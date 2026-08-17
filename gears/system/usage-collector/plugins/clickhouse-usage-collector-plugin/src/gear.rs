@@ -56,7 +56,9 @@ impl Gear for ClickHouseUsageCollectorPlugin {
         // --- Four-step init sequence ---
 
         // Step A: Build the ClickHouse HTTP client and configure timeouts / pool.
-        let client = build_client(&cfg);
+        let client = build_client(&cfg).map_err(|e| {
+            anyhow::anyhow!("database_url is not a valid URL: {e}")
+        })?;
 
         // Step B: Run the embedded idempotent schema migration (CREATE TABLE IF NOT EXISTS).
         apply_migrations(&client, cfg.retention_period_secs)

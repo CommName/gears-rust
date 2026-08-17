@@ -87,7 +87,7 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
         ))
         .expect("valid test config json");
 
-    let client = build_client(&cfg);
+    let client = build_client(&cfg).expect("integration-test URL must parse");
 
     wait_until_ready(&client).await?;
 

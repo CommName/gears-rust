@@ -41,7 +41,6 @@ use toolkit_odata::filter::{FilterField, convert_expr_to_filter_node};
 use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, Page as ODataPage, PageInfo, SortDir};
 use usage_collector_sdk::{
     UsageCollectorPluginError, UsageType, UsageTypeFilterField, UsageTypeGtsId,
-    is_keyset_safe_type_field,
 };
 
 use crate::domain::ports::CatalogStore;
@@ -52,21 +51,19 @@ use crate::infra::storage::error::tracked_ch_err;
 use crate::infra::storage::mapper::{
     current_merge_version, gts_id_str, kind_to_code, type_row_to_model,
 };
+use crate::infra::storage::query::build::{
+    apply_condition, catalog_count_sql, catalog_get_by_gts_id,
+    lightweight_delete_usage_type, prepared_select, prepared_sql, records_ref_count_probe,
+};
 use crate::infra::storage::query::effective_page_size;
 use crate::infra::storage::query::keyset::{
-    encode_next_cursor, ensure_forward_cursor, keyset_predicate,
+    encode_next_cursor, ensure_forward_cursor, keyset_condition,
 };
-use crate::infra::storage::query::translate::{
-    SqlCtx, bind_one, translate_usage_type_filter, usage_type_column,
-};
+use crate::infra::storage::query::schema::{TYPE_SELECT_COLUMNS, UsageTypeCatalog};
+use crate::infra::storage::query::translate::{translate_usage_type_filter, usage_type_column};
 
-// ── Static column list ────────────────────────────────────────────────────────
-
-/// All columns in [`UsageTypeRow`] field order for `usage_type_catalog` SELECT.
-///
-/// A `'static` constant (never caller input), so `RowBinary` decoding is
-/// positional without SQL injection risk.
-const TYPE_COLUMNS: &str = "gts_id, kind, metadata_fields, version";
+use sea_query::{Order, Query};
+use usage_collector_sdk::is_keyset_safe_type_field;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -221,8 +218,14 @@ impl ChCatalogStore {
         self.refresh_runs
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let sql = "SELECT count() FROM usage_type_catalog FINAL";
-        match self.client.query(sql).fetch_one::<u64>().await {
+        let q = match prepared_sql(&self.client, catalog_count_sql()) {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to bind catalog count query");
+                return;
+            }
+        };
+        match q.fetch_one::<u64>().await {
             Ok(n) => {
                 self.metrics.set_catalog_size(n);
             }
@@ -286,11 +289,9 @@ impl CatalogStore for ChCatalogStore {
     }
 
     async fn get(&self, gts_id: UsageTypeGtsId) -> Result<UsageType, UsageCollectorPluginError> {
-        let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let row: Option<UsageTypeRow> = self
-            .client
-            .query(&sql)
-            .bind(gts_id_str(&gts_id))
+        let q = prepared_sql(&self.client, catalog_get_by_gts_id(gts_id_str(&gts_id)))
+            .map_err(UsageCollectorPluginError::internal)?;
+        let row: Option<UsageTypeRow> = q
             .fetch_optional::<UsageTypeRow>()
             .await
             .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
@@ -312,73 +313,58 @@ impl CatalogStore for ChCatalogStore {
     ) -> Result<ODataPage<UsageType>, UsageCollectorPluginError> {
         let limit = effective_page_size(query.limit, DEFAULT_PAGE_SIZE);
 
-        // No leading scope bind — catalog is not tenant/gts-scoped.
-        let mut ctx = SqlCtx::new();
-        let mut clauses: Vec<String> = Vec::new();
+        let q = {
+            let mut stmt = Query::select()
+                .columns(TYPE_SELECT_COLUMNS)
+                .from(UsageTypeCatalog::Table)
+                .order_by(UsageTypeCatalog::GtsId, Order::Asc)
+                .limit(limit.saturating_add(1))
+                .to_owned();
 
-        // Optional `$filter` (currently ignored by the SPI gateway for catalog,
-        // but the allowlist + translate layer is wired for completeness and
-        // future use; the allowed fields are `gts_id` and `kind`).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageTypeFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment = translate_usage_type_filter(&node, &mut ctx)
+            if let Some(expr) = query.filter() {
+                let node = convert_expr_to_filter_node::<UsageTypeFilterField>(expr)
+                    .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
+                let cond = translate_usage_type_filter(&node)
+                    .map_err(UsageCollectorPluginError::internal)?;
+                apply_condition(&mut stmt, cond);
+            }
+
+            if let Some(cursor) = query.cursor.as_ref() {
+                ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
+                if cursor.o != SortDir::Asc {
+                    return Err(UsageCollectorPluginError::internal(format!(
+                        "cursor primary direction must be Asc, got: {:?}",
+                        cursor.o
+                    )));
+                }
+                if cursor.f.as_deref() != query.filter_hash.as_deref() {
+                    return Err(UsageCollectorPluginError::internal(
+                        "cursor filter hash mismatch",
+                    ));
+                }
+                if !gts_id_asc_order().equals_signed_tokens(&cursor.s) {
+                    return Err(UsageCollectorPluginError::internal(
+                        "cursor sort order mismatch",
+                    ));
+                }
+                let cond = keyset_condition(
+                    &[("gts_id", true)],
+                    &cursor.k,
+                    usage_type_column,
+                    |name| UsageTypeFilterField::from_name(name).map(|f| f.kind()),
+                    is_keyset_safe_type_field,
+                )
                 .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Keyset continuation (forward only).
-        if let Some(cursor) = query.cursor.as_ref() {
-            ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
-            if cursor.f.as_deref() != query.filter_hash.as_deref() {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor filter hash mismatch",
-                ));
+                apply_condition(&mut stmt, cond);
             }
-            // The catalog list has one fixed order, so the cursor is checked
-            // against that order rather than the ignored `query.order` — a
-            // token minted under any other order cannot be walked forward here.
-            if !gts_id_asc_order().equals_signed_tokens(&cursor.s) {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor sort order mismatch",
-                ));
-            }
-            let predicate = keyset_predicate(
-                &[("gts_id", true)], // fixed ASC order
-                &cursor.k,
-                usage_type_column,
-                |name| UsageTypeFilterField::from_name(name).map(|f| f.kind()),
-                is_keyset_safe_type_field,
-                &mut ctx,
-            )
-            .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(predicate);
-        }
 
-        // No filter and no keyset cursor leaves `clauses` empty on the first
-        // page of an unfiltered list — omit `WHERE` entirely rather than
-        // emitting `WHERE ` with nothing to its right.
-        let where_clause = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {} ", clauses.join(" AND "))
+            prepared_select(&self.client, stmt).map_err(UsageCollectorPluginError::internal)?
         };
-        let sql = format!(
-            "SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL \
-             {where_clause}ORDER BY gts_id ASC LIMIT {}",
-            limit.saturating_add(1),
-        );
-
-        let mut q = self.client.query(&sql);
-        for b in &ctx.binds {
-            q = bind_one(q, b);
-        }
         let mut rows: Vec<UsageTypeRow> = q
             .fetch_all()
             .await
             .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
 
-        // Look-ahead row present → a next page exists; drop it before mapping.
         let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
         if has_next {
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
@@ -456,14 +442,14 @@ impl ChCatalogStore {
         let gts_id_raw = gts_id_str(&usage_type.gts_id).to_owned();
 
         // 1. Pre-existence check: SELECT FINAL WHERE gts_id = ?.
-        let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let existing: Option<UsageTypeRow> = self
-            .client
-            .query(&sql)
-            .bind(gts_id_raw.as_str())
-            .fetch_optional::<UsageTypeRow>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let existing: Option<UsageTypeRow> = prepared_sql(
+            &self.client,
+            catalog_get_by_gts_id(gts_id_raw.as_str()),
+        )
+        .map_err(UsageCollectorPluginError::internal)?
+        .fetch_optional::<UsageTypeRow>()
+        .await
+        .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
 
         if let Some(row) = existing {
             // 2-3. Compare kind and metadata_fields for idempotency absorb vs conflict.
@@ -523,14 +509,14 @@ impl ChCatalogStore {
         gts_id: &UsageTypeGtsId,
         exclusive_guard: &dyn LockGuardPort,
     ) -> Result<(), UsageCollectorPluginError> {
-        let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let existing: Option<UsageTypeRow> = self
-            .client
-            .query(&sql)
-            .bind(gts_id_str(gts_id))
-            .fetch_optional::<UsageTypeRow>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let existing: Option<UsageTypeRow> = prepared_sql(
+            &self.client,
+            catalog_get_by_gts_id(gts_id_str(gts_id)),
+        )
+        .map_err(UsageCollectorPluginError::internal)?
+        .fetch_optional::<UsageTypeRow>()
+        .await
+        .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
 
         if existing.is_none() {
             return Err(UsageCollectorPluginError::UsageTypeNotFound {
@@ -538,16 +524,14 @@ impl ChCatalogStore {
             });
         }
 
-        let ref_sql = "SELECT count() FROM (SELECT 1 FROM usage_records FINAL WHERE gts_id = ? LIMIT ?) \
-             AS sub_ref";
-        let ref_count: u64 = self
-            .client
-            .query(ref_sql)
-            .bind(gts_id_str(gts_id))
-            .bind(REF_COUNT_CAP)
-            .fetch_one::<u64>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let ref_count: u64 = prepared_sql(
+            &self.client,
+            records_ref_count_probe(gts_id_str(gts_id), REF_COUNT_CAP),
+        )
+        .map_err(UsageCollectorPluginError::internal)?
+        .fetch_one::<u64>()
+        .await
+        .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
 
         if ref_count > 0 {
             self.metrics.inc_usage_type_referenced();
@@ -562,13 +546,14 @@ impl ChCatalogStore {
             return Err(e);
         }
 
-        let delete_sql = "DELETE FROM usage_type_catalog WHERE gts_id = ?";
-        self.client
-            .query(delete_sql)
-            .bind(gts_id_str(gts_id))
-            .execute()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        prepared_sql(
+            &self.client,
+            lightweight_delete_usage_type(gts_id_str(gts_id)),
+        )
+        .map_err(UsageCollectorPluginError::internal)?
+        .execute()
+        .await
+        .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
 
         self.request_catalog_size_refresh();
         Ok(())

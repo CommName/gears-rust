@@ -1,32 +1,23 @@
 //! Injection-safe filter translation: a validated `FilterNode<F>` becomes a
-//! parameterized `ClickHouse` `WHERE` fragment plus an ordered bind list.
+//! sea-query [`Condition`] (bound values, allowlisted identifiers).
 //!
-//! Identifiers come only from the closed allowlists ([`record_column`] /
-//! [`usage_type_column`]); values are always bound via `?` placeholders via
-//! [`crate::infra::storage::query::bind::odata_value_to_bind`].
-//!
-//! ## `ClickHouse` vs `PostgreSQL` dialect differences
-//!
-//! - Placeholders: `ClickHouse` uses positional `?` (not `$N`); there is no
-//!   numbered parameter index in the query fragment — the bind order is tracked
-//!   by `SqlCtx::binds` alone.
-//! - Metadata push-down: `metadata['key']` (map subscript) replaces `metadata
-//!   ->> $key`.
-//! - `DateTime64(6)` comparisons use `i64` epoch-microseconds bound as
-//!   `DateTime64Micros` and converted by `fromUnixTimestamp64Micro(?)`.
-//! - String comparisons for `status` / `kind` are straightforward (`String`
-//!   bind).
+//! Identifiers resolve through [`schema::record_column_iden`] /
+//! [`schema::usage_type_column_iden`]; values go through [`odata_value_to_bind`]
+//! then [`sql_bind_to_expr`] (wrapping `DateTime64` micros in
+//! `fromUnixTimestamp64Micro(?)`).
 
+use sea_query::{Condition, Expr, ExprTrait, SimpleExpr};
 use toolkit_odata::filter::{FilterField, FilterNode, FilterOp};
 
-pub use super::bind::{SqlBind, bind_one, odata_value_to_bind};
+pub use super::bind::{SqlBind, bind_one, odata_value_to_bind, sql_bind_to_expr};
 pub use toolkit_odata::filter::ODataValue;
+
+use super::schema::{record_column_iden, usage_type_column_iden};
 
 /// Closed allowlist mapping a `usage_records` filter-field name to its column.
 ///
-/// The identity map is the security boundary — only these nine identifiers can
-/// ever reach the SQL string. `gts_id` is intentionally absent: it is a typed
-/// parameter on the SPI, not a `$filter` field.
+/// Kept as `&'static str` for keyset helpers and tests; the translate path
+/// resolves through [`record_column_iden`].
 #[must_use]
 pub fn record_column(field_name: &str) -> Option<&'static str> {
     match field_name {
@@ -53,20 +44,10 @@ pub fn usage_type_column(field_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Bind accumulator for a single `ClickHouse` SQL statement.
-///
-/// `ClickHouse` uses positional `?` placeholders — there is no `$N` index.
-/// `binds` holds the values in the order they must be applied via `bind_one`,
-/// matching the left-to-right `?` occurrence in the assembled query.
-///
-/// Callers that need to precede the filter binds with fixed binds (e.g. a
-/// `gts_id` bound as the first `?`) should push those first, then pass `ctx`
-/// to the translate functions.
+/// Bind accumulator retained for keyset / metadata / batch-dedup paths that
+/// still assemble custom `?` fragments alongside sea-query [`Condition`]s.
 pub struct SqlCtx {
-    /// Accumulated binds in placeholder order.
-    ///
-    /// `pub(crate)` so the stores and keyset helper can accumulate binds in the
-    /// same ordered context; not exposed to external consumers.
+    /// Accumulated binds in placeholder order for custom SQL fragments.
     pub(crate) binds: Vec<SqlBind>,
 }
 
@@ -77,7 +58,7 @@ impl SqlCtx {
         Self { binds: Vec::new() }
     }
 
-    /// Append a bind. Called by translate functions for every `?` emitted.
+    /// Append a bind for a custom SQL fragment.
     pub(crate) fn push(&mut self, b: SqlBind) {
         self.binds.push(b);
     }
@@ -89,72 +70,56 @@ impl Default for SqlCtx {
     }
 }
 
-/// Map a comparison [`FilterOp`] to its SQL operator string.
-///
-/// # Errors
-///
-/// Returns an error string for non-comparison operators (`In` / `Contains` /
-/// `StartsWith` / `EndsWith` / `And` / `Or`): those are handled structurally
-/// by the translators.
-fn op_sql(op: FilterOp) -> Result<&'static str, String> {
+/// Map a comparison [`FilterOp`] onto a binary [`SimpleExpr`].
+fn cmp_expr(left: SimpleExpr, op: FilterOp, right: SimpleExpr) -> Result<SimpleExpr, String> {
     match op {
-        FilterOp::Eq => Ok("="),
-        FilterOp::Ne => Ok("<>"),
-        FilterOp::Gt => Ok(">"),
-        FilterOp::Ge => Ok(">="),
-        FilterOp::Lt => Ok("<"),
-        FilterOp::Le => Ok("<="),
+        FilterOp::Eq => Ok(left.eq(right)),
+        FilterOp::Ne => Ok(left.ne(right)),
+        FilterOp::Gt => Ok(left.gt(right)),
+        FilterOp::Ge => Ok(left.gte(right)),
+        FilterOp::Lt => Ok(left.lt(right)),
+        FilterOp::Le => Ok(left.lte(right)),
         other => Err(format!("unsupported operator: {other:?}")),
     }
 }
 
-/// Translate a `usage_records` filter node into a parameterized `ClickHouse`
-/// `WHERE` fragment, pushing each value onto `ctx` as a bind.
-///
-/// Identifiers resolve through [`record_column`]; an unmapped field is an error
-/// (never interpolated). Values resolve through [`odata_value_to_bind`].
+/// Translate a `usage_records` filter node into a [`Condition`].
 ///
 /// # Errors
 ///
 /// Returns an error string when a field is not on the allowlist, an operator is
 /// unsupported, a composite carries a non-`And`/`Or` operator, or a value
 /// cannot be converted to a bind.
-pub fn translate_record_filter<F: FilterField>(
-    node: &FilterNode<F>,
-    ctx: &mut SqlCtx,
-) -> Result<String, String> {
-    translate_filter(node, ctx, record_column)
+pub fn translate_record_filter<F: FilterField>(node: &FilterNode<F>) -> Result<Condition, String> {
+    translate_filter(node, record_column_iden)
 }
 
-/// Translate a `usage_type_catalog` filter node. Identical to
-/// [`translate_record_filter`] but resolves identifiers through
-/// [`usage_type_column`].
+/// Translate a `usage_type_catalog` filter node.
 ///
 /// # Errors
 ///
 /// Same conditions as [`translate_record_filter`].
 pub fn translate_usage_type_filter<F: FilterField>(
     node: &FilterNode<F>,
-    ctx: &mut SqlCtx,
-) -> Result<String, String> {
-    translate_filter(node, ctx, usage_type_column)
+) -> Result<Condition, String> {
+    translate_filter(node, usage_type_column_iden)
 }
 
 /// Shared recursive walker parameterised over the column allowlist.
-fn translate_filter<F: FilterField>(
+pub(crate) fn translate_filter<F: FilterField, C>(
     node: &FilterNode<F>,
-    ctx: &mut SqlCtx,
-    col: fn(&str) -> Option<&'static str>,
-) -> Result<String, String> {
+    col: fn(&str) -> Option<C>,
+) -> Result<Condition, String>
+where
+    C: sea_query::IntoColumnRef + Copy,
+{
     match node {
         FilterNode::Binary { field, op, value } => {
             let column = col(field.name())
                 .ok_or_else(|| format!("field not allowlisted: {}", field.name()))?;
-            let operator = op_sql(*op)?;
-            let bind = odata_value_to_bind(value)?;
-            let placeholder = bind.placeholder();
-            ctx.push(bind);
-            Ok(format!("{column} {operator} {placeholder}"))
+            let right = sql_bind_to_expr(odata_value_to_bind(value)?);
+            let expr = cmp_expr(Expr::col(column).into(), *op, right)?;
+            Ok(Condition::all().add(expr))
         }
         FilterNode::InList { field, values } => {
             let column = col(field.name())
@@ -162,31 +127,27 @@ fn translate_filter<F: FilterField>(
             if values.is_empty() {
                 return Err("IN list must not be empty".to_owned());
             }
-            let placeholders = values
-                .iter()
-                .map(|v| {
-                    odata_value_to_bind(v).map(|b| {
-                        let placeholder = b.placeholder();
-                        ctx.push(b);
-                        placeholder
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(format!("{column} IN ({})", placeholders.join(", ")))
+            // OR of equalities so `fromUnixTimestamp64Micro(?)` RHS exprs work
+            // the same as plain values (sea-query `is_in` is value-list only).
+            let mut any = Condition::any();
+            for v in values {
+                let right = sql_bind_to_expr(odata_value_to_bind(v)?);
+                any = any.add(Expr::col(column).eq(right));
+            }
+            Ok(Condition::all().add(any))
         }
         FilterNode::Composite { op, children } => {
-            let joiner = match op {
-                FilterOp::And => " AND ",
-                FilterOp::Or => " OR ",
+            let mut cond = match op {
+                FilterOp::And => Condition::all(),
+                FilterOp::Or => Condition::any(),
                 other => return Err(format!("invalid composite operator: {other:?}")),
             };
-            let parts = children
-                .iter()
-                .map(|child| translate_filter(child, ctx, col))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(format!("({})", parts.join(joiner)))
+            for child in children {
+                cond = cond.add(translate_filter(child, col)?);
+            }
+            Ok(cond)
         }
-        FilterNode::Not(inner) => Ok(format!("NOT ({})", translate_filter(inner, ctx, col)?)),
+        FilterNode::Not(inner) => Ok(translate_filter(inner, col)?.not()),
     }
 }
 

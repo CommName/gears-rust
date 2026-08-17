@@ -369,7 +369,7 @@ fn build_client_accepts_https_url_with_auth_and_database() {
     };
     cfg.validate().expect("https config is valid");
     // Construction only — no network I/O.
-    let _client = build_client(&cfg);
+    let _client = build_client(&cfg).expect("valid URL produces a client");
 }
 
 #[test]
@@ -384,15 +384,15 @@ fn build_client_accepts_plaintext_http_when_override_set() {
         ..ClickHousePluginConfig::default()
     };
     cfg.validate().expect("override permits http");
-    let _client = build_client(&cfg);
+    let _client = build_client(&cfg).expect("valid URL produces a client");
 }
 
-/// The fallback client is inert: an unparseable `database_url` fails every
-/// request at parameter-validation time, before a socket is opened, so nothing
-/// (credentials included) is ever sent anywhere. `validate()` rejects such a
-/// URL on the production path; this covers the call sites that skip it.
-#[tokio::test]
-async fn build_client_falls_back_to_inert_client_on_unparseable_url() {
+/// `build_client` now returns `Err` for unparseable URLs — callers must
+/// either validate first or handle the error.  Effectively every call site on
+/// the production path already gates through `validate()`, so this just
+/// confirms that the defensive `Result` boundary works.
+#[test]
+fn build_client_rejects_unparseable_url() {
     use super::build_client;
     use crate::config::{ClickHousePluginConfig, SecretFromEnv};
 
@@ -404,15 +404,13 @@ async fn build_client_falls_back_to_inert_client_on_unparseable_url() {
     cfg.validate()
         .expect_err("an unparseable database_url must not pass validation");
 
-    let client = build_client(&cfg);
-    let err = client
-        .query("SELECT 1")
-        .execute()
-        .await
-        .expect_err("a client built from an unparseable URL must not reach a server");
+    let err = match build_client(&cfg) {
+        Err(e) => e,
+        Ok(_) => panic!("an unparseable URL must produce an Err"),
+    };
     assert!(
-        matches!(err, clickhouse::error::Error::InvalidParams(_)),
-        "expected an invalid-params failure before any connection attempt, got: {err}"
+        matches!(err, url::ParseError::RelativeUrlWithoutBase),
+        "expected RelativeUrlWithoutBase parse error, got: {err}"
     );
 }
 
@@ -485,7 +483,7 @@ mod integration {
                 .expect("CREATE DATABASE IF NOT EXISTS must succeed");
         }
 
-        let client = build_client(&cfg);
+        let client = build_client(&cfg).expect("integration-test URL must parse");
         apply_migrations(&client, cfg.retention_period_secs)
             .await
             .expect("migration must succeed against a live ClickHouse instance");

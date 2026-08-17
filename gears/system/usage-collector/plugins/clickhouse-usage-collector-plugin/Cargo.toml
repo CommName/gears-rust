@@ -38,6 +38,8 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 
 clickhouse = { workspace = true }
+sea-query = { workspace = true }
+sea-query-clickhouse = { workspace = true }
 url = { workspace = true }
 
 serde = { workspace = true }

@@ -2,6 +2,23 @@
 
 ClickHouse storage-backend plugin that implements the Usage Collector `UsageCollectorPluginV1` SPI. It is the durable system of record for usage records and the usage-type catalog: the Usage Collector gateway gear discovers it via the types registry and dispatches all persistence to it. The plugin owns nothing of the host's domain logic — it is pure persistence over a ClickHouse columnar OLAP database, with the **cluster gear** `DistributedLockV1` (profile `usage-collector`) backing the per-`gts_id` exclusive coordination lock.
 
+<!-- toc -->
+
+- [Configuration](#configuration)
+- [Operational requirements](#operational-requirements)
+  - [TLS enforcement](#tls-enforcement)
+  - [Cluster distributed-lock dependency](#cluster-distributed-lock-dependency)
+  - [Retention window management](#retention-window-management)
+  - [Data-skipping index management](#data-skipping-index-management)
+  - [Workload isolation and pool contention](#workload-isolation-and-pool-contention)
+- [Storage semantics](#storage-semantics)
+- [SPI conformance](#spi-conformance)
+- [Developer setup](#developer-setup)
+- [Running integration tests](#running-integration-tests)
+- [Running E2E tests](#running-e2e-tests)
+
+<!-- /toc -->
+
 ## Configuration
 
 Config maps to `ClickHousePluginConfig` (`src/config.rs`). Durations are whole seconds (repo convention).
@@ -83,8 +100,8 @@ Same class of gotcha as the TTL above: everything in `CREATE TABLE IF NOT EXISTS
 
 ### Workload isolation and pool contention
 
-- One `clickhouse::Client` (and therefore one underlying HTTP connection pool) serves **both** the ingestion and the query paths. This is a deliberate v1 choice, not a solved isolation guarantee.
-- **The pool is not tunable from config.** There is no `pool_max_connections`-style setting: `clickhouse` 0.15.1 exposes no pool-bound builder (`with_setting`/`with_option` set ClickHouse *server* settings, and the `with_http_client` seam cannot be used from outside the crate), so no config field could drive it. Everything below is therefore an operational mitigation, not a knob.
+- One `clickhouse::Client` from the `sea-clickhouse` soft fork (and therefore one underlying HTTP connection pool) serves **both** the ingestion and the query paths. Runtime SELECT/DELETE SQL is built with `sea-query` + `sea-query-clickhouse` (`FINAL` via `ClickhouseSelect`). This is a deliberate v1 choice, not a solved isolation guarantee.
+- **The pool is not tunable from config.** There is no `pool_max_connections`-style setting: `sea-clickhouse` 0.15 exposes no pool-bound builder (`with_setting`/`with_option` set ClickHouse *server* settings, and the `with_http_client` seam cannot be used from outside the crate), so no config field could drive it. Everything below is therefore an operational mitigation, not a knob.
 - Risk to the ingestion-throughput NFR: a burst of aggregation or list queries competes with ingest writes for the same pool and the same ClickHouse server resources, so query bursts can delay pool acquisition on the write path and push ingest below its throughput budget. The plugin has no internal reservation, priority, or queueing that protects ingest from read traffic.
 - Operator guidance:
   - Watch `uc_clickhouse_pool_acquire_duration_seconds` together with `uc_clickhouse_insert_duration_seconds{mode="batch"}` and `uc_clickhouse_query_requests_total{query_kind="aggregated"}`: rising pool-acquire time correlated with query volume is this contention, not a ClickHouse slowdown.
@@ -96,6 +113,7 @@ Same class of gotcha as the TTL above: everything in `CREATE TABLE IF NOT EXISTS
 ## Storage semantics
 
 - **Deduplication** — application-level read-before-insert using `ReplacingMergeTree(version)` + `FINAL`. With exclusive locking, concurrent creates for the same `gts_id` are serialized, closing the former same-`gts_id` shared-lock residual race. See DESIGN.md §3.6 and PRD.md §5.
+- **Hash-collision residual** — the per-`gts_id` exclusive lock serializes same-`gts_id` creates but does **not** order creates across different `gts_id`s whose hashed lock-name leaves collide, or whose deterministic record `id`s (derived from the `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple) collides across distinct `gts_id`s. This theoretical residual is inherent to any lock-scoped-by-`gts_id` design; `FINAL`-qualified reads plus `ReplacingMergeTree` background convergence serve as a defense-in-depth backstop. This plugin does **not** claim DB-enforced serializable dedup equivalent to what a transactional SQL backend provides.
 - **Consistency profile** — on a single-node deployment: effectively immediate read-after-write for any reader. On a replicated deployment: bounded by ClickHouse's own replication lag. Every read path uses `FINAL`.
   For strict cross-replica read-your-writes, configure ClickHouse's native `insert_quorum` write-quorum setting on the server; this plugin does not enable it by default and enabling it incurs a proportional write-latency cost — see DESIGN.md §3.8.
 - **Workload isolation** — the ClickHouse client/pool is shared by both the ingestion and query paths (v1 design), so query bursts can degrade ingestion throughput; see [Workload isolation and pool contention](#workload-isolation-and-pool-contention).
@@ -107,6 +125,13 @@ Same class of gotcha as the TTL above: everything in `CREATE TABLE IF NOT EXISTS
 ## SPI conformance
 
 The crate implements `usage_collector_sdk::UsageCollectorPluginV1` (via `StorageAdapter` over the record and catalog stores). Conformance is enforced at compile time.
+
+## Developer setup
+
+1. **Prerequisites**: Rust toolchain (latest stable), Docker (for ClickHouse test container), a reachable cluster distributed-lock backend or standalone cache for profile `usage-collector`.
+2. **Environment**: The `database_url` config key accepts `${VAR}` placeholders expanded at startup. For local development, set `CH_PASSWORD` or use a passwordless ClickHouse container started via `make e2e-usage-collector` (which manages the full sidecar lifecycle).
+3. **Testing without Docker**: Unit tests (no ClickHouse) run via `cargo test -p cf-gears-clickhouse-usage-collector-plugin`. Integration tests require the `clickhouse` feature and Docker.
+4. **Code organization**: Entry point at `src/gear.rs`, stores in `src/infra/storage/`, coordination lock in `src/infra/coordination/`, metrics in `src/infra/metrics.rs`, embedded DDL in `migrations/0001_init.sql`.
 
 ## Running integration tests
 

@@ -60,7 +60,7 @@ impl ExpandVarsTrait for SecretFromEnv {
 /// warning. `pub(crate)` so both call sites — and their unit tests — share
 /// one definition instead of duplicating the scheme check.
 pub(crate) fn is_plaintext_url(url: &str) -> bool {
-    url.starts_with("http://")
+    url.trim().to_ascii_lowercase().starts_with("http://")
 }
 
 /// Configuration for the `ClickHouse` Usage Collector storage backend.
@@ -139,6 +139,18 @@ impl ClickHousePluginConfig {
         }
         if let Err(e) = url::Url::parse(self.database_url.expose()) {
             return Err(format!("database_url must be a valid absolute URL: {e}"));
+        }
+        // Reject non-HTTP URL schemes — only http and https are valid for the
+        // ClickHouse HTTP interface. A scheme like `file://` or `tcp://` would
+        // fail at connection time with a confusing error, so fail fast here.
+        let parsed = url::Url::parse(self.database_url.expose()).map_err(|e| {
+            format!("database_url parse failed after validation: {e}")
+        })?;
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(format!(
+                "database_url scheme must be http or https, got: {scheme}"
+            ));
         }
         if self.request_timeout_secs == 0 {
             return Err("request_timeout_secs must be > 0".to_owned());

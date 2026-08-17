@@ -255,29 +255,40 @@ fn err_for_partition_falls_back_to_internal_for_other_variants() {
     }
 }
 
-// ── push_metadata_filters ─────────────────────────────────────────────────────
+// ── metadata_conditions ───────────────────────────────────────────────────────
 
 /// Both the key and every value are bound, so no caller-supplied metadata text
 /// reaches the SQL string.
 ///
-/// The `values.is_empty()` -> `FALSE` arm of `push_metadata_filters` is not
+/// Uses `arrayElement(metadata, ?)` rather than `metadata[?]`: sea-query's
+/// tokenizer treats `[…]` as a quoted span, so a `?` inside brackets is not a
+/// bind placeholder.
+///
+/// The `values.is_empty()` -> `FALSE` arm of `metadata_conditions` is not
 /// covered: `MetadataFilter`'s fields are private and both `new` and its
 /// `Deserialize` impl reject an empty value set, so an empty filter cannot be
 /// constructed to pass in.
 #[test]
 fn metadata_filter_binds_key_and_every_value() {
+    use sea_query::{Expr, Query};
+    use sea_query_clickhouse::ClickhouseQueryBuilder;
     use usage_collector_sdk::MetadataFilter;
 
-    use crate::infra::storage::query::translate::{SqlBind, SqlCtx};
+    use crate::infra::storage::query::schema::UsageRecords;
 
     let filter = MetadataFilter::new("region", ["eu-west", "us-east"]).unwrap();
-    let mut ctx = SqlCtx::new();
-    let mut clauses = Vec::new();
-    ChRecordStore::push_metadata_filters(std::slice::from_ref(&filter), &mut ctx, &mut clauses);
-
-    assert_eq!(clauses, vec!["metadata[?] IN (?, ?)".to_owned()]);
-    assert_eq!(ctx.binds.len(), 3, "one key bind plus one bind per value");
-    assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "region"));
+    let cond = ChRecordStore::metadata_conditions(std::slice::from_ref(&filter));
+    let (sql, values) = Query::select()
+        .expr(Expr::cust("1"))
+        .from(UsageRecords::Table)
+        .cond_where(cond)
+        .build(ClickhouseQueryBuilder);
+    let where_part = sql.split(" WHERE ").nth(1).unwrap_or("");
+    assert!(
+        where_part.contains("arrayElement(metadata, ?) IN (?, ?)"),
+        "got: {where_part}"
+    );
+    assert_eq!(values.0.len(), 3, "one key bind plus one bind per value");
 }
 
 // ── Empty-input short circuits ────────────────────────────────────────────────

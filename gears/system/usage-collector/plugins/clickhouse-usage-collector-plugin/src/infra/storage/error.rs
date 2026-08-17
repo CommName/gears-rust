@@ -28,6 +28,7 @@ fn is_transient(err: &ChError) -> bool {
             | ChError::TimedOut
             | ChError::Compression(_)
             | ChError::Decompression(_)
+            | ChError::BadResponse(_)
     )
 }
 
@@ -65,17 +66,6 @@ pub fn tracked_ch_err(metrics: &Metrics, err: &ChError) -> UsageCollectorPluginE
     };
     metrics.inc_backend_error(class);
     map_ch_err(err)
-}
-
-/// Whether a `ClickHouse` client error on the acquire path should clear the
-/// readiness gauge.
-///
-/// Mirrors the reference plugin's `acquire_error_clears_readiness`: only
-/// connectivity-class (transient) errors represent a genuine outage; protocol or
-/// decode errors on the happy path are non-outage Internal errors.
-#[must_use]
-pub fn acquire_error_clears_readiness(err: &ChError) -> bool {
-    is_transient(err)
 }
 
 #[cfg(test)]

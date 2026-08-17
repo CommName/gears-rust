@@ -39,9 +39,10 @@ struct ParsedEndpoint {
 /// Split a `database_url` into a bare HTTP endpoint plus optional
 /// user/password/database.
 ///
-/// Username and password are taken from the URL's userinfo as-is (not
-/// percent-decoded): callers embedding `${VAR}`-expanded secrets containing
-/// URL-reserved characters must percent-encode them in `database_url` first.
+/// Username and password are taken from the URL's userinfo, where the `url`
+/// crate percent-decodes them (e.g. `%40` → `@`).  Callers embedding
+/// `${VAR}`-expanded secrets containing URL-reserved characters must
+/// percent-encode them in `database_url` first.
 /// The database name is the URL path with leading/trailing slashes trimmed;
 /// an empty path yields `None` (`ClickHouse` then uses the server's default
 /// database for the resolved user).
@@ -59,8 +60,9 @@ fn parse_endpoint(database_url: &str) -> Result<ParsedEndpoint, url::ParseError>
         (!path.is_empty()).then(|| path.to_owned())
     };
 
-    // Strip userinfo/path/query so the remaining string is a bare endpoint
-    // safe to hand to `Client::with_url` (see struct-level doc comment).
+    // Strip userinfo/path/query/fragment so the remaining string is a bare
+    // endpoint safe to hand to `Client::with_url` (see struct-level doc
+    // comment).
     // `set_username`/`set_password` only fail for schemes that cannot carry
     // credentials (e.g. `file:`); an http(s) URL that parsed successfully
     // above always accepts them, so the `Result` is deliberately ignored.
@@ -68,6 +70,7 @@ fn parse_endpoint(database_url: &str) -> Result<ParsedEndpoint, url::ParseError>
     url.set_password(None).ok();
     url.set_path("");
     url.set_query(None);
+    url.set_fragment(None);
 
     Ok(ParsedEndpoint {
         base_url: url.to_string(),
@@ -115,7 +118,13 @@ fn substitute_retention(sql: &str, retention_period_secs: u64) -> String {
 /// `send_timeout` and `receive_timeout` (both bound to
 /// `cfg.request_timeout_secs`).  The `clickhouse` 0.15.x `Client` is a
 /// lightweight handle over an internal `hyper` connection pool.
-pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
+///
+/// # Errors
+///
+/// Returns the `url::ParseError` if `database_url` is not a valid URL.
+/// On the production path `Gear::init` calls `validate()` first, so this
+/// branch is only reachable from direct test/integration call sites.
+pub fn build_client(cfg: &ClickHousePluginConfig) -> Result<clickhouse::Client, url::ParseError> {
     let url = cfg.database_url.expose();
 
     // TLS posture check — mirrors the reference plugin's sslmode-warn pattern.
@@ -130,30 +139,7 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
         );
     }
 
-    // On the production path this branch is unreachable: `Gear::init` always
-    // calls `ClickHousePluginConfig::validate` before `build_client`, and
-    // `validate` rejects a `database_url` that `Url::parse` cannot handle. It
-    // only defends call sites that construct a client without validating first
-    // (direct unit/integration use of `build_client`), where returning an inert
-    // client is preferable to panicking.
-    //
-    // The resulting client cannot connect anywhere: the `clickhouse` crate
-    // re-parses `Client::url` on every request, so the same parse failure
-    // surfaces as `Error::InvalidParams` before any socket is opened — no
-    // request is sent and no credentials leave the process.
-    let endpoint = parse_endpoint(url).unwrap_or_else(|err| {
-        tracing::warn!(
-            error = %err,
-            "database_url failed to parse as a URL; every ClickHouse request will fail with \
-             an invalid-params error before any connection is attempted"
-        );
-        ParsedEndpoint {
-            base_url: url.to_owned(),
-            user: None,
-            password: None,
-            database: None,
-        }
-    });
+    let endpoint = parse_endpoint(url)?;
 
     // `send_timeout` and `receive_timeout` are standard `ClickHouse` HTTP API
     // settings accepted as URL query parameters or per-request headers.
@@ -177,7 +163,7 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
         client = client.with_database(database);
     }
 
-    client
+    Ok(client)
 }
 
 /// Strip `--` SQL comments, returning only the executable source.

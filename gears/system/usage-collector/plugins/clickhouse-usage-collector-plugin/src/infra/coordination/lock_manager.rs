@@ -354,6 +354,10 @@ impl ClusterLockGuard {
     }
 
     /// Explicitly release the lock.
+    ///
+    /// Calling `release` on an already-released guard is a no-op that emits a
+    /// diagnostic warning — it should not happen in normal operation and
+    /// suggests a logic error in the caller.
     pub async fn release(mut self) -> Result<(), UsageCollectorPluginError> {
         self.released = true;
         if let Some(inner) = self.inner.take() {
@@ -361,6 +365,11 @@ impl ClusterLockGuard {
                 self.metrics.inc_lock_manager_unavailable(self.mode);
                 UsageCollectorPluginError::transient(format!("cluster lock release failed: {e}"))
             })?;
+        } else {
+            tracing::warn!(
+                mode = ?self.mode,
+                "cluster lock guard release called twice — the lock was already released"
+            );
         }
         Ok(())
     }
@@ -390,6 +399,11 @@ impl Drop for ClusterLockGuard {
                     );
                 }
             });
+        } else {
+            tracing::warn!(
+                "ClusterLockGuard dropped without explicit release and no Tokio runtime available — \
+                 cluster lock name will remain held until TTL expiry"
+            );
         }
     }
 }

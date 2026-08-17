@@ -5,8 +5,8 @@ use usage_collector_sdk::UsageRecordFilterField;
 use super::super::bind::SqlBind;
 use super::super::translate::{SqlCtx, record_column};
 use super::{
-    cursor_key_to_bind, encode_next_cursor, ensure_forward_cursor, keyset_predicate,
-    render_order_by,
+    cursor_key_to_bind, encode_next_cursor, ensure_forward_cursor, keyset_condition,
+    keyset_predicate, render_order_by,
 };
 
 fn rec_kind(name: &str) -> Option<FieldKind> {
@@ -73,6 +73,34 @@ fn datetime_keyset_uses_epoch_microsecond_conversion() {
         "(created_at, id) > (fromUnixTimestamp64Micro(?), ?)"
     );
     assert_eq!(ctx.binds.len(), 2);
+}
+
+#[test]
+fn keyset_condition_uses_positional_question_marks() {
+    use sea_query::{Expr, Query};
+    use sea_query_clickhouse::ClickhouseQueryBuilder;
+
+    use crate::infra::storage::query::schema::UsageRecords;
+
+    let cond = keyset_condition(
+        &[("gts_id", true)],
+        &["cf.gears.usage.disk".to_owned()],
+        |field| (field == "gts_id").then_some("gts_id"),
+        |_| Some(FieldKind::String),
+        |_| true,
+    )
+    .unwrap();
+    let (sql, values) = Query::select()
+        .expr(Expr::cust("1"))
+        .from(UsageRecords::Table)
+        .cond_where(cond)
+        .build(ClickhouseQueryBuilder);
+    let where_part = sql.split(" WHERE ").nth(1).unwrap_or("");
+    assert!(
+        where_part.contains("(gts_id) > (?)") && !where_part.contains('$'),
+        "got: {where_part}"
+    );
+    assert_eq!(values.0.len(), 1);
 }
 
 #[test]

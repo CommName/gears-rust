@@ -1,20 +1,12 @@
 //! Order-by rendering, keyset (tuple-comparison) predicates, and cursor
-//! encode/decode for keyset pagination — adapted for `ClickHouse`.
+//! encode/decode for keyset pagination — adapted for `ClickHouse` via sea-query.
 //!
-//! Structurally identical to the reference plugin's `keyset.rs`; the only
-//! dialect difference is the placeholder shape: `ClickHouse` uses `?`
-//! (positional) rather than `$N`. The column allowlists and cursor API remain
-//! identical.
-//!
-//! ## Verified `toolkit-odata` cursor / order API
-//!
-//! - `ODataOrderBy(pub Vec<OrderKey>)`; `OrderKey { field: String, dir: SortDir }`.
-//! - `CursorV1 { k: Vec<String>, o: SortDir, s: String, f: Option<String>, d: String }`.
-//! - `CursorV1::encode(&self) -> serde_json::Result<String>` (base64url).
-//! - `CursorV1::decode(token: &str) -> Result<CursorV1, toolkit_odata::Error>`.
+//! The dialect difference vs Postgres remains: positional `?` (not `$N`), with
+//! `DateTime64` cursor keys wrapped in `fromUnixTimestamp64Micro(?)`.
 
 use std::str::FromStr;
 
+use sea_query::{Condition, Expr, Order};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -22,15 +14,10 @@ use uuid::Uuid;
 use toolkit_odata::filter::FieldKind;
 use toolkit_odata::{CursorV1, ODataOrderBy, SortDir};
 
-use super::bind::SqlBind;
+use super::bind::{SqlBind, sql_bind_to_expr};
 use super::translate::SqlCtx;
 
 /// Reject any cursor whose direction is not forward (`"fwd"`).
-///
-/// `FINAL`-qualified reads are ordered consistently, but only forward cursors
-/// are minted in v1. A `"bwd"` cursor would be silently walked forward since
-/// the keyset operator is derived from the sort direction, not `cursor.d`.
-/// Reject it fail-closed until backward paging is implemented.
 ///
 /// # Errors
 ///
@@ -76,17 +63,67 @@ pub fn render_order_by(
     Ok(parts.join(", "))
 }
 
-/// Build a keyset predicate as a row-value tuple comparison.
+/// Resolve order pairs to `(column_name, Order)` for sea-query `order_by`.
 ///
-/// For an all-ascending order: `(c1, c2, …) > (?, ?, …)`.
-/// For an all-descending order: `(c1, c2, …) < (?, ?, …)`.
+/// # Errors
+///
+/// Same conditions as [`render_order_by`].
+pub fn order_by_clauses(
+    order: &ODataOrderBy,
+    col: impl Fn(&str) -> Option<&'static str>,
+) -> Result<Vec<(String, Order)>, String> {
+    if order.is_empty() {
+        return Err("order must not be empty".to_owned());
+    }
+    order
+        .0
+        .iter()
+        .map(|key| {
+            let column = col(&key.field)
+                .ok_or_else(|| format!("order field not allowlisted: {}", key.field))?
+                .to_owned();
+            let dir = match key.dir {
+                SortDir::Asc => Order::Asc,
+                SortDir::Desc => Order::Desc,
+            };
+            Ok((column, dir))
+        })
+        .collect()
+}
+
+/// Build a keyset predicate as a row-value tuple comparison [`Condition`].
+///
+/// For an all-ascending order: `(c1, c2, …) > ($1, $2, …)`.
+/// For an all-descending order: `(c1, c2, …) < ($1, $2, …)`.
 /// Mixed directions are unsupported (v1 limitation).
 ///
 /// # Errors
 ///
 /// Returns an error string when `order_pairs` is empty, its length differs from
-/// `cursor_keys`, a field is nullable (not keyset-safe), a field is not on the
-/// allowlist, directions are mixed, or a cursor key cannot be parsed.
+/// `cursor_keys`, a field is nullable, a field is not on the allowlist,
+/// directions are mixed, or a cursor key cannot be parsed.
+pub fn keyset_condition(
+    order_pairs: &[(&str, bool)],
+    cursor_keys: &[String],
+    col: impl Fn(&str) -> Option<&'static str>,
+    kind: impl Fn(&str) -> Option<FieldKind>,
+    keyset_safe: impl Fn(&str) -> bool,
+) -> Result<Condition, String> {
+    let ((columns, cmp), binds) =
+        keyset_tuple_parts(order_pairs, cursor_keys, col, kind, keyset_safe)?;
+    let rhs: Vec<Expr> = binds.into_iter().map(sql_bind_to_expr).collect();
+    // ClickHouse / ClickhouseQueryBuilder uses positional `?` (not `$N`). Using
+    // `$1` here leaves literal `$1` in the SQL and drops the bound expressions.
+    let slots = vec!["?"; rhs.len()].join(", ");
+    let template = format!("({}) {cmp} ({slots})", columns.join(", "));
+    Ok(Condition::all().add(Expr::cust_with_exprs(template, rhs)))
+}
+
+/// Legacy string-fragment keyset predicate (still used while stores migrate).
+///
+/// # Errors
+///
+/// Same as [`keyset_condition`].
 pub fn keyset_predicate(
     order_pairs: &[(&str, bool)],
     cursor_keys: &[String],
@@ -95,6 +132,27 @@ pub fn keyset_predicate(
     keyset_safe: impl Fn(&str) -> bool,
     ctx: &mut SqlCtx,
 ) -> Result<String, String> {
+    let ((columns, cmp), binds) =
+        keyset_tuple_parts(order_pairs, cursor_keys, col, kind, keyset_safe)?;
+    let mut placeholders = Vec::with_capacity(binds.len());
+    for b in binds {
+        placeholders.push(b.placeholder());
+        ctx.push(b);
+    }
+    Ok(format!(
+        "({}) {cmp} ({})",
+        columns.join(", "),
+        placeholders.join(", ")
+    ))
+}
+
+fn keyset_tuple_parts(
+    order_pairs: &[(&str, bool)],
+    cursor_keys: &[String],
+    col: impl Fn(&str) -> Option<&'static str>,
+    kind: impl Fn(&str) -> Option<FieldKind>,
+    keyset_safe: impl Fn(&str) -> bool,
+) -> Result<((Vec<&'static str>, &'static str), Vec<SqlBind>), String> {
     if order_pairs.is_empty() {
         return Err("keyset order must not be empty".to_owned());
     }
@@ -117,7 +175,7 @@ pub fn keyset_predicate(
     };
 
     let mut columns = Vec::with_capacity(order_pairs.len());
-    let mut placeholders = Vec::with_capacity(order_pairs.len());
+    let mut binds = Vec::with_capacity(order_pairs.len());
     for ((field, _), raw) in order_pairs.iter().zip(cursor_keys.iter()) {
         if !keyset_safe(field) {
             return Err(format!(
@@ -127,37 +185,23 @@ pub fn keyset_predicate(
         let column = col(field).ok_or_else(|| format!("keyset field not allowlisted: {field}"))?;
         let field_kind =
             kind(field).ok_or_else(|| format!("keyset field has no known kind: {field}"))?;
-        let bind = cursor_key_to_bind(field_kind, raw)?;
-        placeholders.push(bind.placeholder());
-        ctx.push(bind);
+        binds.push(cursor_key_to_bind(field_kind, raw)?);
         columns.push(column);
     }
 
-    Ok(format!(
-        "({}) {cmp} ({})",
-        columns.join(", "),
-        placeholders.join(", ")
-    ))
+    Ok(((columns, cmp), binds))
 }
 
 /// Parse a raw cursor key string into a typed [`SqlBind`] for `ClickHouse`.
 ///
-/// `DateTimeUtc` keys are parsed as RFC 3339 strings and converted to
-/// `DateTime64Micros` (`i64` epoch-microseconds), matching the `i64` storage
-/// type of `DateTime64(6)` columns.
-///
 /// # Errors
 ///
-/// Returns an error string when the value cannot be parsed for its kind, or
-/// when the kind is not supported as a keyset column.
+/// Returns an error string when the value cannot be parsed for its kind.
 pub fn cursor_key_to_bind(kind: FieldKind, raw: &str) -> Result<SqlBind, String> {
     match kind {
         FieldKind::DateTimeUtc => {
             let dt = OffsetDateTime::parse(raw, &Rfc3339)
                 .map_err(|e| format!("invalid datetime cursor key `{raw}`: {e}"))?;
-            // Convert nanoseconds to microseconds via Euclidean division (equiv.
-            // to truncating division for positive timestamps; avoids the
-            // clippy::integer_division lint on i128 /).
             let nanos = dt.unix_timestamp_nanos();
             let micros = nanos.div_euclid(1_000);
             #[allow(

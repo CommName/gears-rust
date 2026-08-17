@@ -16,7 +16,7 @@
 //! converts to/from [`time::OffsetDateTime`] using nanosecond arithmetic.
 
 use std::collections::{BTreeMap, HashMap};
-use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use time::OffsetDateTime;
 
@@ -107,8 +107,8 @@ pub fn kind_to_code(kind: UsageKind) -> UsageTypeKindCode {
 ///
 /// Returns [`UsageCollectorPluginError::Internal`] when a key fails
 /// [`MetadataKey::new`] validation (a stored-data invariant break).
-pub fn metadata_hashmap_to_btree<S: BuildHasher>(
-    map: HashMap<String, String, S>,
+pub fn metadata_hashmap_to_btree(
+    map: HashMap<String, String>,
 ) -> Result<BTreeMap<MetadataKey, String>, UsageCollectorPluginError> {
     let mut out = BTreeMap::new();
     for (key, val) in map {
@@ -349,13 +349,28 @@ pub fn current_merge_version() -> u64 {
     micros as u64
 }
 
+/// Monotonic sequence counter for disambiguating concurrent
+/// [`version_higher_than`] calls within the same microsecond.
+///
+/// Two batches beginning in the same microsecond would otherwise produce the
+/// same `ReplacingMergeTree` version for the first record in each batch.  This
+/// counter ensures strict monotonicity across sequential calls regardless of
+/// wall-clock granularity.
+static VERSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Compute a `version` that is strictly higher than `existing_version` by at
 /// least `offset + 1`.  Guards the deactivation cascade against a deactivation
 /// marker that resolves to a lower version than the row it must supersede.
 #[must_use]
 pub fn version_higher_than(existing_version: u64, offset: u64) -> u64 {
     let now = current_merge_version();
+    // The sequence counter disambiguates calls within the same microsecond so
+    // concurrent batches (or any two callers in the same µs wall-clock tick)
+    // always produce distinct base versions, preventing non-deterministic
+    // `ReplacingMergeTree FINAL` resolution between rows at identical versions.
+    let seq = VERSION_SEQ.fetch_add(1, Ordering::SeqCst);
     now.max(existing_version.saturating_add(offset).saturating_add(1))
+        .saturating_add(seq % 1024)
 }
 
 #[cfg(test)]

@@ -1,37 +1,20 @@
 //! Value binding: convert a `toolkit_odata` AST value into a storage-typed
-//! bind, and apply that bind to a `ClickHouse` [`Query`].
+//! bind, and apply that bind to a `ClickHouse` [`Query`] or sea-query [`Expr`].
 //!
-//! Unlike the reference plugin (`sqlx`'s `$N` parameter style), `ClickHouse`
-//! uses positional `?` placeholders.  [`SqlBind`] variants cover the column
-//! types present in `usage_records` and `usage_type_catalog`. [`bind_one`]
-//! applies a single bind to a consumed [`Query`], returning the updated query.
-//!
-//! ## `ClickHouse` crate API (verified against 0.15.1)
-//!
-//! - `Query::bind(value: impl Bind) -> Self` — consumes the query, appends the
-//!   bind value, and returns a new query. Bind values are formatted as SQL
-//!   literals (numbers as digits, strings as quoted `'…'`).
-//! - [`uuid::Uuid`] has `features = ["serde"]` in this workspace; its
-//!   `to_string()` produces a hyphenated UUID that `ClickHouse` accepts as a
-//!   `UUID` literal.
-//! - [`rust_decimal::Decimal`] has `features = ["serde"]`; its `to_string()`
-//!   produces a decimal string (`"42.5"`) that `ClickHouse` accepts for
-//!   `Decimal128(9)` columns.
-//! - `DateTime64(6)` values are epoch-microseconds bound as `i64`, but their
-//!   SQL placeholder must be wrapped in `fromUnixTimestamp64Micro(?)`.
-//!   A bare microsecond integer in a tuple comparison is coerced through
-//!   decimal arithmetic by `ClickHouse` and can fail with `DECIMAL_OVERFLOW`.
+//! `ClickHouse` uses positional `?` placeholders. [`SqlBind`] variants cover
+//! the column types in `usage_records` / `usage_type_catalog`.
 //!
 //! [`Query`]: clickhouse::query::Query
 
 use rust_decimal::Decimal;
+use sea_query::{Expr, SimpleExpr};
 use uuid::Uuid;
 
 use toolkit_odata::filter::ODataValue;
 
+use super::expr::from_unix_timestamp64_micro;
+
 /// A storage-typed value ready to be bound to a `ClickHouse` `?` placeholder.
-///
-/// Each variant maps to a column type in `usage_records` / `usage_type_catalog`.
 #[derive(Debug, Clone)]
 pub enum SqlBind {
     /// `UUID` column bind.
@@ -53,10 +36,8 @@ pub enum SqlBind {
 impl SqlBind {
     /// Render the SQL placeholder required for this bind's storage type.
     ///
-    /// Most values use a plain positional placeholder. `DateTime64(6)` needs
-    /// an explicit epoch-microsecond conversion so `ClickHouse` does not
-    /// interpret the large integer as seconds or coerce it through Decimal
-    /// arithmetic in tuple comparisons.
+    /// Used by custom fragment builders (keyset / batch dedup / metadata).
+    /// Prefer [`sql_bind_to_expr`] when composing sea-query ASTs.
     #[must_use]
     pub fn placeholder(&self) -> &'static str {
         match self {
@@ -66,20 +47,29 @@ impl SqlBind {
     }
 }
 
-/// Convert an `OData` AST value into a storage-typed [`SqlBind`].
+/// Convert an [`SqlBind`] into a sea-query RHS expression.
 ///
-/// - `DateTime` values are converted from `chrono::DateTime<Utc>` to epoch-
-///   microseconds (`i64`) via [`timestamp_micros`].
-/// - `Number` values are converted from `bigdecimal::BigDecimal` to
-///   `rust_decimal::Decimal` via the string representation.
+/// `DateTime64Micros` becomes `fromUnixTimestamp64Micro(?)` so tuple/`IN`
+/// contexts do not hit `DECIMAL_OVERFLOW`.
+#[must_use]
+pub fn sql_bind_to_expr(bind: SqlBind) -> SimpleExpr {
+    match bind {
+        SqlBind::Uuid(u) => Expr::val(u.to_string()),
+        SqlBind::Str(s) => Expr::val(s),
+        SqlBind::Decimal(d) => Expr::val(d.to_string()),
+        SqlBind::DateTime64Micros(n) => from_unix_timestamp64_micro(n),
+        SqlBind::Bool(b) => Expr::val(b),
+        SqlBind::I64(n) => Expr::val(n),
+        SqlBind::U64(n) => Expr::val(n),
+    }
+}
+
+/// Convert an `OData` AST value into a storage-typed [`SqlBind`].
 ///
 /// # Errors
 ///
-/// Returns an error string on `Null` / `Date` / `Time` values (none of the
-/// `usage_records` filter columns are date-only or time-only) or when a
+/// Returns an error string on `Null` / `Date` / `Time` values or when a
 /// numeric value is out of the `rust_decimal::Decimal` range.
-///
-/// [`timestamp_micros`]: chrono::DateTime::timestamp_micros
 pub fn odata_value_to_bind(v: &ODataValue) -> Result<SqlBind, String> {
     match v {
         ODataValue::Uuid(u) => Ok(SqlBind::Uuid(*u)),
@@ -100,12 +90,6 @@ pub fn odata_value_to_bind(v: &ODataValue) -> Result<SqlBind, String> {
 
 /// Apply a single [`SqlBind`] to a `ClickHouse` [`Query`], returning the query
 /// with the bind appended.
-///
-/// `UUID` and `Decimal` values are bound as strings (hyphenated UUID / decimal
-/// string literal) because `ClickHouse` parses those literals correctly for
-/// `UUID` and `Decimal128(9)` column types. `DateTime64Micros` binds its inner
-/// `i64`; callers must render the corresponding placeholder via
-/// [`SqlBind::placeholder`] so the SQL applies `fromUnixTimestamp64Micro`.
 ///
 /// [`Query`]: clickhouse::query::Query
 pub fn bind_one(q: clickhouse::query::Query, v: &SqlBind) -> clickhouse::query::Query {

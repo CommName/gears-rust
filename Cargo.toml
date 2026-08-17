@@ -494,9 +494,30 @@ sea-orm-migration = { version = "1.1", default-features = false, features = [
 # (not runtime-tokio-rustls) to avoid pulling in ring.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs"] }
 
-# ClickHouse async client (official crate, HTTP-based, rustls TLS).
+# ClickHouse async client: SeaQL soft fork of clickhouse-rs (HTTP, rustls TLS).
+# Package `sea-clickhouse` exports the same `clickhouse` crate path as upstream.
 # Used by the clickhouse-usage-collector-plugin (DESIGN.md §3.5).
-clickhouse = { version = "0.15", features = ["rustls-tls"] }
+clickhouse = { package = "sea-clickhouse", version = "0.15", default-features = false, features = [
+    "lz4",
+    "rustls-tls",
+    "sea-ql",
+    "uuid",
+    "time",
+    "rust_decimal",
+    "chrono",
+] }
+# SeaQuery 1.0-rc (parallel to workspace sea-orm's sea-query 0.32) + ClickHouse
+# dialect extensions (FINAL, PREWHERE, etc.). Used to build runtime SQL for the
+# clickhouse-usage-collector-plugin (DESIGN.md §3.5).
+sea-query = { version = "=1.0.0-rc.34", default-features = false, features = [
+    "derive",
+    "backend-mysql",
+    "with-uuid",
+    "with-time",
+    "with-rust_decimal",
+    "with-chrono",
+] }
+sea-query-clickhouse = "0.1.4"
 # `#[repr(i8)]` (de)serialization for ClickHouse Enum8 columns -- the
 # `clickhouse` crate's RowBinaryWithNamesAndTypes schema validation requires
 # Enum8/Enum16 columns to (de)serialize as their underlying integer

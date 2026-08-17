@@ -1,14 +1,15 @@
 //! Injection-safe `OData` → `ClickHouse` SQL translation foundation.
 //!
 //! Pure (no DB) logic that turns a validated `toolkit_odata` filter AST into a
-//! parameterised `ClickHouse` `WHERE` fragment plus an ordered list of binds.
-//! Every SQL identifier is drawn from a closed allowlist
-//! ([`translate::record_column`] / [`translate::usage_type_column`]); every
-//! value is bound (`?`), never interpolated.
+//! sea-query [`Condition`] (and related keyset / aggregate builders). Every
+//! SQL identifier is drawn from a closed allowlist; every value is bound.
 
 pub mod aggregate;
 pub mod bind;
+pub mod build;
+pub mod expr;
 pub mod keyset;
+pub mod schema;
 pub mod translate;
 
 /// Hard upper bound on the page size either list path will request from
@@ -25,10 +26,6 @@ pub const DEFAULT_PAGE_SIZE: u64 = 100;
 /// Resolve the effective `LIMIT` for a list query: the caller's `$top`
 /// (`requested`) when present, else `default_page_size`, clamped to
 /// `[1, MAX_PAGE_SIZE]`.
-///
-/// The lower bound of 1 prevents a `$top=0` from driving `LIMIT 0+1 = 1`
-/// then `truncate(0)` — which would `None`-fail `rows.last()` on a non-empty
-/// table and 500 the list path.
 #[must_use]
 pub fn effective_page_size(requested: Option<u64>, default_page_size: u64) -> u64 {
     requested

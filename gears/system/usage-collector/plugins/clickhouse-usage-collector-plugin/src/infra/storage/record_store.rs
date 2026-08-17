@@ -20,9 +20,12 @@
 //!   returned — un-qualified reads may return stale pre-deactivation or
 //!   duplicate rows.
 //! - **`?` placeholders**: `ClickHouse` uses positional `?` (not `$N`).
-//! - **`metadata['key']`**: map subscript (not `metadata ->> key`).
+//! - **`arrayElement(metadata, ?)`**: map access (not `metadata ->> key`); avoid
+//!   `metadata[?]` in sea-query because `[…]` is tokenized as a quoted span.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+#[cfg(test)]
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,20 +56,23 @@ use crate::infra::storage::mapper::{
     record_row_key, record_row_to_model, record_to_row, version_higher_than,
 };
 use crate::infra::storage::query::aggregate::{
-    agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
+    agg_select_expr, aggregate_limit, corrects_id_partition_clause, dimension_select_expr,
+};
+use crate::infra::storage::query::build::{
+    apply_condition, build_select_final, catalog_exists_gts_id, prepared_select, prepared_sql,
+    record_get_by_id,
 };
 use crate::infra::storage::query::effective_page_size;
+use crate::infra::storage::query::expr::from_unix_timestamp64_micro;
 use crate::infra::storage::query::keyset::{
-    encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
+    encode_next_cursor, ensure_forward_cursor, keyset_condition, order_by_clauses,
 };
-use crate::infra::storage::query::translate::{SqlBind, SqlCtx, bind_one, record_column};
+use crate::infra::storage::query::schema::{RECORD_SELECT_COLUMNS, UsageRecords};
+use crate::infra::storage::query::translate::{
+    SqlBind, SqlCtx, bind_one, record_column, translate_record_filter,
+};
 
-/// Static column list for every `usage_records` SELECT, in [`UsageRecordRow`]
-/// field order. A `'static` constant (never caller input), so decoding is
-/// positional without SQL injection risk.
-const RECORD_COLUMNS: &str = "id, tenant_id, gts_id, value, created_at, resource_id, \
-     resource_type, subject_id, subject_type, idempotency_key, corrects_id, status, metadata, \
-     ingested_at, version";
+use sea_query::{Alias, Condition, Expr, ExprTrait, Query, SimpleExpr, Value as SeaValue};
 
 /// `ClickHouse`-backed implementation of [`RecordStore`] over `usage_records`.
 #[derive(Clone)]
@@ -117,14 +123,14 @@ impl ChRecordStore {
         &self,
         gts_id: &UsageTypeGtsId,
     ) -> Result<(), UsageCollectorPluginError> {
-        let sql = "SELECT gts_id FROM usage_type_catalog FINAL WHERE gts_id = ?";
-        let found: Option<String> = self
-            .client
-            .query(sql)
-            .bind(gts_id_str(gts_id))
-            .fetch_optional::<String>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let found: Option<String> = prepared_sql(
+            &self.client,
+            catalog_exists_gts_id(gts_id_str(gts_id)),
+        )
+        .map_err(UsageCollectorPluginError::internal)?
+        .fetch_optional::<String>()
+        .await
+        .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
         if found.is_none() {
             return Err(UsageCollectorPluginError::UsageTypeNotFound {
                 gts_id: gts_id.clone(),
@@ -146,18 +152,19 @@ impl ChRecordStore {
         &self,
         record: &UsageRecord,
     ) -> Result<Option<UsageRecordRow>, UsageCollectorPluginError> {
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
-             WHERE tenant_id = ? AND gts_id = ? \
-             AND created_at = fromUnixTimestamp64Micro(?) AND id = ?"
-        );
         let created_at_micros = datetime_to_micros(record.created_at);
-        self.client
-            .query(&sql)
-            .bind(record.tenant_id.to_string())
-            .bind(gts_id_str(&record.gts_id))
-            .bind(created_at_micros)
-            .bind(record.id.to_string())
+        let stmt = Query::select()
+            .columns(RECORD_SELECT_COLUMNS)
+            .from(UsageRecords::Table)
+            .and_where(Expr::col(UsageRecords::TenantId).eq(record.tenant_id.to_string()))
+            .and_where(Expr::col(UsageRecords::GtsId).eq(gts_id_str(&record.gts_id)))
+            .and_where(
+                Expr::col(UsageRecords::CreatedAt).eq(from_unix_timestamp64_micro(created_at_micros)),
+            )
+            .and_where(Expr::col(UsageRecords::Id).eq(record.id.to_string()))
+            .to_owned();
+        prepared_select(&self.client, stmt)
+            .map_err(UsageCollectorPluginError::internal)?
             .fetch_optional::<UsageRecordRow>()
             .await
             .map_err(|e| tracked_ch_err(&self.metrics, &e))
@@ -268,9 +275,6 @@ impl ChRecordStore {
             return Ok(HashMap::new());
         }
         // Build `(t, g, c, i) IN ((?, ?, fromUnixTimestamp64Micro(?), ?), ...)`.
-        // A bare epoch-microsecond integer in a tuple comparison is coerced
-        // through Decimal arithmetic by ClickHouse and can raise
-        // DECIMAL_OVERFLOW before the query starts.
         let mut ctx = SqlCtx::new();
         let mut tuples = Vec::with_capacity(records.len());
         for r in records {
@@ -281,10 +285,15 @@ impl ChRecordStore {
             tuples.push("(?, ?, fromUnixTimestamp64Micro(?), ?)");
         }
         let in_clause = tuples.join(", ");
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
-             WHERE (tenant_id, gts_id, created_at, id) IN ({in_clause})"
-        );
+        let stmt = Query::select()
+            .columns(RECORD_SELECT_COLUMNS)
+            .from(UsageRecords::Table)
+            .and_where(Expr::cust(format!(
+                "(tenant_id, gts_id, created_at, id) IN ({in_clause})"
+            )))
+            .to_owned();
+        let (sql, _) = build_select_final(stmt);
+        // Custom IN tuple binds are not in sea-query Values — apply SqlCtx binds.
         let mut q = self.client.query(&sql);
         for b in &ctx.binds {
             q = bind_one(q, b);
@@ -296,30 +305,25 @@ impl ChRecordStore {
         Ok(rows.into_iter().map(|r| (row_dedup_key(&r), r)).collect())
     }
 
-    /// Append metadata side-channel filters as parameterised `WHERE` clauses.
-    ///
-    /// `metadata['?'] IN (?, ?)` — both key and each value are bound via `ctx`.
-    fn push_metadata_filters(
-        metadata_filter: &[MetadataFilter],
-        ctx: &mut SqlCtx,
-        clauses: &mut Vec<String>,
-    ) {
+    /// Append metadata side-channel filters as [`Condition`]s.
+    fn metadata_conditions(metadata_filter: &[MetadataFilter]) -> Condition {
+        let mut all = Condition::all();
         for mf in metadata_filter {
             if mf.values().is_empty() {
-                clauses.push("FALSE".to_owned());
+                all = all.add(Expr::cust("FALSE"));
                 continue;
             }
-            ctx.push(SqlBind::Str(mf.key().as_str().to_owned()));
-            let placeholders = mf
-                .values()
-                .iter()
-                .map(|v| {
-                    ctx.push(SqlBind::Str(v.clone()));
-                    "?"
-                })
-                .collect::<Vec<_>>();
-            clauses.push(format!("metadata[?] IN ({})", placeholders.join(", ")));
+            let mut vals: Vec<sea_query::Value> =
+                vec![sea_query::Value::String(Some(mf.key().as_str().to_owned()))];
+            let mut ph = Vec::with_capacity(mf.values().len());
+            for v in mf.values() {
+                vals.push(sea_query::Value::String(Some(v.clone())));
+                ph.push("?");
+            }
+            let template = format!("arrayElement(metadata, ?) IN ({})", ph.join(", "));
+            all = all.add(Expr::cust_with_values(template, vals));
         }
+        all
     }
 }
 
@@ -652,17 +656,29 @@ impl RecordStore for ChRecordStore {
             held.push((p_idx, guard));
         }
 
-        // Phase 4: renew every lease immediately before the combined write, so
-        // a lease that expired while the other partitions were being prepared
-        // cannot let a concurrent `delete_usage_type` orphan these rows.
+        // Phase 4: renew every lease concurrently immediately before the
+        // combined write, so a lease that expired while the other partitions
+        // were being prepared cannot let a concurrent `delete_usage_type`
+        // orphan these rows.  Concurrent renewal prevents the sequential
+        // Nth-partition expiry hazard under tight lock_ttl_secs (each
+        // ensure_still_held is a cluster round-trip).
         let mut expired: HashSet<usize> = HashSet::new();
-        for (held_idx, (p_idx, guard)) in held.iter().enumerate() {
-            if let Err(e) = guard.ensure_still_held().await {
+        let renew_results = join_all(
+            held.iter().enumerate().map(|(held_idx, (p_idx, guard))| {
+                async move {
+                    let result = guard.ensure_still_held().await;
+                    (held_idx, *p_idx, result)
+                }
+            }),
+        )
+        .await;
+        for (held_idx, p_idx, result) in &renew_results {
+            if let Err(e) = result {
                 self.metrics.inc_lock_manager_unavailable(LockMode::Create);
                 for &idx in &partitions[*p_idx].1 {
-                    outcomes[idx] = Some(Err(err_for_partition(&e)));
+                    outcomes[idx] = Some(Err(err_for_partition(e)));
                 }
-                expired.insert(held_idx);
+                expired.insert(*held_idx);
             }
         }
         if !expired.is_empty() {
@@ -718,14 +734,14 @@ impl RecordStore for ChRecordStore {
     // @cpt-flow:cpt-cf-uc-ch-plugin-seq-get
     #[instrument(skip_all, fields(record_id = %id))]
     async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
-        let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records FINAL WHERE id = ?");
-        let row: Option<UsageRecordRow> = self
-            .client
-            .query(&sql)
-            .bind(id.to_string())
-            .fetch_optional()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let row: Option<UsageRecordRow> = prepared_sql(
+            &self.client,
+            record_get_by_id(&id.to_string()),
+        )
+        .map_err(UsageCollectorPluginError::internal)?
+        .fetch_optional()
+        .await
+        .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
 
         match row {
             Some(row) => record_row_to_model(row),
@@ -748,74 +764,66 @@ impl RecordStore for ChRecordStore {
         let limit =
             effective_page_size(query.limit, crate::infra::storage::query::DEFAULT_PAGE_SIZE);
 
-        // `gts_id = ?` is the first bind; all subsequent binds follow.
-        let mut ctx = SqlCtx::new();
-        let mut clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
+        let q = {
+            let mut stmt = Query::select()
+                .columns(RECORD_SELECT_COLUMNS)
+                .from(UsageRecords::Table)
+                .and_where(Expr::col(UsageRecords::GtsId).eq(gts_id_str(&gts_id)))
+                .limit(limit.saturating_add(1))
+                .to_owned();
 
-        // `$filter` (validated AST → typed node → parameterised fragment).
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment =
-                crate::infra::storage::query::translate::translate_record_filter(&node, &mut ctx)
-                    .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel.
-        Self::push_metadata_filters(metadata_filter, &mut ctx, &mut clauses);
-
-        // Keyset continuation (forward only).
-        if let Some(cursor) = query.cursor.as_ref() {
-            ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
-            if cursor.f.as_deref() != query.filter_hash.as_deref() {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor filter hash mismatch",
-                ));
+            if let Some(expr) = query.filter() {
+                let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
+                    .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
+                let cond =
+                    translate_record_filter(&node).map_err(UsageCollectorPluginError::internal)?;
+                apply_condition(&mut stmt, cond);
             }
-            if !query.order.equals_signed_tokens(&cursor.s) {
-                return Err(UsageCollectorPluginError::internal(
-                    "cursor sort order mismatch",
-                ));
+
+            apply_condition(&mut stmt, Self::metadata_conditions(metadata_filter));
+
+            if let Some(cursor) = query.cursor.as_ref() {
+                ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
+                if cursor.f.as_deref() != query.filter_hash.as_deref() {
+                    return Err(UsageCollectorPluginError::internal(
+                        "cursor filter hash mismatch",
+                    ));
+                }
+                if !query.order.equals_signed_tokens(&cursor.s) {
+                    return Err(UsageCollectorPluginError::internal(
+                        "cursor sort order mismatch",
+                    ));
+                }
+                let order_pairs: Vec<(&str, bool)> = query
+                    .order
+                    .0
+                    .iter()
+                    .map(|key| (key.field.as_str(), matches!(key.dir, SortDir::Asc)))
+                    .collect();
+                let cond = keyset_condition(
+                    &order_pairs,
+                    &cursor.k,
+                    record_column,
+                    |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
+                    is_keyset_safe_record_field,
+                )
+                .map_err(UsageCollectorPluginError::internal)?;
+                apply_condition(&mut stmt, cond);
             }
-            let order_pairs: Vec<(&str, bool)> = query
-                .order
-                .0
-                .iter()
-                .map(|key| (key.field.as_str(), matches!(key.dir, SortDir::Asc)))
-                .collect();
-            let predicate = keyset_predicate(
-                &order_pairs,
-                &cursor.k,
-                record_column,
-                |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
-                is_keyset_safe_record_field,
-                &mut ctx,
-            )
-            .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(predicate);
-        }
 
-        let order_sql = render_order_by(&query.order, record_column)
-            .map_err(UsageCollectorPluginError::internal)?;
+            let order_clauses = order_by_clauses(&query.order, record_column)
+                .map_err(UsageCollectorPluginError::internal)?;
+            for (col, dir) in order_clauses {
+                stmt.order_by_expr(Expr::cust(col), dir);
+            }
 
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
-             WHERE {} ORDER BY {order_sql} LIMIT {}",
-            clauses.join(" AND "),
-            limit.saturating_add(1),
-        );
-
-        let mut q = self.client.query(&sql).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
-            q = bind_one(q, b);
-        }
+            prepared_select(&self.client, stmt).map_err(UsageCollectorPluginError::internal)?
+        };
         let mut rows: Vec<UsageRecordRow> = q
             .fetch_all()
             .await
             .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
 
-        // Look-ahead row present → a next page exists.
         let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
         if has_next {
             rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
@@ -875,104 +883,73 @@ impl RecordStore for ChRecordStore {
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
 
-        let mut ctx = SqlCtx::new();
-        let mut clauses: Vec<String> =
-            vec!["gts_id = ?".to_owned(), "status = 'active'".to_owned()];
-
-        // `corrects_id` partition (plugin-spi.md §Method 3).
-        if let Some(clause) = corrects_id_partition_clause(spec.op) {
-            clauses.push(clause.to_owned());
-        }
-
-        // `$filter`.
-        if let Some(expr) = query.filter() {
-            let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
-                .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            let fragment =
-                crate::infra::storage::query::translate::translate_record_filter(&node, &mut ctx)
-                    .map_err(UsageCollectorPluginError::internal)?;
-            clauses.push(fragment);
-        }
-
-        // Metadata side-channel.
-        Self::push_metadata_filters(metadata_filter, &mut ctx, &mut clauses);
-
-        // Dimension SELECT exprs + subject-not-null guards.
-        let mut select_dims: Vec<String> = Vec::with_capacity(spec.group_by.len());
-        for dim in &spec.group_by {
-            match dim {
-                AggregationDimension::SubjectId => {
-                    clauses.push("subject_id IS NOT NULL".to_owned());
-                }
-                AggregationDimension::SubjectType => {
-                    clauses.push("subject_type IS NOT NULL".to_owned());
-                }
-                _ => {}
+        let dim_count = spec.group_by.len();
+        let q = {
+            let mut stmt = Query::select().from(UsageRecords::Table).to_owned();
+            apply_condition(
+                &mut stmt,
+                Condition::all()
+                    .add(Expr::col(UsageRecords::GtsId).eq(gts_id_str(&gts_id)))
+                    .add(Expr::cust("status = 'active'")),
+            );
+            if let Some(clause) = corrects_id_partition_clause(spec.op) {
+                apply_condition(&mut stmt, Condition::all().add(Expr::cust(clause)));
             }
-            select_dims.push(dimension_select_expr(dim, &mut ctx));
-        }
-
-        let dim_count = select_dims.len();
-        let mut select_parts = select_dims;
-        select_parts.push(agg_select_expr(spec.op).to_owned());
-        let group_by = if dim_count == 0 {
-            String::new()
-        } else {
-            let ordinals = (1..=dim_count)
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(" GROUP BY {ordinals}")
-        };
-
-        let limit_clause = aggregate_limit_clause(dim_count);
-
-        // `JSONEachRow` lets us decode a result whose column count varies per call
-        // without a fixed `Row` struct. Every column is aliased (`d0`…`dN`, `agg`)
-        // so the JSON keys stay predictable whatever the dimension exprs are.
-        let aliased_select = select_parts
-            .iter()
-            .enumerate()
-            .map(|(i, expr)| {
-                if i == dim_count {
-                    format!("{expr} AS agg")
-                } else {
-                    format!("{expr} AS d{i}")
+            if let Some(expr) = query.filter() {
+                let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
+                    .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
+                let cond =
+                    translate_record_filter(&node).map_err(UsageCollectorPluginError::internal)?;
+                apply_condition(&mut stmt, cond);
+            }
+            apply_condition(&mut stmt, Self::metadata_conditions(metadata_filter));
+            for dim in &spec.group_by {
+                match dim {
+                    AggregationDimension::SubjectId => {
+                        apply_condition(
+                            &mut stmt,
+                            Condition::all().add(Expr::cust("subject_id IS NOT NULL")),
+                        );
+                    }
+                    AggregationDimension::SubjectType => {
+                        apply_condition(
+                            &mut stmt,
+                            Condition::all().add(Expr::cust("subject_type IS NOT NULL")),
+                        );
+                    }
+                    _ => {}
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+            }
 
-        let sql = format!(
-            "SELECT {aliased_select} FROM usage_records FINAL \
-             WHERE {}{group_by}{limit_clause}",
-            clauses.join(" AND "),
-        );
+            for (i, dim) in spec.group_by.iter().enumerate() {
+                stmt.expr_as(dimension_select_expr(dim), Alias::new(format!("d{i}")));
+            }
+            stmt.expr_as(agg_select_expr(spec.op), Alias::new("agg"));
 
-        let mut q = self.client.query(&sql).bind(gts_id_str(&gts_id));
-        for b in &ctx.binds {
-            q = bind_one(q, b);
-        }
+            if dim_count > 0 {
+                let ordinals: Vec<SimpleExpr> = (1..=dim_count)
+                    .map(|n| Expr::cust(n.to_string()))
+                    .collect();
+                stmt.add_group_by(ordinals);
+            }
+            if let Some(lim) = aggregate_limit(dim_count) {
+                stmt.limit(lim);
+            }
 
-        // Column names for the JSON key lookup below, matching the aliases above.
-        let dim_names: Vec<String> = (0..dim_count).map(|i| format!("d{i}")).collect();
-
-        // Collect cursor bytes. The server-side `LIMIT` from
-        // `aggregate_limit_clause` bounds the response to the bucket cap, so
-        // the buffered body is bounded too.
-        let mut all_bytes = Vec::new();
+            prepared_select(&self.client, stmt).map_err(UsageCollectorPluginError::internal)?
+        };
         let mut cursor = q
-            .fetch_bytes("JSONEachRow")
+            .fetch_rows()
             .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
-        while let Some(chunk) = cursor
+        let mut buckets = Vec::new();
+        while let Some(row) = cursor
             .next()
             .await
             .map_err(|e| tracked_ch_err(&self.metrics, &e))?
         {
-            all_bytes.extend_from_slice(&chunk);
+            buckets.push(bucket_from_data_row(&row, dim_count)?);
         }
 
-        let buckets = parse_aggregate_response(&all_bytes, &dim_names)?;
         Ok(AggregationResult { buckets })
     }
 
@@ -986,18 +963,27 @@ impl RecordStore for ChRecordStore {
         // a deactivation is in flight (plugin-spi.md Method 5 caller-side rule).
 
         // Step 1: Read the target + active depth-1 compensations.
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
-             WHERE id = ? OR (corrects_id = ? AND status = 'active')"
-        );
-        let rows: Vec<UsageRecordRow> = self
-            .client
-            .query(&sql)
-            .bind(id.to_string())
-            .bind(id.to_string())
-            .fetch_all()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let rows: Vec<UsageRecordRow> = {
+            let id_s = id.to_string();
+            let stmt = Query::select()
+                .columns(RECORD_SELECT_COLUMNS)
+                .from(UsageRecords::Table)
+                .cond_where(
+                    Condition::any()
+                        .add(Expr::col(UsageRecords::Id).eq(id_s.clone()))
+                        .add(
+                            Condition::all()
+                                .add(Expr::col(UsageRecords::CorrectsId).eq(id_s))
+                                .add(Expr::cust("status = 'active'")),
+                        ),
+                )
+                .to_owned();
+            prepared_select(&self.client, stmt)
+                .map_err(UsageCollectorPluginError::internal)?
+                .fetch_all()
+                .await
+                .map_err(|e| tracked_ch_err(&self.metrics, &e))?
+        };
 
         // Step 2: Identify target and compensation rows.
         let target_row = rows.iter().find(|r| r.id == id);
@@ -1030,6 +1016,98 @@ impl RecordStore for ChRecordStore {
     }
 }
 
+
+/// Decode one aggregate [`clickhouse::DataRow`] into an [`AggregationBucket`].
+///
+/// Dimension columns are aliased `d0`…`dN` and the measure column is `agg`,
+/// matching the SELECT built by [`RecordStore::aggregate`].
+fn bucket_from_data_row(
+    row: &clickhouse::DataRow,
+    dim_count: usize,
+) -> Result<AggregationBucket, UsageCollectorPluginError> {
+    let mut key = Vec::with_capacity(dim_count);
+    for i in 0..dim_count {
+        let alias = format!("d{i}");
+        let idx = row
+            .column_names
+            .iter()
+            .position(|c| c.as_ref() == alias)
+            .ok_or_else(|| {
+                UsageCollectorPluginError::internal(format!(
+                    "aggregate response missing dimension column {alias}"
+                ))
+            })?;
+        key.push(sea_value_as_string(&row.values[idx]));
+    }
+
+    let agg_idx = row
+        .column_names
+        .iter()
+        .position(|c| c.as_ref() == "agg")
+        .ok_or_else(|| {
+            UsageCollectorPluginError::internal("aggregate response missing agg column")
+        })?;
+    let value = sea_value_as_optional_bigdecimal(&row.values[agg_idx])?;
+    Ok(AggregationBucket { key, value })
+}
+
+fn sea_value_as_string(v: &SeaValue) -> String {
+    match v {
+        SeaValue::String(Some(s)) => s.clone(),
+        SeaValue::String(None) => String::new(),
+        SeaValue::Uuid(Some(u)) => u.to_string(),
+        SeaValue::Uuid(None) => String::new(),
+        SeaValue::BigInt(Some(n)) => n.to_string(),
+        SeaValue::BigUnsigned(Some(n)) => n.to_string(),
+        SeaValue::Int(Some(n)) => n.to_string(),
+        SeaValue::Unsigned(Some(n)) => n.to_string(),
+        SeaValue::SmallInt(Some(n)) => n.to_string(),
+        SeaValue::SmallUnsigned(Some(n)) => n.to_string(),
+        SeaValue::TinyInt(Some(n)) => n.to_string(),
+        SeaValue::TinyUnsigned(Some(n)) => n.to_string(),
+        SeaValue::Double(Some(n)) => n.to_string(),
+        SeaValue::Float(Some(n)) => n.to_string(),
+        SeaValue::Bool(Some(b)) => b.to_string(),
+        SeaValue::Decimal(Some(d)) => d.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn sea_value_as_optional_bigdecimal(
+    v: &SeaValue,
+) -> Result<Option<BigDecimal>, UsageCollectorPluginError> {
+    let s = match v {
+        SeaValue::Decimal(None)
+        | SeaValue::Double(None)
+        | SeaValue::Float(None)
+        | SeaValue::BigInt(None)
+        | SeaValue::BigUnsigned(None)
+        | SeaValue::Int(None)
+        | SeaValue::Unsigned(None)
+        | SeaValue::String(None) => return Ok(None),
+        SeaValue::Decimal(Some(d)) => d.to_string(),
+        SeaValue::Double(Some(n)) => n.to_string(),
+        SeaValue::Float(Some(n)) => n.to_string(),
+        SeaValue::BigInt(Some(n)) => n.to_string(),
+        SeaValue::BigUnsigned(Some(n)) => n.to_string(),
+        SeaValue::Int(Some(n)) => n.to_string(),
+        SeaValue::Unsigned(Some(n)) => n.to_string(),
+        SeaValue::SmallInt(Some(n)) => n.to_string(),
+        SeaValue::SmallUnsigned(Some(n)) => n.to_string(),
+        SeaValue::TinyInt(Some(n)) => n.to_string(),
+        SeaValue::TinyUnsigned(Some(n)) => n.to_string(),
+        SeaValue::String(Some(s)) => s.clone(),
+        other => {
+            return Err(UsageCollectorPluginError::internal(format!(
+                "unexpected aggregate value type: {other:?}"
+            )));
+        }
+    };
+    Ok(Some(BigDecimal::from_str(&s).map_err(|e| {
+        UsageCollectorPluginError::internal(format!("aggregate value parse error: {e}"))
+    })?))
+}
+
 /// Decode a `JSONEachRow` aggregate response body into [`AggregationBucket`]s.
 ///
 /// `dim_names` are the `d0`…`dN` column aliases the SELECT emitted, in
@@ -1043,6 +1121,7 @@ impl RecordStore for ChRecordStore {
 /// Returns [`UsageCollectorPluginError::Internal`] when a line is not valid
 /// JSON, carries an `agg` value of an unexpected JSON type, or holds an
 /// unparseable decimal.
+#[cfg(test)]
 fn parse_aggregate_response(
     bytes: &[u8],
     dim_names: &[String],

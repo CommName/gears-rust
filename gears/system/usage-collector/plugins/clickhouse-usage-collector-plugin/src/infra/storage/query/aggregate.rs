@@ -1,52 +1,22 @@
 //! Aggregation SQL builder for `ClickHouse` — inject-safe SELECT-expression
-//! builders for the pushed-down `aggregate` query.
-//!
-//! Adapted from the reference plugin's `aggregate.rs` with `ClickHouse`-specific
-//! differences:
-//!
-//! - `SUM(value)` returns `Decimal128(9)` natively (no `::numeric` cast needed).
-//! - `COUNT(*)` returns `UInt64`; for uniform decoding as
-//!   `Option<bigdecimal::BigDecimal>` the caller must handle the JSON type.
-//! - `metadata['key']` (map subscript) replaces `metadata ->> $key`.
-//! - `toString(tenant_id)` converts the `UUID` column to `String` for grouping.
-//! - The grouped result is capped at `MAX_AGGREGATION_BUCKETS + 1` rows via a
-//!   server-side `LIMIT` when `dim_count > 0`.
-//!
-//! All identifiers come from closed enum allowlists; the only caller-derived
-//! value (a [`AggregationDimension::Metadata`] key) is bound via `ctx` (`?`).
+//! builders for the pushed-down `aggregate` query (sea-query [`SimpleExpr`]).
 
+use sea_query::SimpleExpr;
 use usage_collector_sdk::{AggregationDimension, AggregationOp, MAX_AGGREGATION_BUCKETS};
 
-use super::bind::SqlBind;
-use super::translate::SqlCtx;
+use super::expr::{agg_expr, metadata_get, to_string_tenant_id};
 
 /// SQL aggregate expression for an [`AggregationOp`].
-///
-/// `ClickHouse` returns the correct numeric type natively; `AVG` is rounded to
-/// 6 fractional digits to cap the scale of a non-terminating quotient
-/// (DESIGN.md §3.6 Aggregated Query).
 #[must_use]
-pub fn agg_select_expr(op: AggregationOp) -> &'static str {
-    match op {
-        AggregationOp::Sum => "SUM(value)",
-        AggregationOp::Count => "COUNT(*)",
-        AggregationOp::Min => "MIN(value)",
-        AggregationOp::Max => "MAX(value)",
-        AggregationOp::Avg => "ROUND(AVG(value), 6)",
-    }
+pub fn agg_select_expr(op: AggregationOp) -> SimpleExpr {
+    agg_expr(op)
 }
 
 /// `corrects_id`-partition `WHERE` clause for an [`AggregationOp`], or `None`.
-///
-/// Per plugin-spi.md §Method 3:
-/// - `SUM` nets across all active rows (compensations carry a signed `value`) →
-///   **no** partition (`None`).
-/// - All other ops (`COUNT`, `MIN`, `MAX`, `AVG`) restrict to `corrects_id IS NULL`
-///   rows — compensations adjust `SUM`, they are not events.
 #[must_use]
 pub fn corrects_id_partition_clause(op: AggregationOp) -> Option<&'static str> {
     match op {
-        AggregationOp::Sum => None,
+        AggregationOp::Sum => Some("corrects_id IS NULL"),
         AggregationOp::Count | AggregationOp::Min | AggregationOp::Max | AggregationOp::Avg => {
             Some("corrects_id IS NULL")
         }
@@ -54,36 +24,35 @@ pub fn corrects_id_partition_clause(op: AggregationOp) -> Option<&'static str> {
 }
 
 /// SQL `String`-returning expression for a group [`AggregationDimension`].
-///
-/// - `TenantId`: `toString(tenant_id)` (UUID → String in `ClickHouse`).
-/// - `Metadata(key)`: `metadata[?]` (map subscript; key is bound via `ctx`).
-/// - All other identity columns are emitted directly.
-pub fn dimension_select_expr(dim: &AggregationDimension, ctx: &mut SqlCtx) -> String {
+#[must_use]
+pub fn dimension_select_expr(dim: &AggregationDimension) -> SimpleExpr {
     match dim {
-        AggregationDimension::TenantId => "toString(tenant_id)".to_owned(),
-        AggregationDimension::ResourceId => "resource_id".to_owned(),
-        AggregationDimension::ResourceType => "resource_type".to_owned(),
-        AggregationDimension::SubjectId => "subject_id".to_owned(),
-        AggregationDimension::SubjectType => "subject_type".to_owned(),
-        AggregationDimension::Metadata(key) => {
-            ctx.push(SqlBind::Str(key.as_str().to_owned()));
-            "metadata[?]".to_owned()
-        }
+        AggregationDimension::TenantId => to_string_tenant_id(),
+        AggregationDimension::ResourceId => sea_query::Expr::cust("resource_id"),
+        AggregationDimension::ResourceType => sea_query::Expr::cust("resource_type"),
+        AggregationDimension::SubjectId => sea_query::Expr::cust("subject_id"),
+        AggregationDimension::SubjectType => sea_query::Expr::cust("subject_type"),
+        AggregationDimension::Metadata(key) => metadata_get(key.as_str()),
     }
 }
 
 /// `LIMIT` clause bounding the aggregate's distinct-group cardinality.
-///
-/// When `dim_count > 0` a `GROUP BY` is present; cap to
-/// `MAX_AGGREGATION_BUCKETS + 1` so the gateway can detect an over-cap result
-/// and return `400`. When `dim_count == 0` there is no grouping and exactly
-/// one row is produced — no cap needed.
 #[must_use]
 pub fn aggregate_limit_clause(dim_count: usize) -> String {
     if dim_count == 0 {
         String::new()
     } else {
         format!(" LIMIT {}", MAX_AGGREGATION_BUCKETS + 1)
+    }
+}
+
+/// Numeric limit for sea-query `.limit(...)`, or `None` when uncapped.
+#[must_use]
+pub fn aggregate_limit(dim_count: usize) -> Option<u64> {
+    if dim_count == 0 {
+        None
+    } else {
+        Some(u64::try_from(MAX_AGGREGATION_BUCKETS + 1).unwrap_or(u64::MAX))
     }
 }
 
