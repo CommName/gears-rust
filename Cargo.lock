@@ -2166,9 +2166,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bigdecimal",
- "cf-gears-cluster",
- "cf-gears-cluster-sdk",
- "cf-gears-standalone-cluster-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
@@ -2177,7 +2174,6 @@ dependencies = [
  "cf-gears-usage-collector-sdk",
  "chrono",
  "clickhouse",
- "futures",
  "inventory",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -2194,7 +2190,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "xxhash-rust",
 ]
 
 [[package]]
