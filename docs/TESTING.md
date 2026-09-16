@@ -198,7 +198,13 @@ let container = test_containers::postgres_tagged("16-alpine").start().await?;
 ```
 
 Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
-`timescaledb()`, `mariadb()`.
+`timescaledb()`, `mariadb()`, `clickhouse()`.
+
+`timescaledb()`, `mariadb()` and `clickhouse()` return a `GenericImage` rather than a
+`ContainerRequest`: there is no `testcontainers-modules` image module for them, so the caller
+still supplies the wait strategy and environment. ClickHouse in particular needs
+`WaitFor::Nothing` plus an HTTP readiness poll — that image writes its server log to files under
+`/var/log/clickhouse-server`, so a `message_on_stdout` wait can only ever time out.
 
 #### Version-matrix overrides
 
@@ -212,15 +218,23 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_MYSQL_TAG` | `MYSQL_TAG` |
 | `GEARS_TEST_TIMESCALEDB_TAG` | `TIMESCALEDB_TAG` |
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
+| `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration
 ```
 
-`GEARS_TEST_TIMESCALEDB_TAG` is read by both lanes: the Rust plugin fixtures via
-`test_containers::timescaledb()`, and the Python E2E sidecar via `timescaledb_tag()` in
+`GEARS_TEST_TIMESCALEDB_TAG` and `GEARS_TEST_CLICKHOUSE_TAG` are each read by *both* lanes: the
+Rust plugin fixtures via `test_containers::timescaledb()` / `clickhouse()`, and the Python E2E
+sidecars via `timescaledb_tag()` / `clickhouse_tag()` in
 [`testing/e2e/lib/sidecars.py`](../testing/e2e/lib/sidecars.py). A matrix run therefore keeps
 migrations and E2E on the same image instead of silently testing two different ones.
+
+Because those two pins are spelled once per language, each is duplicated across a Rust constant
+and a Python one. The unit tests `e2e_sidecar_pins_the_same_timescaledb_image` and
+`e2e_sidecar_pins_the_same_clickhouse_image` in `libs/test-containers` read `sidecars.py` and
+fail the build if either copy drifts — so a version bump is still a single reviewed decision even
+though it touches two files.
 
 `GEARS_TEST_PG_GRAPH_REQUIRED=1` turns an unavailable PostgreSQL 19 image into a failure rather
 than a graceful skip; it is off by default while that tag is pre-GA. Unset, empty, `0`, `false`,

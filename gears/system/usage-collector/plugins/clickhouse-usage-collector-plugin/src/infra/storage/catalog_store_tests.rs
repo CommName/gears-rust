@@ -702,7 +702,15 @@ mod live {
     use crate::infra::storage::catalog_store::ChCatalogStore;
     use crate::infra::storage::pool::{apply_migrations, ensure_retention_ttl};
 
-    const CH_PASSWORD: &str = "live_test_pw";
+    /// The one password every `ClickHouse` fixture in this repository uses —
+    /// `tests/common/mod.rs`, `pool_tests.rs` and `ClickHouseSidecar.DB_PASSWORD`
+    /// in `testing/e2e/lib/sidecars.py` all spell the same value. Nothing
+    /// depends on the lanes agreeing, but a single value means a reader who
+    /// greps it finds every `ClickHouse` fixture rather than one of four.
+    ///
+    /// MUST be non-empty; see the note on `CH_TEST_PASSWORD` in
+    /// `tests/common/mod.rs` for what the image's entrypoint does otherwise.
+    const CH_PASSWORD: &str = "ch_test_pw";
 
     /// Start a `ClickHouse` container and apply migrations. Panics if Docker is unavailable.
     async fn start() -> (
@@ -710,7 +718,12 @@ mod live {
         clickhouse::Client,
         ContainerAsync<GenericImage>,
     ) {
-        let image = GenericImage::new("clickhouse/clickhouse-server", "25.6")
+        // Image and tag come from `test_containers`, never a local literal:
+        // `cargo xtask check-test-container-pins` enforces it. `WaitFor::Nothing`
+        // is not an oversight — this image logs to files under
+        // /var/log/clickhouse-server, so a log-based wait can only time out;
+        // readiness is the `SELECT 1` poll below.
+        let image = test_containers::clickhouse()
             .with_wait_for(WaitFor::Nothing)
             .with_env_var("CLICKHOUSE_USER", "default")
             .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)

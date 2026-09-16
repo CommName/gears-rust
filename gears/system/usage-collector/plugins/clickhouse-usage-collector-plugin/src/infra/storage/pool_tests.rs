@@ -890,7 +890,7 @@ mod integration {
 
     use testcontainers::core::WaitFor;
     use testcontainers::runners::AsyncRunner;
-    use testcontainers::{GenericImage, ImageExt};
+    use testcontainers::ImageExt;
 
     use super::super::{
         DEFAULT_RETENTION_SECS, INSERT_DEDUP_WINDOW_BLOCKS, apply_migrations, build_client,
@@ -899,7 +899,9 @@ mod integration {
     };
     use crate::config::ClickHousePluginConfig;
 
-    const CH_PASSWORD: &str = "pool_test_pw";
+    /// Shared with every other `ClickHouse` fixture here; see the note on
+    /// `CH_PASSWORD` in `catalog_store_tests.rs`. MUST be non-empty.
+    const CH_PASSWORD: &str = "ch_test_pw";
 
     /// `gts_id` for the row whose `created_at` sits past `DateTime`'s 2106
     /// ceiling, proving a `DateTime64` TTL does not expire it on write.
@@ -921,7 +923,10 @@ mod integration {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn apply_migrations_creates_tables() {
-        let image = GenericImage::new("clickhouse/clickhouse-server", "25.6")
+        // Image and tag come from `test_containers`, never a local literal:
+        // `cargo xtask check-test-container-pins` enforces it. `WaitFor::Nothing`
+        // is deliberate — see the note in `catalog_store_tests.rs`.
+        let image = test_containers::clickhouse()
             .with_wait_for(WaitFor::Nothing)
             .with_env_var("CLICKHOUSE_USER", "default")
             .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)

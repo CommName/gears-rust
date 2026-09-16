@@ -67,6 +67,28 @@ def timescaledb_tag() -> str:
     return os.environ.get(ENV_TIMESCALEDB_TAG, "").strip() or TIMESCALEDB_TAG
 
 
+# The ClickHouse pin, mirrored from libs/test-containers/src/lib.rs (CLICKHOUSE_IMAGE,
+# CLICKHOUSE_TAG, ENV_CLICKHOUSE_TAG). Split into repo + tag rather than one composed
+# literal so the environment override below can reach this lane too; the Rust test
+# `e2e_sidecar_pins_the_same_clickhouse_image` fails the build if any of the three
+# drifts from its constant.
+CLICKHOUSE_IMAGE = "clickhouse/clickhouse-server"
+CLICKHOUSE_TAG = "25.6"
+ENV_CLICKHOUSE_TAG = "GEARS_TEST_CLICKHOUSE_TAG"
+
+
+def clickhouse_tag() -> str:
+    """Effective ClickHouse tag, honoring GEARS_TEST_CLICKHOUSE_TAG.
+
+    Unset *or empty* means "use the pinned constant", matching
+    `test_containers::clickhouse_tag()` on the Rust side. Without this, a CI
+    version matrix would move the Rust plugin tests while leaving E2E on the
+    default -- schema DDL validated against one ClickHouse version, E2E run
+    against another, with nothing in the diff to show it.
+    """
+    return os.environ.get(ENV_CLICKHOUSE_TAG, "").strip() or CLICKHOUSE_TAG
+
+
 # Docker label KEY every sidecar here shares. The VALUE identifies the run that
 # owns the container: a class constant prefix plus RUN_ID. Splitting the two
 # lets `reap_stale` find every sidecar container ever started (filter on the
@@ -504,13 +526,18 @@ class TimescaleDbSidecar(_DockerSidecar):
 class ClickHouseSidecar(_DockerSidecar):
     """A throwaway ClickHouse container with a dynamically mapped host port.
 
-    Keep IMAGE in sync with the Rust plugin integration tests:
-    gears/system/usage-collector/plugins/clickhouse-usage-collector-plugin/tests/common/mod.rs
-    A skew between the two means the plugin's schema DDL is validated against
-    a different ClickHouse version than E2E runs.
+    The image comes from the module-level pin (CLICKHOUSE_IMAGE) and
+    `clickhouse_tag()`, so GEARS_TEST_CLICKHOUSE_TAG moves this lane and the
+    Rust plugin tests together. Resolved once, at class-definition time, for
+    the same reason as TimescaleDbSidecar.IMAGE.
+
+    A skew between the two lanes means the plugin's schema DDL is validated
+    against a different ClickHouse version than E2E runs; the Rust test
+    `e2e_sidecar_pins_the_same_clickhouse_image` in libs/test-containers keeps
+    the two pins from drifting.
     """
 
-    IMAGE = "clickhouse/clickhouse-server:25.6"
+    IMAGE = f"{CLICKHOUSE_IMAGE}:{clickhouse_tag()}"
     LABEL = f"{LABEL_KEY}=usage-collector-ch"
     # The HTTP interface: the `clickhouse` crate the plugin uses is
     # HTTP-based, so 8123 — not the native protocol's 9000 — is the port
