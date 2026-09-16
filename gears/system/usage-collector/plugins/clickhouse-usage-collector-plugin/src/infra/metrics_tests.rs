@@ -1,6 +1,5 @@
 // Test modules using bare `panic!` opt in explicitly.
 #![allow(clippy::panic)]
-#![cfg_attr(coverage_nightly, coverage(off))]
 
 use super::{ErrorClass, InsertMode, Metrics, QueryKind, label};
 
