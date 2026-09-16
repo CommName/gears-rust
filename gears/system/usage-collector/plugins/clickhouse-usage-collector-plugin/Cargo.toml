@@ -62,6 +62,13 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 # Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="clickhouse")]-gated.
 testcontainers = { workspace = true }
+# The ClickHouse image tag comes from `test-containers`, never a local literal:
+# a literal pins the version in four places at once (two test modules here, the
+# integration harness, and the E2E sidecar) with nothing keeping them equal.
+# Enforced by `cargo xtask check-test-container-pins`. Kept alongside
+# `testcontainers` rather than replacing it -- `test_containers` deliberately
+# does not re-export the runner or `ImageExt`.
+test-containers = { workspace = true }
 # In-memory metric reader for the metrics-recording unit tests; the `testing`
 # feature gates `InMemoryMetricExporter`.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

@@ -58,7 +58,11 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
     // inside the container, so it never appears on stdout/stderr and a
     // `message_on_stdout` wait can only ever time out. Readiness is polled
     // over HTTP below instead.
-    let ch_image = GenericImage::new("clickhouse/clickhouse-server", "25.6")
+    //
+    // Image and tag come from `test_containers`, never a local literal:
+    // `cargo xtask check-test-container-pins` enforces it, and the pin is
+    // mirrored into `ClickHouseSidecar` in `testing/e2e/lib/sidecars.py`.
+    let ch_image = test_containers::clickhouse()
         .with_wait_for(WaitFor::Nothing)
         .with_env_var("CLICKHOUSE_USER", "default")
         .with_env_var("CLICKHOUSE_PASSWORD", CH_TEST_PASSWORD)
