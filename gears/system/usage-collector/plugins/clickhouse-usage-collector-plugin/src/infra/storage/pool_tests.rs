@@ -888,9 +888,9 @@ async fn ensure_insert_dedup_window_reports_the_client_side_deadline_on_a_stalle
 mod integration {
     use std::time::Duration;
 
+    use testcontainers::ImageExt;
     use testcontainers::core::WaitFor;
     use testcontainers::runners::AsyncRunner;
-    use testcontainers::ImageExt;
 
     use super::super::{
         DEFAULT_RETENTION_SECS, INSERT_DEDUP_WINDOW_BLOCKS, apply_migrations, build_client,

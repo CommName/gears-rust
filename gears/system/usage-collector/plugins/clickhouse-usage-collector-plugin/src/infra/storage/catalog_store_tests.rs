@@ -1,6 +1,5 @@
 // Test modules using bare `panic!` opt in explicitly.
 #![allow(clippy::panic)]
-#![cfg_attr(coverage_nightly, coverage(off))]
 
 //! Unit tests for [`ChCatalogStore`].
 //!
