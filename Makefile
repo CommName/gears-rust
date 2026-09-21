@@ -686,7 +686,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -753,6 +753,17 @@ test-users-info-pg: install-tools
 test-usage-collector-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
+
+## Run ClickHouse usage-collector plugin integration tests (Docker required;
+## the suite spins up its own clickhouse container via testcontainers).
+## `--run-ignored all` because the suite is double-gated: the `clickhouse`
+## feature compiles the test files, and every Docker-backed test inside them is
+## `#[ignore]`d. CH_REQUIRE_DOCKER=1 turns an unreachable Docker into a panic —
+## without it bring_up_or_skip() reports `ok` on a suite that ran nothing.
+test-usage-collector-ch: install-tools
+	$(call print_target_banner)
+	CH_REQUIRE_DOCKER=1 cargo nextest run -p cf-gears-clickhouse-usage-collector-plugin \
+		--features clickhouse --run-ignored all --no-fail-fast
 
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
@@ -1393,7 +1404,7 @@ ci_docs: lychee gts-docs
 	$(call print_target_banner)
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-types-registry-db lychee gts-docs dylint
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-usage-collector-ch test-types-registry-db lychee gts-docs dylint
 	$(call print_target_banner)
 
 ## Build the cf-gears-example-server release binary, or a single gear when GEAR=<gear> is set
