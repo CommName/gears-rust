@@ -208,7 +208,7 @@ impl Default for ClickHousePluginConfig {
             // Same window the migration DDL bakes in, so a config-less start
             // needs no `MODIFY TTL` reconciliation at startup.
             retention_period_secs: crate::infra::storage::pool::DEFAULT_RETENTION_SECS,
-            vendor: "cyberfabric".to_owned(),
+            vendor: "constructorfabric".to_owned(),
             priority: 10,
         }
     }
@@ -324,7 +324,7 @@ impl ClickHousePluginConfig {
         if self.vendor.trim().is_empty() {
             return Err(
                 "vendor must not be empty; it is part of the GTS instance identity registered \
-                 with types-registry (e.g. vendor = \"cyberfabric\")"
+                 with types-registry (e.g. vendor = \"constructorfabric\")"
                     .to_owned(),
             );
         }

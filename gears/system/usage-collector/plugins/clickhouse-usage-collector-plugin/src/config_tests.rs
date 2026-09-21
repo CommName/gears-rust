@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn config_defaults_are_applied() {
     let cfg: ClickHousePluginConfig = serde_json::from_str("{}").unwrap();
-    assert_eq!(cfg.vendor, "cyberfabric");
+    assert_eq!(cfg.vendor, "constructorfabric");
     assert_eq!(cfg.priority, 10);
     assert_eq!(cfg.request_timeout_secs, 30);
     assert_eq!(cfg.retention_period_secs, 365 * 86_400);
