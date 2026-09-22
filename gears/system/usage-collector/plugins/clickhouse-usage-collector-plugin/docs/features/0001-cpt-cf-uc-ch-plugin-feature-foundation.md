@@ -156,7 +156,7 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 
 - [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-foundation-build-client`
 
-**Input**: The validated `database_url` from config (unwrapped from `SecretFromEnv` only at this boundary).
+**Input**: The validated `database_url` from config (unwrapped from its `SecretString` only at this boundary).
 
 **Output**: A configured `clickhouse::Client`.
 
@@ -246,7 +246,7 @@ The system **MUST** build the `PluginV1<UsageCollectorPluginSpecV1>` registratio
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-tls-dsn`
 
-The system **MUST** reject a plaintext `http://` `database_url` at config validation time unless `allow_insecure_http = true` is explicitly set. The scheme **MUST** be read from the parsed URL (normalized to lowercase) rather than matched as a raw prefix, so that `HTTP://` is gated identically. A `database_url` whose scheme is neither `http` nor `https` **MUST** be rejected at the same point regardless of `allow_insecure_http`, and the rejection **MUST** name only the scheme, never the DSN. The DSN **MUST** be wrapped in `SecretFromEnv` with no `Display`, `Serialize`, or `PartialEq`, and a `Debug` that emits `<redacted>`; the raw URL is unwrapped only at the `build_client` boundary. When `allow_insecure_http == true` and the URL is `http://`, `build_client` **MUST** emit `tracing::warn!` on every startup.
+The system **MUST** reject a plaintext `http://` `database_url` at config validation time unless `allow_insecure_http = true` is explicitly set. The scheme **MUST** be read from the parsed URL (normalized to lowercase) rather than matched as a raw prefix, so that `HTTP://` is gated identically. A `database_url` whose scheme is neither `http` nor `https` **MUST** be rejected at the same point regardless of `allow_insecure_http`, and the rejection **MUST** name only the scheme, never the DSN. The DSN **MUST** be held as a `secrecy::SecretString`, which has no `Display`, `Serialize`, or `PartialEq`, emits `[REDACTED]` from `Debug`, and is zeroized on drop; the raw URL is unwrapped via `ExposeSecret::expose_secret` only at the `build_client` boundary. When `allow_insecure_http == true` and the URL is `http://`, `build_client` **MUST** emit `tracing::warn!` on every startup.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-foundation-build-client`
 

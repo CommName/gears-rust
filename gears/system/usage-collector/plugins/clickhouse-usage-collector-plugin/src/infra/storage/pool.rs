@@ -19,6 +19,7 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use percent_encoding::percent_decode_str;
+use secrecy::ExposeSecret;
 use url::Url;
 
 use crate::config::{ClickHousePluginConfig, is_plaintext_url};
@@ -177,9 +178,9 @@ fn new_base_client() -> anyhow::Result<clickhouse::Client> {
 
 /// Build a configured `clickhouse::Client` from the plugin config.
 ///
-/// The DSN (embedding credentials) is unwrapped from [`SecretFromEnv`] only
-/// here at the connection boundary — it is never logged or stored past this
-/// call. `ClickHouse` credentials and usage data are always sent in
+/// The DSN (embedding credentials) is unwrapped from its `SecretString` only
+/// here at the connection boundary — it is never logged. `ClickHouse`
+/// credentials and usage data are always sent in
 /// cleartext when the URL scheme is `http://`; [`ClickHousePluginConfig::validate`]
 /// (called by `Gear::init` before this function) already fails closed on a
 /// plaintext `database_url` unless `allow_insecure_http` is explicitly set,
@@ -205,7 +206,13 @@ fn new_base_client() -> anyhow::Result<clickhouse::Client> {
 /// `CryptoProvider` has been installed process-wide. An unparseable
 /// `database_url` is *not* an error here — see the inert-client note below.
 pub fn build_client(cfg: &ClickHousePluginConfig) -> anyhow::Result<clickhouse::Client> {
-    let url = cfg.database_url.expose();
+    // The config's `SecretString` is zeroized on drop, but that guarantee stops
+    // at this boundary: `clickhouse` 0.15.1 stores the user and password as
+    // plain `String`s on the `Client` for its whole lifetime
+    // (`clickhouse-0.15.1/src/lib.rs:87-91`), so one unzeroized copy of the
+    // credentials outlives this call regardless. Zeroize still shortens the
+    // window for the config-side copy; do not read it as end-to-end scrubbing.
+    let url = cfg.database_url.expose_secret();
 
     // TLS posture check — mirrors the reference plugin's sslmode-warn pattern.
     // Reaching this branch means `allow_insecure_http` was explicitly set

@@ -446,10 +446,12 @@ fn migration_sql_has_correct_order_by_for_records() {
 #[test]
 fn build_client_accepts_https_url_with_auth_and_database() {
     use super::build_client;
-    use crate::config::{ClickHousePluginConfig, SecretFromEnv};
+    use secrecy::SecretString;
+
+    use crate::config::ClickHousePluginConfig;
 
     let cfg = ClickHousePluginConfig {
-        database_url: SecretFromEnv::new("https://chuser:secret@clickhouse.example:8443/usage_db"),
+        database_url: SecretString::from("https://chuser:secret@clickhouse.example:8443/usage_db"),
         request_timeout_secs: 15,
         ..ClickHousePluginConfig::default()
     };
@@ -462,10 +464,12 @@ fn build_client_accepts_https_url_with_auth_and_database() {
 #[test]
 fn build_client_accepts_plaintext_http_when_override_set() {
     use super::build_client;
-    use crate::config::{ClickHousePluginConfig, SecretFromEnv};
+    use secrecy::SecretString;
+
+    use crate::config::ClickHousePluginConfig;
 
     let cfg = ClickHousePluginConfig {
-        database_url: SecretFromEnv::new("http://default:@localhost:8123/default"),
+        database_url: SecretString::from("http://default:@localhost:8123/default"),
         allow_insecure_http: true,
         request_timeout_secs: 7,
         ..ClickHousePluginConfig::default()
@@ -482,10 +486,12 @@ fn build_client_accepts_plaintext_http_when_override_set() {
 #[tokio::test]
 async fn build_client_falls_back_to_inert_client_on_unparseable_url() {
     use super::build_client;
-    use crate::config::{ClickHousePluginConfig, SecretFromEnv};
+    use secrecy::SecretString;
+
+    use crate::config::ClickHousePluginConfig;
 
     let cfg = ClickHousePluginConfig {
-        database_url: SecretFromEnv::new("not a url"),
+        database_url: SecretString::from("not a url"),
         allow_insecure_http: true,
         ..ClickHousePluginConfig::default()
     };
@@ -909,6 +915,7 @@ async fn ensure_insert_dedup_window_reports_the_client_side_deadline_on_a_stalle
 mod integration {
     use std::time::Duration;
 
+    use secrecy::ExposeSecret;
     use testcontainers::ImageExt;
     use testcontainers::core::WaitFor;
     use testcontainers::runners::AsyncRunner;
@@ -980,7 +987,8 @@ mod integration {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        let endpoint = parse_endpoint(cfg.database_url.expose()).expect("parseable test URL");
+        let endpoint =
+            parse_endpoint(cfg.database_url.expose_secret()).expect("parseable test URL");
         if let Some(db) = endpoint.database.as_deref()
             && db != "default"
         {

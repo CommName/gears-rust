@@ -56,6 +56,10 @@ percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_repr = { workspace = true }
+# `database_url` embeds credentials; `SecretString` gives a redacted `Debug`, no
+# `Display`/`Serialize`/`PartialEq`, and zeroize on drop. `toolkit` does not
+# re-export `secrecy`, so it is a direct dependency here.
+secrecy = { workspace = true }
 
 time = { workspace = true }
 rust_decimal = { workspace = true }

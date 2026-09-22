@@ -7,7 +7,7 @@ fn config_defaults_are_applied() {
     assert_eq!(cfg.priority, 10);
     assert_eq!(cfg.request_timeout_secs, 30);
     assert_eq!(cfg.retention_period_secs, 365 * 86_400);
-    assert!(cfg.database_url.expose().is_empty());
+    assert!(cfg.database_url.expose_secret().is_empty());
     assert!(!cfg.allow_insecure_http);
     assert!(
         cfg.async_insert,
@@ -357,7 +357,7 @@ fn expand_vars_expands_database_url_placeholders() {
     let mut cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
     cfg.expand_vars()
         .expect("expand_vars should resolve placeholders");
-    assert_eq!(cfg.database_url.expose(), "http://u:8123/db");
+    assert_eq!(cfg.database_url.expose_secret(), "http://u:8123/db");
 }
 
 #[test]

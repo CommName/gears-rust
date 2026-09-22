@@ -1,56 +1,5 @@
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use toolkit::var_expand::{ExpandVars as ExpandVarsTrait, ExpandVarsError};
-
-/// Wrapper around a config string whose final value is a secret.
-///
-/// Holds a plain `String` for `Deserialize` + `ExpandVars` compatibility
-/// (toolkit's `#[expand_vars]` derive substitutes `${VAR}` placeholders on
-/// `String` fields; `secrecy::SecretString` is not `ExpandVars`-aware), while
-/// suppressing every accidental leak surface:
-///
-/// * No `Display` impl — `format!("{secret}")` won't compile.
-/// * `Debug` emits `<redacted>`, so `tracing::debug!(?cfg)` / panic-formatter
-///   dumps never print the resolved `ClickHouse` URL (which embeds credentials).
-/// * No `Serialize`, no `PartialEq` — secret bytes never leak through a
-///   config-snapshot path or an assertion message.
-///
-/// The only read accessor is [`Self::expose`] (deliberately verbose so every
-/// read site is grep-able). `expand_vars` runs on the inner `String` before
-/// any consumer sees the value.
-#[derive(Clone, Default, Deserialize)]
-#[serde(transparent)]
-pub struct SecretFromEnv(String);
-
-impl SecretFromEnv {
-    /// Construct directly from an already-resolved value, skipping `${VAR}`
-    /// expansion. Config deserialization goes through `#[serde(transparent)]`
-    /// instead; this is for call sites (tests, in-process fixtures) that
-    /// already hold a resolved secret string.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Read the resolved secret bytes. Use only at boundaries that consume the
-    /// URL (config validation, building the `ClickHouse` client); never log the
-    /// returned value.
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for SecretFromEnv {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
-
-impl ExpandVarsTrait for SecretFromEnv {
-    fn expand_vars(&mut self) -> Result<(), ExpandVarsError> {
-        self.0.expand_vars()
-    }
-}
 
 /// Return `true` when `url` uses a plaintext `http` connection (no TLS).
 ///
@@ -83,14 +32,21 @@ pub(crate) fn is_plaintext_url(url: &str) -> bool {
 #[serde(default, deny_unknown_fields)]
 pub struct ClickHousePluginConfig {
     /// `ClickHouse` HTTP endpoint URL including credentials, e.g.
-    /// `https://user:${CH_PASSWORD}@host:8443/db`. Wrapped in [`SecretFromEnv`]
-    /// (Debug-redacted, no Display / Serialize); `${VAR}` templating is
-    /// expanded via the `#[expand_vars]` derive. [`Self::validate`] admits only
-    /// the `http` and `https` schemes, and rejects a plaintext `http` URL
-    /// unless [`Self::allow_insecure_http`] is set. Both checks read the parsed
-    /// (lowercase-normalized) scheme, so `HTTP://` is treated as `http://`.
+    /// `https://user:${CH_PASSWORD}@host:8443/db`. Held as a
+    /// [`SecretString`]: `Debug` emits `[REDACTED]` (so `tracing::debug!(?cfg)`
+    /// and panic-formatter dumps never print the resolved URL), there is no
+    /// `Display`, `Serialize`, or `PartialEq` to leak the bytes through a
+    /// config-snapshot path or an assertion message, and the buffer is zeroized
+    /// on drop. The only read accessor is
+    /// [`ExposeSecret::expose_secret`](secrecy::ExposeSecret::expose_secret),
+    /// so every read site is grep-able; `${VAR}` templating is expanded via the
+    /// `#[expand_vars]` derive before any consumer sees the value.
+    /// [`Self::validate`] admits only the `http` and `https` schemes, and
+    /// rejects a plaintext `http` URL unless [`Self::allow_insecure_http`] is
+    /// set. Both checks read the parsed (lowercase-normalized) scheme, so
+    /// `HTTP://` is treated as `http://`.
     #[expand_vars]
-    pub database_url: SecretFromEnv,
+    pub database_url: SecretString,
     /// Explicit development/test opt-out for a plaintext (`http://`)
     /// `database_url`. `database_url` embeds credentials
     /// ([`Self::database_url`]), so an unencrypted connection sends them —
@@ -198,7 +154,7 @@ pub struct ClickHousePluginConfig {
 impl Default for ClickHousePluginConfig {
     fn default() -> Self {
         Self {
-            database_url: SecretFromEnv::default(),
+            database_url: SecretString::default(),
             allow_insecure_http: false,
             request_timeout_secs: 30,
             // On by default: the write path is one INSERT per request, so
@@ -276,10 +232,10 @@ impl ClickHousePluginConfig {
     /// [`Self::async_insert`] is enabled, a retention window outside
     /// `(0, MAX_RETENTION_SECS]`, or a blank `vendor`.
     pub fn validate(&self) -> Result<(), String> {
-        if self.database_url.expose().trim().is_empty() {
+        if self.database_url.expose_secret().trim().is_empty() {
             return Err("database_url must not be empty".to_owned());
         }
-        let parsed = match url::Url::parse(self.database_url.expose()) {
+        let parsed = match url::Url::parse(self.database_url.expose_secret()) {
             Ok(parsed) => parsed,
             Err(e) => return Err(format!("database_url must be a valid absolute URL: {e}")),
         };
@@ -333,7 +289,7 @@ impl ClickHousePluginConfig {
         // credential- and data-exposure risk, not just a style choice. The
         // override must be set explicitly and is not implied by any other
         // field (e.g. a `http://` scheme alone is never sufficient consent).
-        if is_plaintext_url(self.database_url.expose()) && !self.allow_insecure_http {
+        if is_plaintext_url(self.database_url.expose_secret()) && !self.allow_insecure_http {
             return Err(
                 "database_url uses a plaintext http:// scheme, which sends credentials and \
                  usage data unencrypted; use https:// or set allow_insecure_http = true to \

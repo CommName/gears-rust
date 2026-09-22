@@ -21,8 +21,9 @@
 //! Deliberately NOT `#![cfg(feature = "clickhouse")]` — no Docker and no
 //! server are involved, so this runs on every `cargo test`.
 
-use clickhouse_usage_collector_plugin::config::{ClickHousePluginConfig, SecretFromEnv};
+use clickhouse_usage_collector_plugin::config::ClickHousePluginConfig;
 use clickhouse_usage_collector_plugin::infra::storage::pool::build_client;
+use secrecy::SecretString;
 
 #[test]
 fn build_client_without_installed_crypto_provider_fails_closed() {
@@ -35,7 +36,7 @@ fn build_client_without_installed_crypto_provider_fails_closed() {
     );
 
     let cfg = ClickHousePluginConfig {
-        database_url: SecretFromEnv::new("https://chuser:secret@clickhouse.example:8443/usage_db"),
+        database_url: SecretString::from("https://chuser:secret@clickhouse.example:8443/usage_db"),
         ..ClickHousePluginConfig::default()
     };
     cfg.validate().expect("https config is valid");

@@ -44,7 +44,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
   - **Retired: Coordination Lock Manager, `CatalogLockPort`, `LockGuardPort`.** `infra/coordination/` no longer exists. Both stores are constructed from a ClickHouse client, the metric inventory and a deadline only; nothing in the plugin coordinates across processes.
   - SPI Storage Adapter: pure delegation, no business logic, owns backend-error classification (realizing `cpt-cf-uc-ch-plugin-fr-error-classification`) and keyset cursor encoding.
   - Schema Migration: the embedded `migrations/0001_init.sql` DDL runner (idempotent, re-runnable as a no-op; fixed 1-year TTL default) plus `ensure_retention_ttl`; `--` comment lines stripped and statements split while respecting single-quoted string literals before execution; no versioned-migration framework for non-TTL schema evolution (PRD.md §13 Open Questions).
-  - TLS-defaulted, secret-wrapped DSN (`SecretFromEnv` with redacted `Debug`, no `Display`/`Serialize`).
+  - TLS-defaulted, secret-wrapped DSN (`secrecy::SecretString` with redacted `Debug`, no `Display`/`Serialize`, zeroized on drop).
   - Published (narrower, numerically-bounded) consistency profile per DESIGN.md §3.8.
 
 - **Out of scope**:

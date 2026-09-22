@@ -2184,6 +2184,7 @@ dependencies = [
  "postcard",
  "rust_decimal",
  "rustls",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_repr",
