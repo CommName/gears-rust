@@ -1452,7 +1452,10 @@ impl RecordStore for ChRecordStore {
         // then `gts_id` and the scan binds for the scan predicate, then
         // `gts_id` and the scan binds again for the marker subquery, then the
         // trailing (`$filter` status half) binds.
-        let mut q = self.client.query(&sql);
+        let mut q = self
+            .client
+            .query(&sql)
+            .with_setting("output_format_json_quote_decimals", "1");
         for b in &select_binds {
             q = bind_one(q, b);
         }

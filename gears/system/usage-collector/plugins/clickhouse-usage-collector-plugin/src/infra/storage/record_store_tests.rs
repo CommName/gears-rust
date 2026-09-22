@@ -952,6 +952,40 @@ fn aggregate_response_parses_dimensions_and_decimal_values() {
     );
 }
 
+/// The quoted form is exact; the unquoted form is not — which is precisely why
+/// `aggregate` reads its result with `output_format_json_quote_decimals = 1`.
+///
+/// `serde_json` is built without `arbitrary_precision`, so an unquoted
+/// *fractional* number is stored as an `f64` and a `Decimal128(9)` wider than
+/// ~15 significant digits comes back carrying digits that were never in the
+/// data. Both cases above this test use whole numbers (`7`, `2`), which survive
+/// the `f64` round-trip intact and so cannot detect the difference.
+///
+/// The parser deliberately keeps accepting both shapes; the query-side setting
+/// is what guarantees the exact branch is the one taken in production.
+#[test]
+fn aggregate_response_is_exact_only_for_a_quoted_decimal() {
+    let dim_names: Vec<String> = Vec::new();
+    let exact = "1234567890.123456789";
+
+    let quoted =
+        parse_aggregate_response(format!("{{\"agg\":\"{exact}\"}}\n").as_bytes(), &dim_names)
+            .expect("quoted decimal");
+    assert_eq!(
+        quoted[0].value.as_ref().map(ToString::to_string),
+        Some(exact.to_owned()),
+        "the quoted branch is exact end-to-end"
+    );
+
+    let unquoted =
+        parse_aggregate_response(format!("{{\"agg\":{exact}}}\n").as_bytes(), &dim_names)
+            .expect("an unquoted decimal still parses");
+    assert_ne!(
+        unquoted[0].value, quoted[0].value,
+        "an unquoted fractional number has already lost precision through f64"
+    );
+}
+
 /// An empty `MIN`/`MAX`/`AVG` group comes back as JSON `null`, which is a
 /// valid absent value rather than a parse failure. Blank lines between rows
 /// are skipped, and a missing dimension key decodes as an empty component.

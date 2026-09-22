@@ -5,8 +5,14 @@
 //! differences:
 //!
 //! - `SUM(value)` returns `Decimal128(9)` natively (no `::numeric` cast needed).
+//!   The caller transports it losslessly by reading the result with
+//!   `output_format_json_quote_decimals = 1` (see `AVG` below and
+//!   `record_store::aggregate`).
 //! - `COUNT(*)` returns `UInt64`; for uniform decoding as
 //!   `Option<bigdecimal::BigDecimal>` the caller must handle the JSON type.
+//! - `AVG` avoids `ClickHouse`'s `avg()` entirely, because it returns `Float64`
+//!   and would bound the mean at ~15 significant digits on the server; the mean
+//!   is computed as an exact decimal quotient instead. See [`agg_select_expr`].
 //! - `metadata['key']` (map subscript) replaces `metadata ->> $key`.
 //! - `toString(tenant_id)` converts the `UUID` column to `String` for grouping.
 //! - The grouped result is capped at `MAX_AGGREGATION_BUCKETS + 1` rows via a
@@ -34,9 +40,30 @@ use super::bind::SqlBind;
 
 /// SQL aggregate expression for an [`AggregationOp`].
 ///
-/// `ClickHouse` returns the correct numeric type natively; `AVG` is rounded to
-/// 6 fractional digits to cap the scale of a non-terminating quotient
-/// (DESIGN.md §3.6 Aggregated Query).
+/// `SUM`/`MIN`/`MAX` return `Decimal128(9)` natively and `COUNT(*)` returns
+/// `UInt64`, so those four need no cast: the caller reads the result with
+/// `output_format_json_quote_decimals = 1`, which makes every Decimal arrive as
+/// a quoted JSON string and decode into `BigDecimal` exactly.
+///
+/// `AVG` deliberately does **not** use `ClickHouse`'s `avg()`, which returns
+/// `Float64` and would cap the mean at ~15 significant digits before the result
+/// ever left the server — the quoting setting applies to Decimals and cannot
+/// reach a float. Dividing the two exact Decimal aggregates instead keeps the
+/// whole computation in decimal arithmetic: `Decimal128(9) / UInt64` yields
+/// `Decimal(38, 9)`, which the setting then quotes. Measured on the pinned 25.6
+/// tag, the mean of two `1234567890123.456789` rows is exact this way, where
+/// `avg()` yields `1234567890123.4568`. This also matches the reference
+/// `TimescaleDB` plugin, where Postgres's `avg(numeric)` is already exact.
+///
+/// `ROUND(…, 6)` still caps the scale, because a non-terminating quotient
+/// (e.g. `÷ 3`) is unbounded in scale and decimal division does not make it
+/// finite (DESIGN.md §3.6 Aggregated Query).
+///
+/// `nullIf(COUNT(*), 0)` is load-bearing: an ungrouped aggregate over zero
+/// surviving rows still produces one row, and a bare `SUM(value) / COUNT(*)`
+/// raises `ILLEGAL_DIVISION` there. Dividing by `NULL` instead yields `NULL`,
+/// which is the absent value that empty group already reports. A `GROUP BY`
+/// group always holds at least one row, so this only ever fires ungrouped.
 #[must_use]
 pub fn agg_select_expr(op: AggregationOp) -> &'static str {
     match op {
@@ -44,7 +71,7 @@ pub fn agg_select_expr(op: AggregationOp) -> &'static str {
         AggregationOp::Count => "COUNT(*)",
         AggregationOp::Min => "MIN(value)",
         AggregationOp::Max => "MAX(value)",
-        AggregationOp::Avg => "ROUND(AVG(value), 6)",
+        AggregationOp::Avg => "ROUND(SUM(value) / nullIf(COUNT(*), 0), 6)",
     }
 }
 

@@ -62,9 +62,17 @@ fn count_expr_contains_count_star() {
     assert_eq!(agg_select_expr(AggregationOp::Count), "COUNT(*)");
 }
 
+/// `AVG` is an exact decimal quotient rounded to 6 places, never `avg()` —
+/// `ClickHouse`'s `avg()` returns `Float64` and would bound the mean at ~15
+/// significant digits on the server, where no output setting can recover it.
+/// The `nullIf` keeps an empty ungrouped group returning `NULL` instead of
+/// raising `ILLEGAL_DIVISION`.
 #[test]
-fn avg_expr_rounds_to_6_places() {
-    assert_eq!(agg_select_expr(AggregationOp::Avg), "ROUND(AVG(value), 6)");
+fn avg_expr_is_a_rounded_exact_decimal_quotient() {
+    assert_eq!(
+        agg_select_expr(AggregationOp::Avg),
+        "ROUND(SUM(value) / nullIf(COUNT(*), 0), 6)"
+    );
 }
 
 #[test]

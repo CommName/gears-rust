@@ -7,7 +7,8 @@
 //! - metadata side-channel filtering,
 //! - SUM nets compensation, COUNT active-only, GROUP BY `resource_id`,
 //! - GROUP BY metadata key combined with `$filter` (SELECT/WHERE bind order),
-//! - `MAX_AGGREGATION_BUCKETS + 1` cap enforcement.
+//! - `MAX_AGGREGATION_BUCKETS + 1` cap enforcement,
+//! - full `Decimal128(9)` precision through the `JSONEachRow` result decode.
 //!
 //! `list` and `aggregate` do not resolve `ReplacingMergeTree` versions: they
 //! scan raw rows and anti-join the ids that carry a deactivation marker (see
@@ -1029,6 +1030,95 @@ async fn ch_aggregate_every_op_excludes_a_deactivated_record() {
     }
 }
 
+/// Every op must carry full `Decimal128(9)` precision all the way to the caller.
+///
+/// Two independent hops used to destroy it, and this test covers both:
+///
+/// 1. **Transport.** `aggregate` reads its result as `JSONEachRow`, and
+///    `ClickHouse` writes a Decimal as an *unquoted* JSON number unless
+///    `output_format_json_quote_decimals = 1` is set. `serde_json` is built
+///    without `arbitrary_precision`, so an unquoted fractional number is stored
+///    as an `f64` and `SUM`/`MIN`/`MAX` come back carrying digits that were
+///    never in the data — measured without the setting, the `SUM` below loses
+///    its last five digits.
+/// 2. **Computation.** `ClickHouse`'s `avg()` returns `Float64`, so an `AVG`
+///    built on it is already bounded to ~15 significant digits before the
+///    result leaves the server, where no output setting can recover it.
+///    `agg_select_expr` divides the two exact Decimal aggregates instead.
+///
+/// Every other aggregate assertion in this file is a whole number (or `1.5`),
+/// all of which round-trip through `f64` intact — so this is the only test that
+/// can observe either hop. All four non-`COUNT` expectations here need 19
+/// significant digits and so discriminate individually.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_aggregate_preserves_full_decimal_precision() {
+    let Some((_h, store)) = setup_with_type(VCPU_GTS, &[]).await else {
+        return;
+    };
+    let tenant = Uuid::from_u128(0x3102);
+
+    // Both values carry 6 fractional digits under a 13-digit integer part — 19
+    // significant digits, well beyond what an `f64` holds exactly. The integer
+    // part has to be this wide for the `AVG` case to bite: `ROUND(…, 6)` caps
+    // the mean's scale, so only the digits left of the point can push it past
+    // `f64`'s ~16-digit reach.
+    let mut low = record_at(VCPU_GTS, tenant, 0x3102_0001, 0);
+    low.value = Decimal::new(1_234_567_890_123_456_789, 6); // 1234567890123.456789
+    store.create(low).await.expect("create the low record");
+
+    let mut high = record_at(VCPU_GTS, tenant, 0x3102_0002, 1);
+    high.value = Decimal::new(7_654_321_098_765_432_101, 6); // 7654321098765.432101
+    store.create(high).await.expect("create the high record");
+
+    let cases = [
+        (AggregationOp::Sum, "8888888988888.888890"),
+        (AggregationOp::Count, "2"),
+        (AggregationOp::Min, "1234567890123.456789"),
+        (AggregationOp::Max, "7654321098765.432101"),
+        // The mean is exactly 4444444494444.444445 — the sum halves without a
+        // remainder, so `ROUND(…, 6)` has nothing to round and the expectation
+        // is rounding-mode independent. Measured, an `avg()`-based AVG returns
+        // 4444444494444.444 here: the last three digits are gone before the
+        // result leaves the server.
+        (AggregationOp::Avg, "4444444494444.444445"),
+    ];
+
+    for (op, expected) in cases {
+        let spec = AggregationSpec {
+            op,
+            group_by: Vec::new(),
+        };
+        let result = store
+            .aggregate(
+                common::fixture_gts_id(VCPU_GTS),
+                &ODataQuery::new(),
+                &[],
+                spec,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("aggregate {op:?} failed: {e:?}"));
+
+        assert_eq!(
+            result.buckets.len(),
+            1,
+            "empty group_by -> exactly one bucket for {op:?}"
+        );
+        let actual = result.buckets[0]
+            .value
+            .as_ref()
+            .map_or_else(|| panic!("{op:?} produced no value"), ToString::to_string);
+        // `BigDecimal` equality is scale-normalized, so a quoted `Decimal128(9)`
+        // rendering its trailing zeros (`2.000000000`) still equals `2`.
+        let actual_num: BigDecimal = actual.parse().expect("numeric aggregate");
+        let expected_num: BigDecimal = expected.parse().expect("numeric literal");
+        assert_eq!(
+            actual_num, expected_num,
+            "{op:?} must keep every significant digit (got {actual})"
+        );
+    }
+}
+
 /// A group whose only record is deactivated must disappear entirely, not
 /// survive as a zero-valued bucket.
 ///
@@ -1169,6 +1259,12 @@ async fn ch_aggregate_with_a_status_filter_exercises_the_trailing_conjunct() {
 ///
 /// The gateway depends on this shape: an aggregate over an empty survivor set
 /// must still yield its single (null-valued) bucket.
+///
+/// Every op is exercised because this is the one scope where `AVG`'s expression
+/// can fail outright rather than merely return the wrong number: it divides
+/// `SUM(value)` by `COUNT(*)`, and an empty survivor set makes that denominator
+/// zero. `nullIf` is what turns the resulting `ILLEGAL_DIVISION` into the absent
+/// value the bucket is contracted to carry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ch_aggregate_over_only_deactivated_records_yields_one_ungrouped_bucket() {
@@ -1189,27 +1285,37 @@ async fn ch_aggregate_over_only_deactivated_records_yields_one_ungrouped_bucket(
             .expect("deactivate every seeded record");
     }
 
-    let spec = AggregationSpec {
-        op: AggregationOp::Sum,
-        group_by: Vec::new(),
-    };
-    let result = store
-        .aggregate(
-            common::fixture_gts_id(VCPU_GTS),
-            &ODataQuery::new(),
-            &[],
-            spec,
-        )
-        .await
-        .expect("an aggregate over no surviving group must still succeed");
+    for op in [
+        AggregationOp::Sum,
+        AggregationOp::Count,
+        AggregationOp::Min,
+        AggregationOp::Max,
+        AggregationOp::Avg,
+    ] {
+        let spec = AggregationSpec {
+            op,
+            group_by: Vec::new(),
+        };
+        let result = store
+            .aggregate(
+                common::fixture_gts_id(VCPU_GTS),
+                &ODataQuery::new(),
+                &[],
+                spec,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("an aggregate over no surviving group must still succeed for {op:?}: {e:?}")
+            });
 
-    assert_eq!(
-        result.buckets.len(),
-        1,
-        "an ungrouped aggregate always emits exactly one bucket, even when no row \
-         survives the marker anti-join: {:?}",
-        result.buckets
-    );
+        assert_eq!(
+            result.buckets.len(),
+            1,
+            "an ungrouped aggregate always emits exactly one bucket for {op:?}, even when no \
+             row survives the marker anti-join: {:?}",
+            result.buckets
+        );
+    }
 }
 
 /// An unfiltered `list` shows a deactivated record exactly once, as inactive,
