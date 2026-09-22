@@ -52,7 +52,11 @@ impl Gear for ClickHouseUsageCollectorPlugin {
         // --- Three-step init sequence ---
 
         // Step A: Build the ClickHouse HTTP client and configure timeouts / pool.
-        let client = build_client(&cfg);
+        // Fallible: the transport is built from the process-wide rustls
+        // CryptoProvider, which `toolkit::bootstrap::init_procedure` installs
+        // before any `Gear::init` runs. Absent one, fail rather than fall back
+        // to the `clickhouse` crate's hardcoded provider.
+        let client = build_client(&cfg)?;
 
         // Step B: Run the embedded idempotent schema migration, then reconcile
         // usage_records TTL with the configured retention window. Both are

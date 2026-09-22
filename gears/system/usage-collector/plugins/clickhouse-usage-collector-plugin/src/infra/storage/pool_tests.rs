@@ -6,6 +6,23 @@ use super::{
 };
 use crate::config::is_plaintext_url;
 
+/// Install a rustls `CryptoProvider` for this test process.
+///
+/// `build_client` fails closed when none is installed (see
+/// `pool.rs::new_base_client`). Production installs one in
+/// `toolkit::bootstrap::init_procedure` before any `Gear::init` runs; unit
+/// tests do not go through bootstrap, so they install one here. Which
+/// provider it is does not matter to these tests — none of them opens a
+/// socket, they only need the lookup in `new_base_client` to find something.
+///
+/// Idempotent and race-safe: `install_default` is backed by a process-wide
+/// `OnceLock`, so a second call — from another test, possibly on another
+/// thread — returns `Err` and is deliberately dropped. `drop` rather than
+/// `let _ =` satisfies `clippy::let_underscore_must_use`.
+fn install_test_crypto_provider() {
+    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+}
+
 // ---------------------------------------------------------------------------
 // Comment stripping ahead of `;`-splitting
 //
@@ -437,8 +454,9 @@ fn build_client_accepts_https_url_with_auth_and_database() {
         ..ClickHousePluginConfig::default()
     };
     cfg.validate().expect("https config is valid");
+    install_test_crypto_provider();
     // Construction only — no network I/O.
-    let _client = build_client(&cfg);
+    let _client = build_client(&cfg).expect("client builds once a provider is installed");
 }
 
 #[test]
@@ -453,7 +471,8 @@ fn build_client_accepts_plaintext_http_when_override_set() {
         ..ClickHousePluginConfig::default()
     };
     cfg.validate().expect("override permits http");
-    let _client = build_client(&cfg);
+    install_test_crypto_provider();
+    let _client = build_client(&cfg).expect("client builds once a provider is installed");
 }
 
 /// The fallback client is inert: an unparseable `database_url` fails every
@@ -473,7 +492,9 @@ async fn build_client_falls_back_to_inert_client_on_unparseable_url() {
     cfg.validate()
         .expect_err("an unparseable database_url must not pass validation");
 
-    let client = build_client(&cfg);
+    install_test_crypto_provider();
+    let client =
+        build_client(&cfg).expect("an unparseable URL degrades to an inert client, not an error");
     let err = client
         .query("SELECT 1")
         .execute()
@@ -977,7 +998,8 @@ mod integration {
                 .expect("CREATE DATABASE IF NOT EXISTS must succeed");
         }
 
-        let client = build_client(&cfg);
+        super::install_test_crypto_provider();
+        let client = build_client(&cfg).expect("client builds once a provider is installed");
         apply_migrations(&client, cfg.client_deadline())
             .await
             .expect("migration must succeed against a live ClickHouse instance");

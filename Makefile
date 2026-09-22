@@ -940,6 +940,11 @@ test-cluster-redis: install-tools
 ##                                test surface). See issue #1935.
 ##   - cf-gears-oagw           : startup validation rejects allow_http_upstream
 ##                                under --features fips (PR #1985).
+##   - cf-gears-clickhouse-usage-collector-plugin
+##                              : the ClickHouse HTTP transport is built from the
+##                                installed CryptoProvider rather than the
+##                                `clickhouse` crate's hardcoded non-FIPS
+##                                aws-lc-rs (see infra::storage::pool).
 ##
 ## Per-package `pkg/feat` syntax is required because `bootstrap` exists only
 ## on `cf-gears-toolkit` and the crates have independent FIPS feature
@@ -948,7 +953,7 @@ test-cluster-redis: install-tools
 ## compiles once.
 test-fips: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw \
+	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
 		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-oagw/fips
 
 ## Cross-compile gate for the Windows+FIPS path (Windows handshake

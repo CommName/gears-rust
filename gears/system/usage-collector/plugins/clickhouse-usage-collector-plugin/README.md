@@ -40,6 +40,7 @@ The plugin's only gear dependency is `types-registry` (for the registration hand
 - `validate` also rejects any scheme other than `http`/`https` — including the native-protocol `clickhouse://` and `tcp://` forms — since this plugin talks to ClickHouse's HTTP interface only. That is a separate failure from the TLS gate: `allow_insecure_http` is consent to skip TLS, not consent to an unusable scheme. Only the offending scheme appears in the error; the DSN never does.
 - `allow_insecure_http` exists for local development/test against an unencrypted ClickHouse instance (e.g. a Docker test container) — it **MUST NOT** be set in production.
 - Even with the override, `build_client` still emits a `tracing::warn!` on every plaintext connection so operators have a durable, per-startup signal that TLS is off.
+- The HTTPS transport is built from the rustls `CryptoProvider` the host process installed, not from the `clickhouse` crate's own connector (which hardcodes a non-FIPS `aws-lc-rs` provider). A server started with `--features fips` therefore gets FIPS-validated crypto on the ClickHouse path too, and this plugin needs no `fips` feature of its own. If no provider has been installed — i.e. `toolkit::bootstrap::init_crypto_provider` has not run — `build_client` fails rather than falling back.
 
 ### Retention window management
 

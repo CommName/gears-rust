@@ -201,8 +201,9 @@ pub struct Metrics {
     //   separate TLS-handshake error variant to distinguish.
     //
     // - No observable pool gauges (`pool_connections_active`,
-    //   `pool_connections_idle`): the `clickhouse` 0.15.x crate uses `reqwest`'s
-    //   internal HTTP connection pool and exposes no pool-size counters.
+    //   `pool_connections_idle`): the `clickhouse` 0.15.x crate runs on a
+    //   `hyper-util` legacy client's internal connection pool and exposes no
+    //   pool-size counters.
     //
     // - No `uc_clickhouse_lock_*` series: the plugin uses no coordination lock
     //   (DESIGN.md §3.5), so nothing could ever increment them.

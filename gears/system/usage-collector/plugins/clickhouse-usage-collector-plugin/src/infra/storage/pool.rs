@@ -2,6 +2,8 @@
 //!
 //! Exposes five entry points:
 //! - [`build_client`] — constructs and configures the `clickhouse::Client`.
+//!   Its transport comes from `new_base_client`, the one place this plugin
+//!   chooses an HTTP stack (and therefore a crypto provider).
 //! - `configure_insert` — applies this plugin's per-`INSERT` timeouts and
 //!   settings (including the insert dedup token) to a freshly acquired
 //!   `Insert` handle.
@@ -10,10 +12,12 @@
 //! - [`ensure_retention_ttl`] — reconciles `usage_records` TTL with config.
 //! - [`ensure_insert_dedup_window`] — retrofits the `usage_records` insert
 //!   dedup window onto tables created before the migration carried it.
-
 use std::time::Duration;
 
 use anyhow::Context as _;
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
 use percent_encoding::percent_decode_str;
 use url::Url;
 
@@ -106,6 +110,71 @@ pub(crate) const MIGRATION_SQL: &str = include_str!("../../../migrations/0001_in
 /// Default `usage_records` TTL baked into [`MIGRATION_SQL`] (1 year in seconds).
 pub(crate) const DEFAULT_RETENTION_SECS: u64 = 365 * 86_400;
 
+/// TCP keepalive applied to the `ClickHouse` HTTP connector.
+const TCP_KEEPALIVE: Duration = Duration::from_mins(1);
+
+/// Idle-socket timeout for the `ClickHouse` HTTP connection pool.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Mint a bare `clickhouse::Client` — no URL, credentials or settings — over
+/// an HTTP stack this crate controls.
+///
+/// # Why not `clickhouse::Client::default()`
+///
+/// Under the workspace's `rustls-tls` feature, the crate's
+/// `http_client::default()` (`clickhouse-0.15.1/src/http_client.rs:46-76`)
+/// hardcodes the **non**-FIPS `aws_lc_rs` provider, ignoring whatever
+/// `toolkit::bootstrap::init_crypto_provider` installed process-wide. A FIPS
+/// server would pass its `provider.fips()` witness and still negotiate
+/// `ClickHouse` connections through non-validated crypto. The provider is
+/// reached from *source*, not a distinct crate, so `make fips-policy` cannot
+/// catch it.
+///
+/// So the connector is rebuilt from the installed provider and passed to
+/// `Client::with_http_client`. Every other knob `http_client::default()` sets
+/// is reproduced verbatim — including **webpki** roots, since the OS trust
+/// store would change which CAs are accepted — so only the backend differs,
+/// and in a non-FIPS build it resolves to the same one.
+///
+/// # Errors
+///
+/// Fail-closed when no rustls `CryptoProvider` is installed: building from an
+/// ad-hoc one would mask a misconfigured bootstrap rather than surface it.
+fn new_base_client() -> anyhow::Result<clickhouse::Client> {
+    // `get_default` reads the process-wide provider rustls itself holds, and
+    // returns `None` when none was installed — no fallback that would mint one
+    // from the calling crate's own `cfg!`, which is the source-level provider
+    // selection this function exists to eliminate. Fail closed instead, so a
+    // misconfigured bootstrap surfaces.
+    let provider = rustls::crypto::CryptoProvider::get_default().context(
+        "cannot build the ClickHouse client: call \
+         toolkit::bootstrap::init_crypto_provider() first",
+    )?;
+
+    let mut connector = HttpConnector::new();
+    connector.set_keepalive(Some(TCP_KEEPALIVE));
+    // The crate computes this as `!cfg!(any(native-tls, rustls-tls-aws-lc,
+    // rustls-tls-ring))`, which is `false` for the workspace's feature set —
+    // https:// URLs must reach the TLS connector rather than be rejected.
+    connector.enforce_http(false);
+
+    // The builder takes `impl Into<Arc<CryptoProvider>>`; `get_default` hands
+    // back a `&Arc`, so this clones the handle — same provider identity, no
+    // deep copy of the provider itself.
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_provider_and_webpki_roots(provider.clone())
+        .context("failed to build the ClickHouse TLS connector from the installed CryptoProvider")?
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(connector);
+
+    let http = HyperClient::builder(TokioExecutor::new())
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .build(connector);
+
+    Ok(clickhouse::Client::with_http_client(http))
+}
+
 /// Build a configured `clickhouse::Client` from the plugin config.
 ///
 /// The DSN (embedding credentials) is unwrapped from [`SecretFromEnv`] only
@@ -129,7 +198,13 @@ pub(crate) const DEFAULT_RETENTION_SECS: u64 = 365 * 86_400;
 /// Settings attached here ride on **every** request this client makes,
 /// `SELECT`s included. Settings that must apply to writes only are attached
 /// per-statement by `configure_insert` instead.
-pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
+///
+/// # Errors
+///
+/// Propagates [`new_base_client`]'s fail-closed error when no rustls
+/// `CryptoProvider` has been installed process-wide. An unparseable
+/// `database_url` is *not* an error here — see the inert-client note below.
+pub fn build_client(cfg: &ClickHousePluginConfig) -> anyhow::Result<clickhouse::Client> {
     let url = cfg.database_url.expose();
 
     // TLS posture check — mirrors the reference plugin's sslmode-warn pattern.
@@ -176,7 +251,7 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
     // combined timeout knob rather than separate send/receive splits.
     let timeout_str = cfg.request_timeout_secs.to_string();
 
-    let mut client = clickhouse::Client::default()
+    let mut client = new_base_client()?
         .with_url(endpoint.base_url)
         .with_setting("send_timeout", &timeout_str)
         .with_setting("receive_timeout", &timeout_str);
@@ -191,7 +266,7 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
         client = client.with_database(database);
     }
 
-    client
+    Ok(client)
 }
 
 /// Apply this plugin's per-`INSERT` `ClickHouse` configuration to a freshly

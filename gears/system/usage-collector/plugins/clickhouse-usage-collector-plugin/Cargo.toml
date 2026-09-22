@@ -33,6 +33,22 @@ async-trait = { workspace = true }
 
 clickhouse = { workspace = true }
 url = { workspace = true }
+
+# HTTP transport for the `ClickHouse` client. Built here rather than taken from
+# `clickhouse::Client::default()` so the TLS stack uses the process-wide rustls
+# CryptoProvider instead of the crate's hardcoded non-FIPS `aws-lc-rs`
+# (see `infra::storage::pool::new_base_client`). `hyper-util` needs its
+# features spelled out -- the workspace entry is bare and `client-legacy` is
+# not a default; mirrors `libs/toolkit-http/Cargo.toml`, minus `http2` because
+# the stock `ClickHouse` connector is `enable_http1()` only.
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true, features = [
+  "client",
+  "client-legacy",
+  "http1",
+  "tokio",
+] }
+rustls = { workspace = true }
 # Decode percent-encoded userinfo from `database_url` before `with_user` /
 # `with_password` (Url::username/password return the encoded form).
 percent-encoding = { workspace = true }

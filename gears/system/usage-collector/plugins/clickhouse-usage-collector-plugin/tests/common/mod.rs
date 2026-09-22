@@ -77,7 +77,19 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
         ))
         .expect("valid test config json");
 
-    let client = build_client(&cfg);
+    // `build_client` fails closed when no rustls `CryptoProvider` is installed
+    // process-wide (see `pool.rs::new_base_client`). Production installs one in
+    // `toolkit::bootstrap::init_procedure`; this harness does not go through
+    // bootstrap, so it installs one itself. The harness talks plain `http://`,
+    // so the provider is never exercised — the lookup just has to succeed.
+    //
+    // Idempotent and race-safe: `install_default` is backed by a process-wide
+    // `OnceLock`, so a second call returns `Err`, which is deliberately
+    // dropped. `drop` rather than `let _ =` satisfies
+    // `clippy::let_underscore_must_use`.
+    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+
+    let client = build_client(&cfg)?;
 
     wait_until_ready(&client).await?;
 

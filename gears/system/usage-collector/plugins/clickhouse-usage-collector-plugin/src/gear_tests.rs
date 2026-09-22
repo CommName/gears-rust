@@ -20,6 +20,27 @@ impl ConfigProvider for StaticConfig {
     }
 }
 
+/// Install a rustls `CryptoProvider` for this test process.
+///
+/// Only needed by tests that let `init` reach step A: `build_client` fails
+/// closed when no provider is installed (see `pool.rs::new_base_client`), and
+/// in production `toolkit::bootstrap::init_procedure` installs one before any
+/// `Gear::init` runs. Tests that assert on a *config* rejection never get that
+/// far and do not need it.
+///
+/// Must not be hoisted into a shared once-per-process fixture: under
+/// `cargo nextest` each test is its own process, so the install has to happen
+/// in the test that depends on it rather than being inherited from whichever
+/// test happened to run first. That in-process ordering dependency is exactly
+/// what made this a latent `cargo test` pass and a `make test-fips` failure.
+///
+/// Idempotent and race-safe: `install_default` is backed by a process-wide
+/// `OnceLock`, so a second call returns `Err` and is deliberately dropped.
+/// `drop` rather than `let _ =` satisfies `clippy::let_underscore_must_use`.
+fn install_test_crypto_provider() {
+    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+}
+
 #[tokio::test]
 async fn init_rejects_empty_database_url() {
     let provider = Arc::new(StaticConfig(json!({
@@ -99,6 +120,10 @@ async fn init_fails_at_the_migration_step_when_the_backend_is_unreachable() {
         Arc::new(ClientHub::default()),
         CancellationToken::new(),
     );
+
+    // Step A (build_client) needs an installed provider, or `init` fails there
+    // and never reaches the migration this test is about.
+    install_test_crypto_provider();
 
     let err = ClickHouseUsageCollectorPlugin
         .init(&ctx)
