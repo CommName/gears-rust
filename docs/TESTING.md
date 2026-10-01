@@ -219,6 +219,7 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_TIMESCALEDB_TAG` | `TIMESCALEDB_TAG` |
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
 | `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
+| `GEARS_TEST_RYUK_TAG` | `RYUK_TAG` |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration

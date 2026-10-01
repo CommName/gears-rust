@@ -1,4 +1,3 @@
-#![cfg(feature = "clickhouse")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 //! `ClickHouse`-backed integration tests for [`ChCatalogStore`]
 //! (create / get / list / delete).
@@ -19,7 +18,7 @@
 //!
 //! Requires Docker for `ClickHouse`.
 
-mod common;
+use crate::common;
 
 use rust_decimal::Decimal;
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
@@ -595,6 +594,7 @@ async fn ch_usage_type_catalog_insert_is_synchronous() {
     // restricts to inserts, and `usage_records` is not a substring of this name.
     let sql = "SELECT Settings['async_insert'] FROM system.query_log \
                WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+                 AND current_database = currentDatabase() \
                  AND positionCaseInsensitive(query, 'usage_type_catalog') > 0 \
                ORDER BY event_time_microseconds DESC LIMIT 1";
 

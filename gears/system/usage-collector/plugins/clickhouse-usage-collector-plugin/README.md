@@ -153,9 +153,32 @@ The crate implements `usage_collector_sdk::UsageCollectorPluginV1` (via `Storage
 
 ## Running integration tests
 
-The real-DB suites are gated behind the `clickhouse` feature and require Docker for a ClickHouse image:
+The real-DB suites are gated behind the `clickhouse` feature, every Docker-backed
+test is also `#[ignore]`d, and they require Docker for a ClickHouse image:
 
-    cargo test -p cf-gears-clickhouse-usage-collector-plugin --features clickhouse
+    make test-usage-collector-ch
+    # which runs:
+    cargo test -p cf-gears-clickhouse-usage-collector-plugin --features clickhouse \
+        --tests -- --include-ignored --test-threads=8
+
+The integration tests are one test binary (`tests/integration_ch/`) that shares
+**one** ClickHouse container across all its tests and gives each test its own
+database. Run them with `cargo test`: `cargo nextest` still passes, but its
+process-per-test starts a container per test again. The seven Docker tests
+inside `src/` stay in the lib test binary and start a container each.
+
+The shared container is registered with a [Ryuk](https://github.com/testcontainers/moby-ryuk)
+reaper sidecar, which removes it ~10s after the test process exits for any
+reason — `SIGKILL` and the OOM killer included. Each test process registers its
+own session label, so runs in parallel on one Docker daemon never remove each
+other's containers. Environment knobs:
+
+| Variable | Effect |
+|---|---|
+| `GEARS_TEST_CH_MEMORY_MIB` | Memory cap of the container (default `2048`, `0` = none); ClickHouse sizes itself to 90% of it |
+| `GEARS_TEST_DOCKER_SOCKET` | Docker socket mounted into Ryuk (default: `DOCKER_HOST`'s `unix://` path, else `/var/run/docker.sock`) |
+| `GEARS_TEST_RYUK_DISABLED` | Skip Ryuk where mounting the socket is forbidden; a leaked container is then removed when the next run starts |
+| `GEARS_TEST_RYUK_TAG` | Override the pinned Ryuk image tag |
 
 Without the feature, only unit tests run (no Docker needed):
 
@@ -187,6 +210,6 @@ the container is managed by `ClickHouseSidecar` in
 `testing/e2e/lib/sidecars.py`. The ClickHouse image and tag are pinned once,
 as `CLICKHOUSE_IMAGE`/`CLICKHOUSE_TAG` in
 `libs/test-containers/src/lib.rs`, and consumed from there by both
-`tests/common/mod.rs` (via `test_containers::clickhouse()`) and by
+`tests/integration_ch/common/mod.rs` (via `test_containers::clickhouse()`) and by
 `sidecars.py`; the Rust test `e2e_sidecar_pins_the_same_clickhouse_image`
 checks the two stay in agreement.

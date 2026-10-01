@@ -1,4 +1,3 @@
-#![cfg(feature = "clickhouse")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 //! `ClickHouse`-backed integration tests for [`ChRecordStore`] ingest:
 //! single insert with idempotency dedup (insert / absorb / conflict),
@@ -7,7 +6,7 @@
 //! dedup token. Requires Docker, except for the fixture-contract test at the
 //! bottom of the file.
 
-mod common;
+use crate::common;
 
 use rust_decimal::Decimal;
 use tokio::sync::Barrier;
@@ -1046,6 +1045,7 @@ async fn last_insert_settings(
                       Settings['insert_deduplication_token'] \
                FROM system.query_log \
                WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+                 AND current_database = currentDatabase() \
                  AND positionCaseInsensitive(query, ?) > 0 \
                ORDER BY event_time_microseconds DESC LIMIT 1";
 

@@ -1,11 +1,10 @@
-#![cfg(feature = "clickhouse")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 //! `ClickHouse`-backed integration test for the `uc_clickhouse_ready` gauge
 //! lifecycle on the request path: a connectivity failure clears it, and the
 //! next successful round-trip re-arms it, on one metric series. Requires
 //! Docker.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

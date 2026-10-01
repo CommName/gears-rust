@@ -760,16 +760,29 @@ test-usage-collector-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-timescaledb-usage-collector-plugin --features postgres
 
-## Run ClickHouse usage-collector plugin integration tests (Docker required;
-## the suite spins up its own clickhouse container via testcontainers).
-## `--run-ignored all` because the suite is double-gated: the `clickhouse`
+## Run ClickHouse usage-collector plugin integration tests (Docker required).
+## `--include-ignored` because the suite is double-gated: the `clickhouse`
 ## feature compiles the test files, and every Docker-backed test inside them is
 ## `#[ignore]`d. CH_REQUIRE_DOCKER=1 turns an unreachable Docker into a panic —
 ## without it bring_up_or_skip() reports `ok` on a suite that ran nothing.
+##
+## Uses `cargo test`, not `nextest` (like test-cluster-k8s): the integration
+## suite is ONE test binary (`tests/integration_ch/main.rs`) whose harness keeps
+## ONE ClickHouse server in a `static` and gives every test its own database;
+## nextest's process-per-test would start a server per test again.
+## `--test-threads` caps how many tests hit that one server at once; `--tests`
+## skips doctests, as nextest did. The seven Docker tests inside `src/` stay in
+## the lib test binary and still start a container each.
+##
+## No cleanup `trap` is needed: the harness registers its server with a Ryuk
+## reaper sidecar, which removes it ~10s after the test process exits for ANY
+## reason, SIGKILL included. Each run has its own session label, so a pipeline
+## running in parallel on the same Docker daemon is never touched. Set
+## GEARS_TEST_RYUK_DISABLED=1 where mounting the Docker socket is forbidden.
 test-usage-collector-ch: install-tools
 	$(call print_target_banner)
-	CH_REQUIRE_DOCKER=1 cargo nextest run -p cf-gears-clickhouse-usage-collector-plugin \
-		--features clickhouse --run-ignored all --no-fail-fast
+	CH_REQUIRE_DOCKER=1 cargo test -p cf-gears-clickhouse-usage-collector-plugin \
+		--features clickhouse --tests --no-fail-fast -- --include-ignored --test-threads=8
 
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
