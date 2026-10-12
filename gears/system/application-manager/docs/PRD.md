@@ -162,6 +162,7 @@ This glossary is canonical. The DESIGN links to it and adds only design-level te
 | Consumer service | A service that relies on data owned by a section plugin. The Application Manager does not know about it. |
 | Platform-rejected request | A request that the platform turns away before it reaches the system: request protection such as body limits, content-type checks and throttling, and authentication, scope and license checks. The platform logs it. The system does not audit it. |
 | Fail closed | Refusing a request when a required check cannot be answered, instead of letting it through. |
+| Platform-level permission | A permission that platform access control grants for the platform as a whole. A role that a subject holds within one tenant, such as a tenant administrator, is a tenant-level role and is not a platform-level permission. |
 | Contract conformance test | A test that checks one side of a section plugin or audit plugin contract against the obligations of that contract. |
 
 ## 2. Actors
@@ -222,7 +223,7 @@ This glossary is canonical. The DESIGN links to it and adds only design-level te
 
 - **Role**: The platform service that authenticates callers and holds the platform's access rules. Authentication happens before a request reaches the system. The system asks platform access control for a permission decision on every request.
 - **Direction**: The system calls platform access control. Platform access control never calls the system.
-- **Data exchanged**: The system sends the authenticated caller subject and the action: seed, uninstall, listing, or schema reading. Platform access control returns whether the caller is permitted.
+- **Data exchanged**: The system sends the authenticated caller subject and the action: seed, uninstall, listing, or schema reading. It names no tenant. Platform access control decides from the caller and the action by its own rules, and returns whether the caller is permitted. Its policy grants these actions only through a platform-level permission, as `cpt-cf-application-manager-fr-authorization` states.
 - **Availability**: If it cannot answer, the system fails closed: the request ends as temporarily unavailable, and no section plugin is called. See `cpt-cf-application-manager-fr-dependency-failures`.
 
 #### Platform Storage
@@ -433,14 +434,14 @@ The system **MUST** fail to start in each of these cases:
 - no audit plugin is available;
 - more than one audit plugin is registered;
 - the time-limit setting, or another required setting, is missing or invalid;
-- the platform root tenant cannot be determined;
+- the configured limits cannot fit within the platform request deadline even with no section plugin registered (see `cpt-cf-application-manager-nfr-bounded-request-time`);
 - a section key does not follow the stated token pattern (see `cpt-cf-application-manager-contract-section-plugin`).
 
 If the plugin registration facility answers and reports no section plugins, the system **MUST** start with an empty set of section keys. The system **MUST NOT** treat an unreachable plugin registration facility as an empty set of section plugins.
 
-When a dependency that these checks need is temporarily unreachable at startup, the system **MUST** retry it for a configured, bounded period, and **MUST** fail to start only when that period ends without an answer.
+The system **MUST** fail to start at once when any of these checks fails, including when a dependency that a check needs does not answer. The system **MUST NOT** retry a failed startup check. A new start of the system is the only retry.
 
-- **Rationale**: Configuration problems must show up at deploy time, when an operator is watching, and not later at seed time.
+- **Rationale**: Configuration problems must show up at deploy time, when an operator is watching, and not later at seed time. Failing at once, with no retry, keeps startup simple and makes every startup fault visible as a failed start. No startup check depends on another gear's background work, so every check can fail at once.
 - **Actors**: `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-section-plugin`, `cpt-cf-application-manager-actor-audit-plugin`
 - **Depends on**: `cpt-cf-application-manager-fr-unique-section-keys`, `cpt-cf-application-manager-fr-section-priority`, `cpt-cf-application-manager-fr-audit-plugin`, `cpt-cf-application-manager-fr-bounded-plugin-calls`
 
@@ -519,8 +520,8 @@ The system **MUST** report every seed and uninstall request as exactly one of th
 - plugin rejected: at least one section plugin refused its section as unacceptable;
 - not permitted: before dispatch, platform access control refused the caller; or, after dispatch, a section plugin refused because the caller lacks an extra permission;
 - not found: an uninstall named an unknown application, and no section plugin was called;
-- internal failure: at least one section plugin failed unexpectedly or exceeded the time limit, or, after a seed was dispatched, the system could not update the registry (see `cpt-cf-application-manager-fr-dependency-failures`), or, after an accepted uninstall, the system could not delete the registry entry;
-- temporarily unavailable: before dispatch, platform access control, registry storage, the audit plugin for the request hand-off, or a section plugin's schema could not be reached; nothing was dispatched, and the caller can retry.
+- internal failure: at least one section plugin failed unexpectedly or exceeded the time limit, or a dispatch or removal call was not sent because that section plugin's configured in-flight limit was full (reported as not sent for that section), or, after a seed was dispatched, the system could not update the registry (see `cpt-cf-application-manager-fr-dependency-failures`), or, after an accepted uninstall, the system could not delete the registry entry;
+- temporarily unavailable: before dispatch, platform access control, registry storage, the audit plugin for the request hand-off, or a section plugin's schema could not be reached, or a section plugin's schema was unusable; or the request reached a replica before it was ready, while it was stopping, or when the configured limit of concurrent requests was reached; nothing was dispatched, and the caller can retry.
 
 When more than one category applies, `cpt-cf-application-manager-fr-outcome-precedence` decides which one is reported. Platform-rejected requests never reach the system, so they get none of these categories.
 
@@ -536,7 +537,7 @@ Before dispatch, the system **MUST** apply the categories in this order, and **M
 1. temporarily unavailable, because platform access control cannot answer, or registry storage cannot answer for a permitted caller;
 2. not permitted by platform access control;
 3. not found, for uninstall only;
-4. temporarily unavailable, because the audit plugin cannot accept the request hand-off or, for seed only, a section plugin cannot serve its schema;
+4. temporarily unavailable, because the audit plugin cannot accept the request hand-off or, for seed only, a section plugin cannot serve its schema or a section plugin's schema is unusable;
 5. invalid manifest, for seed only.
 
 This order ranks categories only. Which requests are handed to the audit plugin, and when, is set by `cpt-cf-application-manager-fr-audit-ordering`.
@@ -567,6 +568,8 @@ The system **MUST** apply one configurable time limit to every plugin call, incl
 - section dispatch or removal: that section is an internal failure, audited as a timeout, and the remaining section plugins are still called;
 - request hand-off: the audit plugin is treated as unable to accept it, and the request ends as `cpt-cf-application-manager-fr-audit-ordering` states, with nothing dispatched;
 - final-result hand-off: the caller still gets the result, and the failure is logged.
+
+The system **MUST** also apply a configured limit to the calls in flight to each plugin. When that limit is full, the system **MUST NOT** send the new call, and **MUST** end it at once as the list above states for its call kind, reported as not sent rather than as a timeout. For section dispatch or removal, that section is an internal failure, reported as not sent, and the remaining section plugins are still called.
 
 The system **MUST NOT** cancel or undo work that a section plugin has already started.
 
@@ -703,9 +706,12 @@ The system **MUST** accept requests only from subjects authenticated through the
 
 The system **MUST** check the platform's access rules separately for seed, uninstall, listing, and schema reading. The system **MUST** check seed and uninstall as separate permissions. The system **MUST** let a section plugin that needs an extra permission refuse a request as not permitted.
 
-- **Rationale**: Seeding and uninstalling change what other services believe is installed, so they must be tightly controlled.
-- **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-section-plugin`, `cpt-cf-application-manager-actor-platform-access-control`
+Seed, uninstall, listing, and schema reading are platform-level actions. The system **MUST NOT** name a tenant in these permission checks, and **MUST** leave the decision to platform access control, which decides from the caller and the action by its own rules. Those rules may fall back to the caller's own tenant. The platform's access rules **MUST** therefore grant these four actions only through a platform-level permission. A tenant-level role, such as the administrator of any tenant, **MUST NOT** grant them. This obligation belongs to platform access control and its policy owners (see section 10).
+
+- **Rationale**: Seeding and uninstalling change what other services believe is installed, so they must be tightly controlled. Installed applications are a property of the environment, not of a tenant, so only a platform-level permission may grant these actions.
+- **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`, `cpt-cf-application-manager-actor-section-plugin`, `cpt-cf-application-manager-actor-platform-access-control`, `cpt-cf-application-manager-actor-security-reviewer`
 - **Depends on**: `cpt-cf-application-manager-fr-authentication`
+- **Verification Method**: Tests that inspect every permission check the system sends and find no tenant named in it, plus a review of the platform policy with its owners, which shows that only a platform-level permission grants the four actions.
 
 #### Audit Event Per Request
 
@@ -730,7 +736,7 @@ Privacy by design applies, because a caller subject can identify a person. The f
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-audit-ordering`
 
-The system **MUST** attempt the request hand-off for every seed and uninstall request that reaches the system. This includes a request already decided before the hand-off as temporarily unavailable, because platform access control or registry storage could not answer, as not permitted by platform access control, or as not found. A request that reaches a replica before it is ready to serve is a request whose request hand-off was not accepted: it counts as attempted and not accepted, the failure is logged, and it ends as temporarily unavailable. The system **MUST NOT** dispatch anything unless the audit plugin has accepted the request hand-off.
+The system **MUST** attempt the request hand-off for every seed and uninstall request that reaches the system. This includes a request already decided before the hand-off as temporarily unavailable, because platform access control or registry storage could not answer, as not permitted by platform access control, or as not found. A request that reaches a replica before it is ready to serve, while it is stopping, or when the configured limit of concurrent requests is reached is a request whose request hand-off was not accepted: it counts as attempted and not accepted, the failure is logged, and it ends as temporarily unavailable. The system **MUST NOT** dispatch anything unless the audit plugin has accepted the request hand-off.
 
 If the audit plugin cannot accept the request hand-off, the system **MUST**:
 
@@ -791,7 +797,7 @@ The system **MUST** require, through the audit plugin contract, that manifest bo
 
 The system **MUST** meet its half of a complete audit trail for every seed and uninstall request that reaches the system, whatever its outcome: exactly one attempted request hand-off per request, and exactly one attempted final-result hand-off per accepted request hand-off, as `cpt-cf-application-manager-fr-audit-ordering` and `cpt-cf-application-manager-fr-audit-single-handoff` state. The system relies on the audit plugin contract for the second half of the guarantee: the audit plugin eventually records every hand-off it accepts in the request's audit event.
 
-The only case with no audit event is a request whose request hand-off the audit plugin could not accept, except that a request hand-off that exceeded the time limit counts as not accepted although the audit plugin may still have recorded it, as `cpt-cf-application-manager-contract-audit-plugin` describes. `cpt-cf-application-manager-fr-audit-ordering` sets its outcome; nothing is dispatched, and the failure is logged. A final-result hand-off that the audit plugin could not accept is also logged. Platform-rejected requests never reach the system, are logged by the platform, and are not audited. A request that reaches the system before it is ready is not exempt: it is an attempted request hand-off that was not accepted.
+The only case with no audit event is a request whose request hand-off the audit plugin could not accept, except that a request hand-off that exceeded the time limit counts as not accepted although the audit plugin may still have recorded it, as `cpt-cf-application-manager-contract-audit-plugin` describes. `cpt-cf-application-manager-fr-audit-ordering` sets its outcome; nothing is dispatched, and the failure is logged. A final-result hand-off that the audit plugin could not accept is also logged. Platform-rejected requests never reach the system, are logged by the platform, and are not audited. A request that reaches the system before it is ready, while it is stopping, or when the configured limit of concurrent requests is reached is not exempt: it is an attempted request hand-off that was not accepted.
 
 - **Threshold**: In every test run, all of these hold (only requests that reach the system are counted):
   - attempted request hand-offs equal seed and uninstall requests that reach the system, with none missing and none duplicated;
@@ -805,9 +811,9 @@ The only case with no audit event is a request whose request hand-off the audit 
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-platform-scope`
 
-The system **MUST** treat all seeded applications as one platform-wide set. The system **MUST NOT** make registry data owned by or visible per tenant, and **MUST** make registry data reachable only through the platform's access checks. A scoping marker that is always the platform root tenant is not per-tenant ownership.
+The system **MUST** treat all seeded applications as one platform-wide set. The system **MUST NOT** make registry data owned by or visible per tenant, and **MUST** make registry data reachable only through the platform's access checks. The system **MUST NOT** record any tenant against a registry entry.
 
-- **Threshold**: No registry read or write skips the access check. No per-tenant copy of the registry exists.
+- **Threshold**: No registry read or write skips the access check. No per-tenant copy of the registry exists, and no registry entry names a tenant.
 - **Rationale**: Installed applications are a property of the environment, not of a tenant.
 - **Verification Method**: Inspection of the public surface and of data ownership, plus tests on every action.
 - **Architecture Allocation**: See [DESIGN.md § NFR Allocation](./DESIGN.md#nfr-allocation) for how this is realized
@@ -838,9 +844,9 @@ The system **MUST** stop waiting for any plugin call once the time limit has pas
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-nfr-bounded-request-time`
 
-The system **MUST** keep seed and uninstall as non-interactive operations run at deploy time. The system **MUST** keep the worst-case duration of each within the ordered sequence of plugin calls it makes, each capped by the time limit. Operators keep this bound within the platform request deadline.
+The system **MUST** keep seed and uninstall as non-interactive operations run at deploy time. The system **MUST** keep the worst-case duration of each within the ordered sequence of plugin calls it makes, each capped by the time limit, plus one access-control decision and the request's registry operations, each capped by its own configured limit. Operators keep this bound within the platform request deadline. The system **MUST** fail to start when its configured limits cannot fit within the platform request deadline even with no section plugin registered. When they fit without section plugins but not with the registered ones, the system **MUST** start and **MUST** give operators a visible signal.
 
-- **Threshold**: In tests with test section plugins and a test audit plugin that always reach the time limit, a request never takes longer than its sequence of capped plugin calls.
+- **Threshold**: In tests with test section plugins and a test audit plugin that always reach the time limit, and with platform access control and registry storage that always reach their limits, a request never takes longer than its sequence of capped plugin calls plus the capped access-control decision and registry operations.
 - **Rationale**: Deployment pipelines need a predictable upper bound for how long a seed can take.
 - **Architecture Allocation**: See [DESIGN.md § NFR Allocation](./DESIGN.md#nfr-allocation) for how this is realized
 
@@ -993,6 +999,7 @@ Define the public API surface, versioning/compatibility guarantees, and integrat
   - retry internally until every hand-off it accepts is recorded in the request's audit event, including the final result;
   - mark an audit event that never receives its final result as "final result unknown", at a time the audit plugin decides;
   - treat a request hand-off that may have exceeded the time limit on the system's side as possibly recorded, so that an audit event recorded from it is identifiable as one whose audit id the caller never received;
+  - deduplicate hand-offs on the request identity, so that each request has at most one audit event;
   - keep each audit event unaltered once it is complete;
   - document what it stores, how long it keeps it, how it purges it, and how it handles erasure and other data-subject requests;
   - keep manifest bodies unexposed by default, as `cpt-cf-application-manager-fr-audit-exposure` requires;
@@ -1155,7 +1162,6 @@ Define the public API surface, versioning/compatibility guarantees, and integrat
 **Alternative Flows**:
 
 - **Section plugin cannot serve its schema**: Reading that schema, or the combined schema, ends as temporarily unavailable, and the caller can try again. Listing the section keys still works.
-
 ### List Seeded Applications
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-usecase-list-applications`
@@ -1272,12 +1278,13 @@ This use case shows the effect of a change only. It prescribes no order between 
 - [ ] When several pre-dispatch causes apply, the category follows `cpt-cf-application-manager-fr-outcome-precedence`. For example, a request while platform access control cannot answer ends as temporarily unavailable even when the audit plugin is also down, and an uninstall of an unknown application by a refused caller ends as not permitted.
 - [ ] When registry storage fails after a seed was dispatched, the caller gets internal failure, or a category that ranks higher after dispatch, with the per-section results and a statement that the registry was not updated. The final-result hand-off records the failure, and seeding again restores the registry entry.
 - [ ] When a section plugin serves a schema that declares another dialect, uses an external reference, or does not compile, a seed ends as temporarily unavailable, nothing is dispatched, and the failure is reported as a section-plugin defect.
-- [ ] A request that reaches a replica before it is ready is counted as an attempted request hand-off that was not accepted, is logged, and ends as temporarily unavailable.
+- [ ] A request that reaches a replica before it is ready, while it is stopping, or when the configured limit of concurrent requests is reached is counted as an attempted request hand-off that was not accepted, is logged, and ends as temporarily unavailable.
+- [ ] No permission check that the system sends for seed, uninstall, listing, or schema reading names a tenant, and no registry entry records a tenant.
 - [ ] A refused caller ends as not permitted even while registry storage cannot answer.
 - [ ] When a section plugin cannot serve its schema, a seed ends as temporarily unavailable and nothing is dispatched. Reading that schema ends as temporarily unavailable, reading the combined schema ends as temporarily unavailable, and listing the section keys still works.
 - [ ] The registry is unchanged after requests that end before dispatch: invalid manifest, temporarily unavailable, not permitted by platform access control, or not found.
 - [ ] The system fails to start when two section plugins share a key or a priority, or when a section plugin reports no key or priority.
-- [ ] The system fails to start when the plugin registration facility cannot be reached, when no audit plugin is available, when more than one audit plugin is registered, when the time-limit setting is missing or invalid, when the platform root tenant cannot be determined, or when a section key does not follow the token pattern.
+- [ ] The system fails to start when the plugin registration facility cannot be reached, when no audit plugin is available, when more than one audit plugin is registered, when the time-limit setting is missing or invalid, or when a section key does not follow the token pattern.
 - [ ] When the plugin registration facility reports no section plugins, the system starts with an empty set of section keys, and a manifest with an empty set of sections results in succeeded.
 - [ ] Discovery shows the current section keys and live schemas.
 - [ ] Listing applications and listing section keys still work while the audit plugin is unavailable.
@@ -1289,11 +1296,11 @@ This use case shows the effect of a change only. It prescribes no order between 
 |------------|-------------|-------------|
 | Section plugins | Own section keys and priorities, serve schemas, and apply and remove sections. A section plugin that cannot report its key or priority stops the system from starting. When the plugin registration facility reports none, the system starts with an empty key set. See `cpt-cf-application-manager-fr-startup-checks`. | p1 |
 | Audit plugin | Accepts the hand-offs for every seed and uninstall request that reaches the system and records them as audit events. Without one, the system fails to start. If it cannot accept a request hand-off, nothing is dispatched and the request ends as `cpt-cf-application-manager-fr-audit-ordering` states. | p1 |
-| Platform access control | Authenticates callers and decides seed, uninstall, listing, and schema-read permissions. If it cannot answer, the system fails closed. See `cpt-cf-application-manager-fr-dependency-failures`. | p1 |
-| Plugin registration facility | Lets the system find its section plugins and its audit plugin once, at startup. If it cannot be reached within the bounded startup retry, the system fails to start; an unreachable facility is never read as "no section plugins". See `cpt-cf-application-manager-fr-startup-checks`. | p1 |
-| Platform tenant directory | Gives the platform root tenant, which the system needs once at startup. If it is unreachable, startup fails after the bounded retry. See `cpt-cf-application-manager-fr-startup-checks`. | p1 |
+| Platform access control | Authenticates callers and decides seed, uninstall, listing, and schema-read permissions. If it cannot answer, the system fails closed. See `cpt-cf-application-manager-fr-dependency-failures`. The system names no tenant in these permission checks, so platform access control decides by its own rules, which may fall back to the caller's own tenant. Obligation on its policy: these four actions are platform-level, so the policy grants them only through a platform-level permission, and a tenant-level role, such as the administrator of any tenant, does not grant them. The authorization policy owners own this obligation. See `cpt-cf-application-manager-fr-authorization`. | p1 |
+| Plugin registration facility | Lets the system find its section plugins and its audit plugin once, at startup. If it cannot be reached, the system fails to start; an unreachable facility is never read as "no section plugins". See `cpt-cf-application-manager-fr-startup-checks`. | p1 |
+| Platform runtime start failure | A failed start of the system must end the process with a failure exit status, so that deployment tooling sees the failed start and can restart the process. This is still to be verified against the platform runtime. See [DESIGN §4.12](./DESIGN.md#412-assumptions-dependencies-and-migration-impact), which also lists the platform items that this PRD does not repeat, such as out-of-process plugins and exposing the gateway request deadline to gears. | p1 |
 | Platform storage | Holds the registry. If it cannot answer before dispatch, seed, uninstall, and listing end as temporarily unavailable, and nothing is dispatched. If it fails after a seed was dispatched, see `cpt-cf-application-manager-fr-dependency-failures`. | p1 |
-| Platform error format | The platform's standard format for failed responses. Each failed seed and uninstall response carries the outcome report in it, so the format must keep the report the system adds. Today it drops it, and the change is pending with the platform owners. Until it lands, a failed response tells the caller only the outcome category and the error detail, so `cpt-cf-application-manager-fr-response-content` is not yet met for failed responses. See [DESIGN §4.12](./DESIGN.md#412-assumptions-dependencies-and-migration-impact). | p1 |
+| Platform error format | The platform's standard format for failed responses. Each failed seed and uninstall response carries the outcome report in it, so the format must keep the report the system adds. Today it drops it, and the change is pending with the platform owners. Until it lands, a failed seed or uninstall response carries the HTTP status, the outcome category, the error detail, and the platform's standard error context: the field violations of an invalid manifest, and a precondition violation naming each section that a section plugin rejected. It does not carry the full outcome report, that is the per-section outcomes and the registry effect, nor the audit id. `cpt-cf-application-manager-fr-response-content` is therefore not yet met for failed responses. See [DESIGN §4.12](./DESIGN.md#412-assumptions-dependencies-and-migration-impact). | p1 |
 | Platform observability facility | Carries the system's operational logs, metrics, and operator signals, as `cpt-cf-application-manager-nfr-operational-signals` requires. If it loses signals, request handling is not affected. | p2 |
 
 ## 11. Assumptions
@@ -1306,6 +1313,7 @@ This use case shows the effect of a change only. It prescribes no order between 
 - Seeding happens at deploy time and not on user request paths.
 - The platform plugin model lets each section plugin announce a priority.
 - Section plugins and the audit plugin are registered before the system starts.
+- Platform access control can decide a permission check that names no tenant, from the caller and the action alone.
 
 ## 12. Risks
 
@@ -1324,6 +1332,8 @@ This use case shows the effect of a change only. It prescribes no order between 
 | A request is turned away by the platform before it reaches the system | The request has no audit event, because request protection (body limits, content-type checks, throttling) and authentication, scope and license checks run first | The platform logs these requests; only requests that reach the system are audited (see `cpt-cf-application-manager-nfr-audit-completeness`) |
 | The platform error format change does not land | Failed seed and uninstall responses lack the per-section outcomes and the audit id, so callers must consult the audit trail to act on a failure | The dependency is raised with the platform owners; successful responses are unaffected; the audit trail and the application listing still record how each request ended |
 | The audit plugin does not honour its retry-and-record obligation | Audit events are lost | The obligation is part of the audit plugin contract, backed by a contract conformance test owned by audit-plugin authors |
+| The platform policy grants seed, uninstall, listing, or schema reading through a tenant-level role | Platform access control may fall back to the caller's own tenant, so the administrator of any tenant could seed or uninstall applications for the whole environment, or read the whole registry | The obligation is recorded on platform access control (section 10) and in `cpt-cf-application-manager-fr-authorization`; the policy is reviewed with the authorization policy owners before release; every seed and uninstall is audited with the caller subject, so a wrong grant is traceable |
+| A failed start does not end the process with a failure exit status | Deployment tooling that reacts only to a failure exit does not see or restart a failed start, and a replica may stay down unnoticed | The platform runtime behaviour is verified by a smoke test before release (see [DESIGN §4.12](./DESIGN.md#412-assumptions-dependencies-and-migration-impact)); the startup failure signal and a replica that never becomes ready remain visible to operators |
 
 ## 13. Open Questions
 

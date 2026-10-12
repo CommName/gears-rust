@@ -81,7 +81,7 @@ Impact by concern:
 * A test with a section plugin added and then removed, with no change to gear code, demonstrates `cpt-cf-application-manager-fr-plugin-extensibility`.
 * A test with a counting registry double shows that no types-registry call happens during seed, uninstall or listing keys.
 * Dispatch-order tests confirm lowest priority value first on seed and on uninstall.
-* Review of record: the [DESIGN](../DESIGN.md) describes the init flow as this ADR states.
+* Review of record: the [DESIGN](../DESIGN.md) describes the startup flow (DESIGN §3.6 Startup and Plugin Discovery) as this ADR states.
 
 ## Pros and Cons of the Options
 

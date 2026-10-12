@@ -59,8 +59,8 @@ The decision has these parts:
 * **Re-seed carries no diff meaning.** A re-seed simply overwrites the entry with the newest values. The gear does not compare the new version with the old one, does not record what changed and does not decide whether a re-seed is an upgrade, a downgrade or a repeat.
 * **Uninstall.** Once an uninstall is accepted (authorized, application found, request hand-off accepted by the audit plugin), the entry is deleted, whatever the section plugins return. Section plugin outcomes of an uninstall live only in the response and the audit event. The last seeded version is read from the entry before deletion and passed to the section plugins.
 * **Recovery.** The registry is a rebuildable view of the last seeds. Recovery, including repair after a registry write failed post-dispatch, is a re-seed by each application's seeding caller.
-* **Storage scoping.** The table also carries `owner_tenant_id`, a secure-ORM scoping value that is always the platform root tenant. It is not application data and not per-tenant ownership, and the sentence "nothing else of the application is stored" refers to application data.
-* **Scope.** The registry is one platform-wide set held in platform storage, reachable only through the platform's access checks. It is not per tenant.
+* **Storage scoping.** The table carries no owner column and no other scoping column. It is an unrestricted global table: the secure-ORM entity is declared `#[secure(unrestricted)]`, so `secure_insert` needs no tenant id, and access is gated only by the permission decision for the action ([ADR 0007](./0007-cpt-cf-application-manager-adr-platform-scope-without-root-tenant.md)). The table holds exactly the stored fields above.
+* **Scope.** The registry is one platform-wide set held in platform storage, reachable only through the platform's access checks. It is not per tenant, and no entry names a tenant.
 
 Decision scope: this ADR covers what the registry stores, when an entry is written or deleted, what a re-seed means for it, and how it is recovered. It does not decide validation and dispatch ([ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md)), the audit id and audit storage ([ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md)), how outcomes are reported over HTTP ([ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md)), or concurrent seeds for the same application id, which [DESIGN §4.2](../DESIGN.md#42-concurrent-requests-for-the-same-application) resolves.
 
@@ -88,7 +88,7 @@ Impact by concern:
 
 ### Confirmation
 
-* Confirmation of storage scoping: the registry table carries the platform root tenant as its scoping value and no other tenant value.
+* Confirmation of storage scoping: inspection shows that the registry entity is declared `#[secure(unrestricted)]` and that the table has no owner column and no other scoping column ([ADR 0007](./0007-cpt-cf-application-manager-adr-platform-scope-without-root-tenant.md)).
 * Review of record: the registry section of the [DESIGN](../DESIGN.md) matches the field list above: no field beyond those named, and no manifest or section content.
 * Tests that compare the registry before and after each outcome that ends before dispatch (unchanged) and each outcome after dispatch (created or updated, with the correct last result).
 * A test that deletes the entry on an accepted uninstall regardless of section plugin outcomes, and leaves it unchanged on a not permitted, unavailable or not found uninstall.
@@ -147,6 +147,7 @@ Related decisions:
 * [ADR 0003](./0003-cpt-cf-application-manager-adr-validate-all-then-dispatch.md): validation before dispatch and the ordered dispatch whose section outcomes yield the last result value.
 * [ADR 0006](./0006-cpt-cf-application-manager-adr-outcome-http-mapping.md): how outcome categories, ranked by `cpt-cf-application-manager-fr-outcome-precedence`, are reported over HTTP, with partial failure reported as an error.
 * [ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md): the audit plugin issues the audit id at the request hand-off, and owns audit storage and exposure.
+* [ADR 0007](./0007-cpt-cf-application-manager-adr-platform-scope-without-root-tenant.md): the registry is an unrestricted global table with no owner column, and permission decisions name no context tenant.
 
 Review and supersession: revisit this decision if a consumer needs history of past seeds or per-section applied state in the gear itself, or if per-tenant installs enter scope. Either change would supersede this ADR and would need to weigh the data, privacy and domain-logic costs recorded above. Concurrent seeds for the same application id are not decided here; they are resolved in [DESIGN §4.2](../DESIGN.md#42-concurrent-requests-for-the-same-application).
 
@@ -166,7 +167,7 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-application-manager-fr-pass-through` — the registry keeps no section content or per-section state.
 * `cpt-cf-application-manager-fr-retry` — retry is a fresh seed, because no applied state is kept.
 * `cpt-cf-application-manager-nfr-recovery` — the registry is fully rebuilt by re-seeding.
-* `cpt-cf-application-manager-nfr-platform-scope` — one platform-wide set, reachable only through access checks.
+* `cpt-cf-application-manager-nfr-platform-scope` — one platform-wide set with no owner column, reachable only through access checks.
 * `cpt-cf-application-manager-nfr-availability` — listing stays available while the audit plugin is down.
 * `cpt-cf-application-manager-usecase-list-applications` — the operator lists seeded applications from the registry.
 * `cpt-cf-application-manager-usecase-uninstall` — uninstall deletes the entry once accepted.

@@ -48,7 +48,7 @@ Every seed and uninstall request ends in exactly one outcome category (`cpt-cf-a
 
 Chosen option: "One HTTP status per outcome category, partial failure reported as an error", because it is the only option that lets a caller act on the status alone, keeps the fixed precedence visible in the status, and never lets a partial failure pass as success.
 
-Every seed and uninstall request ends in exactly one outcome category, mapped as follows. The response always carries the category and the outcome of each section (or of each section plugin for uninstall), and the audit id whenever the audit plugin accepted the request hand-off (see [ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md)).
+Every seed and uninstall request ends in exactly one outcome category, mapped as follows. The response always carries the category. By design it also carries the outcome of each section (or of each section plugin for uninstall), and the audit id whenever the audit plugin accepted the request hand-off (see [ADR 0004](./0004-cpt-cf-application-manager-adr-audit-via-plugin.md)). A success response carries them today. A failed response carries them only once the platform dependency in Consequences lands.
 
 | Outcome category | HTTP status | Meaning |
 |---|---|---|
@@ -71,11 +71,11 @@ Decision scope: this ADR covers how each outcome category is reported over HTTP,
 ### Consequences
 
 * The status mapping is part of the public contract. Adding a new outcome category or changing a status would supersede this ADR with a new one and would need an update of the [DESIGN](../DESIGN.md).
-* When a section schema is temporarily unavailable, the report names the section key with a reason: `unreachable`, `timed_out` or `unusable`. For `unusable` (a schema that declares another dialect, uses an external reference, or does not compile), retrying helps only after the section plugin is fixed.
+* When a section schema is temporarily unavailable, the report names the section key with a reason: `unreachable`, `timed_out`, `not_sent` or `unusable`. For `unusable` (a schema that declares another dialect, uses an external reference, or does not compile), retrying helps only after the section plugin is fixed.
 * Generic HTTP clients, deploy jobs and monitoring can treat any status that is not 2xx as a failure, so a partial failure stops a deploy job without body parsing.
 * When several sections fail in different ways, the status names only the category that ranks highest after dispatch; callers that need every failure read the per-section outcomes in the body.
 * The endpoint table of the [DESIGN](../DESIGN.md) must use exactly this mapping and keep 422 and 400 apart.
-* Carrying the outcome report in a failed response depends on the platform's problem format keeping the gear's extension member; the PRD lists it as a p1 dependency with a matching risk, and the [DESIGN](../DESIGN.md) records it as a pending platform dependency. Until it lands, a failed response carries the status and the problem detail only, and `cpt-cf-application-manager-fr-response-content` is not yet met for failed responses.
+* Carrying the outcome report in a failed response depends on the platform's problem format keeping the gear's extension member; the PRD lists it as a p1 dependency with a matching risk, and the [DESIGN](../DESIGN.md) records it as a pending platform dependency. Until it lands, a failed seed or uninstall response carries the HTTP status, the outcome category, the problem detail, and the canonical context: field violations for an invalid manifest (422) and a precondition violation naming each rejecting section (400). It does not carry the full outcome report, that is the per-section outcomes and the registry effect, nor the audit id, so `cpt-cf-application-manager-fr-response-content` is not yet met for failed responses.
 
 Impact by concern:
 
