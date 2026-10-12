@@ -141,6 +141,8 @@ members = [
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
     "gears/system/oagw/oagw",
     "gears/system/oagw/oagw-sdk",
+    "gears/system/application-manager/application-manager-sdk",
+    "gears/system/application-manager/application-manager",
     "gears/system/usage-collector/usage-collector-sdk",
     "gears/system/usage-collector/usage-collector",
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
@@ -357,6 +359,7 @@ resource-group = { package = "cf-gears-resource-group", version = "0.4.5", path 
 credstore = { package = "cf-gears-credstore", version = "0.5.2", path = "gears/credstore/credstore" }
 oagw = { package = "cf-gears-oagw", version = "0.5.5", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.10.0", path = "gears/system/account-management/account-management" }
+application-manager = { package = "cf-gears-application-manager", version = "0.1.0", path = "gears/system/application-manager/application-manager" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.4.0", path = "gears/system/usage-collector/usage-collector" }
 cluster = { package = "cf-gears-cluster", version = "0.2.9", path = "gears/system/cluster/cluster" }
 api-gateway = { package = "cf-gears-api-gateway", version = "0.5.2", path = "gears/system/api-gateway" }
@@ -377,6 +380,7 @@ tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4
 authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.2", path = "gears/system/authz-resolver/authz-resolver-sdk" }
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.5", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.15", path = "gears/system/oagw/oagw-sdk" }
+application-manager-sdk = { package = "cf-gears-application-manager-sdk", version = "0.1.0", path = "gears/system/application-manager/application-manager-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.14", path = "gears/system/usage-collector/usage-collector-sdk" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.6", path = "gears/system/event-broker/event-broker-sdk" }
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }

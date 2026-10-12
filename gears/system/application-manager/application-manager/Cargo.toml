@@ -1,0 +1,37 @@
+[package]
+name = "cf-gears-application-manager"
+description = "application-manager gear"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "application_manager"
+
+[lints]
+workspace = true
+
+[dependencies]
+application-manager-sdk = { workspace = true }
+
+types-registry = { workspace = true }
+authz-resolver = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+humantime-serde = { workspace = true }
+serde = { workspace = true }
+toolkit = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,39 @@
+[package]
+name = "cf-gears-application-manager-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for application-manager gear: section and audit plugin APIs, models, and error definitions"
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "application_manager_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Required by the `gts_type_schema` plugin-spec macro.
+schemars = { workspace = true }
+
+# GTS types
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+# CallerIdentity <-> SecurityContext conversion (DESIGN §3.1, §3.3).
+toolkit-security = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

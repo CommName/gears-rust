@@ -1,0 +1,7 @@
+[gear]
+name = "Application Manager"
+description = "Platform-wide application manifest seeding and uninstall, dispatched to pluggable section plugins with a mandatory audit plugin."
+category = "core-functionality"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

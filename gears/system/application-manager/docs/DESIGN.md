@@ -160,20 +160,35 @@ The gear uses the platform's single layer model: `api/rest/`, `domain/`, and `in
 | Infrastructure (`infra/`) | Guarded plugin calls and ClientHub adapters, the PolicyEnforcer adapter, registry persistence, startup checks, the readiness healthcheck, and telemetry | ClientHub scoped clients by GTS id; types registry `list_instances`; PolicyEnforcer; SeaORM through SecureConn; a hand-implemented start capability; platform OpenTelemetry |
 | SDK crate (`application-manager-sdk`), the contract | Section plugin and audit plugin interfaces, shared models, plugin error kinds, and GTS type definitions | Rust traits and models; GTS |
 
-The SDK crate is the only crate that plugin gears depend on. The gear registers no public ClientHub client of its own, so REST is the only consumer surface. Planned code locations, relative to `gears/system/application-manager/`:
+The SDK crate is the only crate that plugin gears depend on. The gear registers no public ClientHub client of its own, so REST is the only consumer surface. Code locations, relative to `gears/system/application-manager/`:
 
 | Item | Location |
 |---|---|
 | Section plugin interface | `application-manager-sdk/src/section_plugin_api.rs` |
 | Audit plugin interface | `application-manager-sdk/src/audit_plugin_api.rs` |
 | Shared models: outcome categories, section outcomes, outcome report, audit content, caller identity | `application-manager-sdk/src/models.rs` |
-| Plugin error kinds | `application-manager-sdk/src/errors.rs` |
-| GTS type definitions: the two plugin types, the application resource type, the outcome report type | `application-manager-sdk/src/gts.rs` |
+| Plugin error kinds: `SectionPluginError` and `AuditPluginError` | `application-manager-sdk/src/errors.rs` |
+| GTS type definitions: the two plugin types; the ids of the application resource type and the outcome report type; the authorization action names | `application-manager-sdk/src/gts.rs` |
 | Composition root, capabilities, healthcheck registration | `application-manager/src/gear.rs` |
 | Typed configuration | `application-manager/src/config.rs` |
+| Domain-level storage limits | `application-manager/src/domain/limits.rs` |
 | REST layer | `application-manager/src/api/rest/` (`dto.rs`, `handlers.rs`, `routes.rs`) |
 | Domain services and ports | `application-manager/src/domain/`, with the ports in `domain/ports.rs` |
 | Adapters, registry entity, repository, migrations | `application-manager/src/infra/`, with storage under `infra/storage/` (`entity/`, `repo.rs`, `migrations/`) |
+
+Contract and limit constants have fixed homes. The SDK publishes the ones that plugins and the gear share; the gear keeps its own:
+
+| Constant | Value | Home |
+|---|---|---|
+| `SECTION_KEY_MAX_LEN` | 64 bytes | `application-manager-sdk/src/section_plugin_api.rs` |
+| `SERVED_SCHEMA_MAX_BYTES` | 1 MiB of compact `serde_json` serialization | `application-manager-sdk/src/section_plugin_api.rs` |
+| `PLUGIN_DETAIL_MAX_BYTES` | 1024 bytes | `application-manager-sdk/src/errors.rs` |
+| `HANDOFF_MANIFEST_MAX_DEPTH` | 126 levels | `application-manager-sdk/src/models.rs` |
+| `OUTCOME_REPORT_TYPE_ID`, `APPLICATION_RESOURCE_TYPE`, and the action names `ACTION_SEED`, `ACTION_UNINSTALL`, `ACTION_LIST`, `ACTION_READ_SCHEMA` | The GTS ids and action names of §3.3 | `application-manager-sdk/src/gts.rs` |
+| `GATEWAY_REQUEST_DEADLINE` | 30s | `application-manager/src/config.rs` |
+| `MAX_CONCURRENCY` | 1,000,000 | `application-manager/src/config.rs`, crate-private |
+| `REGISTRY_TEXT_MAX_BYTES` | 255 bytes | `application-manager/src/domain/limits.rs` |
+| `MAX_JSON_DEPTH` | At most `HANDOFF_MANIFEST_MAX_DEPTH` (126); introduced with the receive step | Gear domain (`application-manager/src/domain/`), no file yet |
 
 ## 2. Principles & Constraints
 
@@ -317,7 +332,7 @@ The last result is derived from the section outcomes of that seed:
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-manifest`
 
-**Manifest.** A JSON object with exactly two members: `application`, the envelope, and `sections`, an object with one member per registered section key, whose value is that section. No object anywhere in the body may repeat a member name. The envelope holds exactly `id` and `version`. Each is non-empty text within the configured maximum length (`max_envelope_text_length`, §4.7), with no control character (as §4.1 defines it, which includes NUL). The id is never case-folded, trimmed, or normalised. The envelope rules are the gear's own. Section rules come from each section plugin's schema.
+**Manifest.** A JSON object with exactly two members: `application`, the envelope, and `sections`, an object with one member per registered section key, whose value is that section. No object anywhere in the body may repeat a member name. The envelope holds exactly `id` and `version`. Each is non-empty text within the configured maximum length (`max_envelope_text_length`, §4.7), with no control character (as §4.1 defines it, which includes NUL). The id is never case-folded, trimmed, or normalised. The envelope rules are the gear's own. Section rules come from each section plugin's schema. The SDK's `ApplicationEnvelope`, which `apply` and `remove` receive, holds `id` and `version` and accepts extra members, which it drops. Rejecting extra members is the validator's rule (`additionalProperties`), not the SDK type's.
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-section`
 
@@ -342,30 +357,44 @@ The last result is derived from the section outcomes of that seed:
 | `registry_effect` | What the request did to its entry. `not_updated` and `delete_failed` mean the change is not confirmed: the write failed, or it timed out or was interrupted by a request task failure after it started, in which case it may still have taken effect. | `updated`, `not_updated`, `unchanged`, `deleted`, `delete_failed` |
 | `audit_id` | The audit id, when the request hand-off was accepted | Opaque text |
 
-In the 422 Problem, each field violation mirrors one item of `problems`: field is the location, reason is the rule, and description is the message. In the 400 Problem, each precondition violation mirrors one `rejected` section, using the canonical violation members `type`, `subject`, and `description` ([context.rs](../../../../libs/toolkit-canonical-errors/src/context.rs)). `type` is the fixed token `section_rejected`. `subject` is `/sections/<key>`, followed by the plugin's JSON Pointer location within the section when given. `description` is the plugin's detail, truncated to the bound that the SDK fixes.
+An optional member that does not apply is omitted, never `null`. This holds for `application` and `audit_id`, for `id` and `version` inside `application`, for `detail` and `location` in `sections` items, and for `key` in `unavailable` items.
+
+In the 422 Problem, each field violation mirrors one item of `problems`: field is the location, reason is the rule, and description is the message. In the 400 Problem, each precondition violation mirrors one `rejected` section, using the canonical violation members `type`, `subject`, and `description` ([context.rs](../../../../libs/toolkit-canonical-errors/src/context.rs)). `type` is the fixed token `section_rejected`. `subject` is `/sections/<key>`, followed by the plugin's JSON Pointer location within the section when given. `description` is the plugin's detail, truncated to the SDK bound `PLUGIN_DETAIL_MAX_BYTES` (§3.3).
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-caller-identity`
 
-**Caller identity.** The identity-only context that the gear passes to every section plugin call and to both hand-offs: the subject id, subject type, subject tenant id, and token scopes, copied from the request's `SecurityContext`, plus the request id. It never carries the bearer token. The SDK ships a constructor that turns it back into a `SecurityContext` with no bearer token, copying the subject id, subject type, subject tenant id, and token scopes, so that a plugin can make its own PolicyEnforcer check (§3.3).
+**Caller identity.** The identity-only context that the gear passes to every section plugin call and to both hand-offs: the subject id, subject type, subject tenant id, and token scopes, copied from the request's `SecurityContext`, plus the request id. Its members are `subject_id`, `subject_type` (omitted when unknown), `subject_tenant_id`, `token_scopes`, and `request_id`, and it rejects any other member. It never carries the bearer token. The SDK ships a constructor that turns it back into a `SecurityContext` with no bearer token, copying the subject id, subject type, subject tenant id, and token scopes, so that a plugin can make its own PolicyEnforcer check (§3.3).
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-audit-event-content`
 
-**Audit event content.** The request hand-off carries:
+**Audit event content.** Both hand-offs receive the caller identity as an argument. It is never part of the hand-off content. The `request_id` in the content equals the caller identity's `request_id`, and the `audit_id` in the final-result content equals the audit id argument. The gear guarantees both. An optional member that does not apply is omitted, never `null`. The one exception is `manifest`, as its row states.
 
-- the operation and the request id, a time-ordered UUID generated when the request is received, with its receive time. The request id is the stable correlation key for the request's audit event;
-- the caller identity;
-- the application, by operation. Seed: the id and the version as structured fields, each only when it was extracted and is within the envelope limits. The manifest as sent carries them in every case. Uninstall: the id exactly as submitted when it can be stored, and the last seeded version when the entry was found. A never-storable uninstall id (§4.1) is not carried as a field. The hand-off carries its length in bytes and the SHA-256 digest of its bytes as received instead;
-- the manifest as sent (seed), in one member: the raw body bytes, and a format flag that is `json` when the body parsed and `unparsed` otherwise. When the body parsed, the member also carries the parsed JSON value;
-- the category already decided before the hand-off, if any.
+The request hand-off content (`RequestHandoffContent`):
 
-The final-result hand-off carries:
+| Member | Content |
+|---|---|
+| `operation` | `seed` or `uninstall` |
+| `request_id` | A time-ordered UUID generated when the request is received. It is the stable correlation key for the request's audit event. (open, §4.12) |
+| `received_at` | The receive time, as RFC 3339 text (open, §4.12) |
+| `application` | Seed: `id` and `version`, each only when it was extracted and is within the envelope limits. When the body parsed, the manifest carries them in every case. Uninstall: `id` exactly as submitted when it can be stored, and `version`, the last seeded version, when the entry was found. Omitted for a never-storable uninstall id (§4.1). |
+| `manifest` | Seed only: the parsed JSON value of the body. Omitted when the body is invalid, that is when the gear's single parse (§3.2 step 1) produces no value: a syntax error or non-UTF-8 bytes, nesting beyond `MAX_JSON_DEPTH` (rule `malformed_json`), or a repeated member name (rule `duplicate_member`). An invalid body is not a manifest, so its content is not recorded; the request is still handed off and audited, and it ends as invalid manifest with that rule unless an earlier rank applies. This keeps the hand-off content plain JSON that always round-trips (PRD `cpt-cf-application-manager-fr-audit-event`). A body that is the JSON value `null` is carried as `null`, which is distinct from an omitted member. The hand-off carries no raw body bytes and no format flag. |
+| `decided_category` | The category already decided before the hand-off, if any |
+| `id_length_bytes` | Uninstall of a never-storable id only: the length of the id in bytes, as received |
+| `id_sha256` | Uninstall of a never-storable id only: the SHA-256 digest of the id's bytes as received, written as `sha256:` followed by 64 lowercase hex digits |
 
-- the audit id and the request id;
-- the validation result with its problems;
-- the per-section outcomes, each with the fingerprint of the schema used. `timed_out` means the outcome is unknown, and no late result is sent;
-- the overall outcome category;
-- the registry effect;
-- the completion time.
+The debug form of the request hand-off content prints the manifest as redacted, so manifest content cannot reach logs or diagnostics through it (§2.2). The SDK publishes `HANDOFF_MANIFEST_MAX_DEPTH` (126): the deepest parsed manifest, in nested arrays or objects with `[]` counting as 1, that still round-trips through `serde_json` inside the hand-off content. The hand-off wraps the manifest in its own object, which costs levels under the `serde_json` recursion limit of 128. The gear's parse depth bound `MAX_JSON_DEPTH` is at or below it (§3.2 step 1), so an audit plugin that stores the content as JSON can read back every manifest the gear accepts.
+
+The final-result hand-off content (`FinalResultContent`):
+
+| Member | Content |
+|---|---|
+| `audit_id` | The audit id that the request hand-off returned |
+| `request_id` | The request id |
+| `validation` | The validation result: `valid`, and `problems` with the same item shape as the outcome report. Omitted when validation did not run, so "not run" stays distinct from "valid". |
+| `sections` | The per-section outcomes, in priority order: `key`, `outcome`, and `schema_fingerprint`, the fingerprint of the schema used. `schema_fingerprint` is omitted when no schema was fetched for the section, as on uninstall. `timed_out` means the outcome is unknown, and no late result is sent. |
+| `category` | The overall outcome category |
+| `registry_effect` | The registry effect, including a failed or unconfirmed write or delete |
+| `completed_at` | The completion time, as RFC 3339 text (open, §4.12) |
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-schema-fingerprint`
 
@@ -379,7 +408,7 @@ The final-result hand-off carries:
 | OutcomeCategory and SectionOutcome | Request and per-section results | Fixed sets in `application-manager-sdk/src/models.rs` |
 | OutcomeReport | Caller-facing result of seed and uninstall | GTS type `gts.cf.core.application_manager.outcome_report.v1~`, defined in `application-manager-sdk/src/gts.rs` |
 | CallerIdentity | Identity passed to plugins | `application-manager-sdk/src/models.rs` |
-| AuditEventContent | Content of the two hand-offs | `application-manager-sdk/src/models.rs`, used by the audit plugin interface |
+| AuditEventContent | Content of the two hand-offs | `RequestHandoffContent` and `FinalResultContent` in `application-manager-sdk/src/models.rs`, used by the audit plugin interface |
 | SchemaFingerprint | Identity of a schema as served | Defined above |
 
 **Relationships**:
@@ -388,7 +417,7 @@ The final-result hand-off carries:
 - ApplicationRegistryEntry → AuditEventContent: the entry's audit id names the audit event of the last seed.
 - OutcomeReport → SectionOutcome: one section outcome per section plugin that took part, in priority order.
 - Section → SchemaFingerprint: each validated section carries the fingerprint of the schema it was checked against.
-- AuditEventContent → CallerIdentity: every request hand-off names the caller.
+- AuditEventContent → CallerIdentity: every hand-off call passes the caller as an argument, next to the content.
 
 ### 3.2 Component Model
 
@@ -479,7 +508,7 @@ The PRD's precedence, audit ordering, and dispatch rules form one sequence that 
 
 For seed and uninstall it runs, in order:
 
-1. Receive: the request id, the receive time, and the application id. Seed parses the raw body once, with a parser that rejects any object that repeats a member name, and checks the envelope limits on that parse. The workspace JSON library, `serde_json`, keeps the last of repeated members by default, so the gear needs a duplicate-detecting parse. A repeated member name ends the parse like a syntax error, with rule `duplicate_member`. Member names are compared after unescaping, so `"id"` and `"\u0069d"` are the same name. The parse runs before authorization on a body as large as the gateway body limit, so it is depth-bounded and stack-safe. It runs on `serde_json`'s own deserializer, whose recursion limit stays enabled, and it stops at the gear constant `MAX_JSON_DEPTH`, which is set at or below that limit. A body nested deeper ends the parse like a syntax error, with rule `malformed_json`, so no body can recurse past the bound. When the body does not parse, or `application.id` is missing or not a string, no id is extracted, and the request continues to its rank. Uninstall takes the id from the path or the body and checks only whether it could ever be stored.
+1. Receive: the request id, the receive time, and the application id. Seed parses the raw body once, with a parser that rejects any object that repeats a member name, and checks the envelope limits on that parse. The workspace JSON library, `serde_json`, keeps the last of repeated members by default, so the gear needs a duplicate-detecting parse. A repeated member name ends the parse like a syntax error, with rule `duplicate_member`. Member names are compared after unescaping, so `"id"` and `"\u0069d"` are the same name. The parse runs before authorization on a body as large as the gateway body limit, so it is depth-bounded and stack-safe. It runs on `serde_json`'s own deserializer, whose recursion limit stays enabled, and it stops at the gear constant `MAX_JSON_DEPTH`, which is set at or below the SDK's `HANDOFF_MANIFEST_MAX_DEPTH` (126, §3.1). That bound is below the recursion limit, and it keeps every accepted manifest readable inside the hand-off content. A body nested deeper ends the parse like a syntax error, with rule `malformed_json`, so no body can recurse past the bound. When the body does not parse, or `application.id` is missing or not a string, no id is extracted, and the request continues to its rank. Uninstall takes the id from the path or the body and checks only whether it could ever be stored.
 2. The permission decision for `seed` or `uninstall`, through the policy decision port, bounded by `pdp_call_timeout`, with no context tenant. The application id is sent as a resource property only when one was extracted and it can be stored (§3.3).
 3. For a permitted caller only, the registry step: a read of the entry under the permit's scope, bounded by `registry_operation_timeout`. It proves that storage can answer and, for uninstall, decides not found and yields the last version. An uninstall id that can never be stored cannot name any entry, so it is decided as not found with no registry read. That never-storable id is empty, contains a control character (§4.1), or is longer than `REGISTRY_TEXT_MAX_BYTES` (§3.7). Any other uninstall id is looked up, including one longer than `max_envelope_text_length`, which applies to seed only. A seed with no extracted id, or with an id that can never be stored, reads the empty id, which no entry can have, so the step still proves that storage can answer.
 4. The request hand-off, through the audit hand-off client.
@@ -587,7 +616,7 @@ Whole-manifest validation and the combined schema must follow one rule, so that 
 - Owns the envelope schema and the envelope limits: non-empty text, within the configured maximum length, with no NUL or other control characters.
 - Compiles each served section schema as Draft 2020-12. A missing `$schema` means Draft 2020-12. Any of these makes that key's schema `unusable`: a `$schema` that names another dialect, a reference that leaves the served document, a pattern that the linear-time engine cannot compile within its compile limits, a number outside the IEEE-754 double range, an integer beyond 2^53 in magnitude, a schema larger than `SERVED_SCHEMA_MAX_BYTES`, or any other compile failure.
 - Configures the workspace `jsonschema` crate explicitly. The draft is pinned to 2020-12. `pattern` and `patternProperties` use the crate's linear-time engine, the `regex` crate, through the crate's pattern options with explicit compile limits: the gear constants `SCHEMA_REGEX_SIZE_LIMIT` and `SCHEMA_REGEX_DFA_SIZE_LIMIT`. That syntax has no lookaround and no backreferences. The retriever refuses every external reference. No network or file resolution can happen, whatever crate features the workspace enables.
-- Checks the size of each served schema before compiling it: a schema whose serialization is longer than the gear constant `SERVED_SCHEMA_MAX_BYTES`, which the SDK publishes, is `unusable`.
+- Checks the size of each served schema before compiling it: a schema whose compact `serde_json` serialization is longer than `SERVED_SCHEMA_MAX_BYTES` (1 MiB), which the SDK publishes, is `unusable`.
 - Runs compilation, validation, canonicalization, and hashing on the blocking thread pool, off the async executor.
 - Composes the combined schema: the envelope schema with a `sections` object whose properties are every current section schema under its key, all keys required, and no other members allowed. Each section schema is embedded as its own schema resource with a distinct `$id` that the gear assigns: the gear-owned URN `urn:cf:application-manager:section:<key>`, built from its section key. A top-level `$id` in the served schema is replaced by the assigned one. A `$ref` that relies on the served `$id`, such as an absolute URI built from it, therefore becomes an external reference, and the schema is `unusable`. References local to the served document, such as `#/$defs/item`, resolve inside that resource and never collide across section plugins.
 - Validates the manifest against that composition in one pass and collects every problem.
@@ -716,7 +745,7 @@ Every configuration and plugin-set problem must stop the gear at deploy time. Th
 
 ##### Responsibility scope — Startup and Registration
 
-- During `init`: reads the gear configuration with the strict accessor and validates every setting (§4.7), and registers the section plugin and audit plugin GTS types in the types registry. `init` does not register migrations. The gear returns them from `DatabaseCapability::migrations()`, and the platform migration phase runs them before `init` ([contracts.rs](../../../../libs/toolkit/src/contracts.rs), [host_runtime.rs](../../../../libs/toolkit/src/runtime/host_runtime.rs)).
+- During `init`: reads the gear configuration with the strict accessor and validates every setting. Every configuration failure fails `init` with reason `invalid_setting` (§4.7). It also registers the section plugin and audit plugin GTS types in the types registry (phasing: §4.12). `init` does not register migrations. The gear returns them from `DatabaseCapability::migrations()`, and the platform migration phase runs them before `init` ([contracts.rs](../../../../libs/toolkit/src/contracts.rs), [host_runtime.rs](../../../../libs/toolkit/src/runtime/host_runtime.rs)).
 - Startup call bound: each startup call is made once, with no retry, and is bounded by `plugin_call_timeout`. This covers the types registry listing and each `key` call. Scoped client resolution is a synchronous ClientHub lookup that cannot wait ([client_hub.rs](../../../../libs/toolkit/src/client_hub.rs)).
 - During the start phase, through a hand-implemented start capability, `start` runs every startup step itself, in this order, and returns only once the startup result is published or a step has failed:
   - lists the section plugin instances and the audit plugin instances from the types registry, which is in ready mode before the start phase, so one listing sees every registered instance. It reads each registered priority. A listing that fails, or does not answer within its bound, fails `start` with `types_registry_unreachable`, and is never read as an empty listing;
@@ -756,11 +785,11 @@ The domain owns five ports, plus a clock and an id source. Infrastructure implem
 | Startup | Publish the startup result once, and set the stopping flag. Domain components and the REST gate read the holder. | Startup component, into the domain's startup result holder | A holder that tests publish or mark stopping directly |
 | Clock and request id source | Receive time, completion time, and time-ordered request ids | System clock and UUID generator | A controllable clock and a fixed id sequence |
 
-`gear.rs` is the composition root. It returns the migrations from `DatabaseCapability::migrations()`, which the platform runs before `init`. In `init` it validates the configuration, registers the GTS types, and builds the policy adapter, the registry repository, and the orchestrator with its request-task tracker. In the start phase, the startup component runs every startup check, builds the plugin adapters, and publishes the startup result. In the stop phase, the startup component drains the request tasks and the detached plugin calls. Domain services hold their ports as trait objects and never see transport, storage, or ClientHub types. Tests build the domain services directly with doubles, and run the startup component against a fake types registry and ClientHub.
+`gear.rs` is the composition root. It returns the migrations from `DatabaseCapability::migrations()`, which the platform runs before `init`. In `init` it validates the configuration, registers the GTS types, and builds the policy adapter, the registry repository, and the orchestrator with its request-task tracker (phasing: §4.12). In the start phase, the startup component runs every startup check, builds the plugin adapters, and publishes the startup result. In the stop phase, the startup component drains the request tasks and the detached plugin calls. Domain services hold their ports as trait objects and never see transport, storage, or ClientHub types. Tests build the domain services directly with doubles, and run the startup component against a fake types registry and ClientHub.
 
 ### 3.3 API Contracts
 
-This section realizes the PRD public interfaces `cpt-cf-application-manager-interface-seeding` and `cpt-cf-application-manager-interface-discovery`, and the PRD integration contracts `cpt-cf-application-manager-contract-section-plugin` and `cpt-cf-application-manager-contract-audit-plugin`. Once the SDK crate exists, it is the normative statement of the two plugin contracts. Until then, the PRD contracts are normative, together with ADR 0004 for the audit plugin, and the SDK crate must match them when it is written. The plugin tables below mirror them, and both the tables and the SDK crate realize the PRD contracts.
+This section realizes the PRD public interfaces `cpt-cf-application-manager-interface-seeding` and `cpt-cf-application-manager-interface-discovery`, and the PRD integration contracts `cpt-cf-application-manager-contract-section-plugin` and `cpt-cf-application-manager-contract-audit-plugin`. The SDK crate is the normative statement of the two plugin contracts. It matches the PRD contracts, together with ADR 0004 for the audit plugin. The plugin tables below mirror it, and both the tables and the SDK crate realize the PRD contracts.
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-interface-rest-api`
 
@@ -823,7 +852,7 @@ Requests that fail platform authentication get the platform's 401 and never reac
 **Safe wire errors.**
 
 - The text of a section plugin's `Internal` error, timeout details, PDP internals, and storage errors never appear in responses. They are logged under the request's trace id. Plugin `Internal` text is logged length-bounded, under the plugin-diagnostic log classification.
-- A section plugin's `Rejected` and `NotPermitted` detail is returned as caller-facing text, truncated to a bounded length that the SDK fixes. The section plugin contract forbids putting manifest values in it.
+- A section plugin's `Rejected` and `NotPermitted` detail is returned as caller-facing text, truncated to `PLUGIN_DETAIL_MAX_BYTES` (1024 bytes), which the SDK fixes. The section plugin contract forbids putting manifest values in it.
 - Validation messages name locations, rule tokens, and schema-side constraints, never manifest values.
 - Unknown and missing keys are named, because the caller needs them to fix the manifest.
 
@@ -845,11 +874,11 @@ Requests that fail platform authentication get the platform's 401 and never reac
 
 - **Contracts**: `cpt-cf-application-manager-contract-section-plugin`
 - **Technology**: ToolKit plugin model. The asynchronous plugin interface lives in the SDK crate, the GTS plugin type is `gts.cf.toolkit.plugins.plugin.v1~cf.core.application_manager_section.plugin.v1~`, and the client is a scoped ClientHub client under the instance's GTS id.
-- **Location**: `application-manager-sdk/src/section_plugin_api.rs`; the GTS type in `application-manager-sdk/src/gts.rs`
+- **Location**: `application-manager-sdk/src/section_plugin_api.rs`; the error kinds in `application-manager-sdk/src/errors.rs`; the GTS type in `application-manager-sdk/src/gts.rs`
 
 | Operation | Called | Receives | Returns | Time-limit outcome |
 |---|---|---|---|---|
-| `key` | Once, by `start`, after every gear's `init` | Nothing | Its one section key, following the SDK token pattern: lower-case letters, digits, `-`, `_`, and `.`, within a bounded length that the SDK fixes | Called once, with no retry. Startup fails at once with `section_key_unavailable` |
+| `key` | Once, by `start`, after every gear's `init` | Nothing | Its one section key, following the SDK token pattern: 1 to `SECTION_KEY_MAX_LEN` (64) bytes of lower-case letters, digits, `-`, `_`, and `.`, other than `.` and `..` | Called once, with no retry. Startup fails at once with `section_key_unavailable` |
 | `schema` | On every seed after the request hand-off, and on every schema discovery read | Caller identity | Its section schema as a JSON Schema Draft 2020-12 document, with references inside the document | Seed or read ends as temporarily unavailable, reason `timed_out` |
 | `apply` | On seed dispatch, in priority order | Caller identity, the envelope (id, version), and its own section unchanged | Success, or one error kind | Section is `timed_out`, an internal failure; dispatch continues |
 | `remove` | On an accepted uninstall, in priority order | Caller identity and the envelope (id, last seeded version) | Success, or one error kind | Section is `timed_out`, an internal failure; dispatch continues |
@@ -857,6 +886,8 @@ Requests that fail platform authentication get the platform's 401 and never reac
 A call that the plugin's in-flight cap refuses is never sent, so it gives `not_sent` instead of `timed_out`. For `schema` that is the reason `not_sent`, for `apply` and `remove` the section outcome `not_sent`, an internal failure with dispatch continuing, and for `key` a startup failure, `section_key_unavailable`, with no retry.
 
 Priority is not an operation. It is the `priority` of the plugin's registered GTS instance, read from the instance listing at startup, with the lowest value first. The instance `vendor` is not used for selection.
+
+**Section keys.** The SDK publishes the key check as `validate_section_key`. The keys `.` and `..` are rejected, because they cannot be carried as the `{section_key}` path segment of `GET /application-manager/v1/section-keys/{section_key}/schema`: clients and proxies normalise them. Other keys that contain dots, such as `...`, `.a`, and `a.`, are valid.
 
 **Answerable after `init`.** A section plugin must answer `key`, and must have its instance, priority, and scoped client registered, once its own `init` has finished. Neither may depend on the plugin's start phase, because the gear may read them before that plugin gear starts. The same holds for the audit plugin's instance and scoped client.
 
@@ -868,15 +899,17 @@ Priority is not an operation. It is the `priority` of the plugin's registered GT
 
 Any other failure, such as a panic, a transport failure, or a client that cannot be resolved, is treated as `Internal`.
 
-**Caller identity.** Every section plugin call and both hand-offs receive `CallerIdentity` (`cpt-cf-application-manager-entity-caller-identity`), never the raw `SecurityContext`. It has no bearer token, so no plugin can reuse the caller's credentials. A section plugin uses it to identify the caller and to make its own authorization decision. For a PolicyEnforcer check, the plugin builds a `SecurityContext` with the SDK's constructor, which copies the subject id, subject type, subject tenant id, and token scopes, and sets no bearer token. Copying the scopes matters, because an empty scope list means that no capability was granted ([context.rs](../../../../libs/toolkit-security/src/context.rs)). The enforcer does not serialize the bearer token into the PDP request ([models.rs](../../../../gears/system/authz-resolver/authz-resolver-sdk/src/models.rs)), so a check from that context needs no token. Section plugins use their own service credentials for any work they do. Only a plugin that needs the caller's raw token, for its own downstream calls, cannot have it (§4.3).
+Plugins build these errors only through the SDK constructors of `SectionPluginError`. Every constructor cuts `detail`, and the `Rejected` location, to `PLUGIN_DETAIL_MAX_BYTES` (1024 bytes) at a UTF-8 character boundary, so a plugin cannot push an unbounded string into responses or logs. The constructors of `AuditPluginError` apply the same bound to `detail`. Both error types live in `application-manager-sdk/src/errors.rs`.
 
-**Contract evolution.** Additive changes within a `v1` plugin type are allowed: new optional model fields and new audit content members, as the PRD compatibility rule states. Anything else, such as a new operation, a changed signature, a new error kind, or a changed meaning, is a new GTS type version. A gear release that supports a new version lists the instances of every version it supports at startup, and the key, priority, and single-audit-plugin checks apply across versions. The running gear does not list instances of a version it does not support. A plugin therefore moves to a new version only after the gear supports it, as the PRD's coordinated-update rule requires, and the key listing shows which section plugins took part.
+**Caller identity.** Every section plugin call and both hand-offs receive `CallerIdentity` (`cpt-cf-application-manager-entity-caller-identity`), never the raw `SecurityContext`. It has no bearer token, so no plugin can reuse the caller's credentials. A section plugin uses it to identify the caller and to make its own authorization decision. For a PolicyEnforcer check, the plugin builds a `SecurityContext` with the SDK's constructor, which copies the subject id, subject type, subject tenant id, and token scopes, and sets no bearer token. Copying the scopes matters, because an empty scope list means that no capability was granted ([context.rs](../../../../libs/toolkit-security/src/context.rs)). The enforcer does not serialize the bearer token into the PDP request ([models.rs](../../../../gears/system/authz-resolver/authz-resolver-sdk/src/models.rs)), so a check from that context needs no token. Section plugins use their own service credentials for any work they do. Only a plugin that needs the caller's raw token, for its own downstream calls, cannot have it (§4.3). `CallerIdentity` carries exactly the five members of §3.1 and rejects any other member, so no bearer-token member can be added to it on the wire.
+
+**Contract evolution.** Additive changes within a `v1` plugin type are allowed: new optional model fields and new audit content members, as the PRD compatibility rule states. `CallerIdentity` is the one exception. It is closed within `v1`, so that no bearer-token member can be smuggled in, and any new member in it is a new GTS type version. Anything else, such as a new operation, a changed signature, a new error kind, or a changed meaning, is a new GTS type version. A gear release that supports a new version lists the instances of every version it supports at startup, and the key, priority, and single-audit-plugin checks apply across versions. The running gear does not list instances of a version it does not support. A plugin therefore moves to a new version only after the gear supports it, as the PRD's coordinated-update rule requires, and the key listing shows which section plugins took part.
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-interface-audit-plugin-api`
 
 - **Contracts**: `cpt-cf-application-manager-contract-audit-plugin`
 - **Technology**: ToolKit plugin model. The asynchronous plugin interface lives in the SDK crate, the GTS plugin type is `gts.cf.toolkit.plugins.plugin.v1~cf.core.application_manager_audit.plugin.v1~`, and the client is a scoped ClientHub client under the instance's GTS id.
-- **Location**: `application-manager-sdk/src/audit_plugin_api.rs`; the GTS type in `application-manager-sdk/src/gts.rs`
+- **Location**: `application-manager-sdk/src/audit_plugin_api.rs`; the error kinds in `application-manager-sdk/src/errors.rs`; the GTS type in `application-manager-sdk/src/gts.rs`
 
 | Operation | Called | Receives | Returns | Time-limit outcome |
 |---|---|---|---|---|
@@ -894,7 +927,7 @@ The audit contract, on the gear's side:
 
 - **Cardinality.** Exactly one audit plugin instance must be registered. Startup fails when none or more than one is registered. A client that cannot be resolved fails startup at once, with no retry.
 - **Accepted.** An accepted hand-off means the audit plugin has taken responsibility for recording it and will retry until it is recorded. It does not mean the record is already durable.
-- **Correlation.** The request id is the stable key of the request's audit event. The audit plugin deduplicates on it.
+- **Correlation.** The request id is the stable key of the request's audit event. The audit plugin deduplicates on it. The caller identity is passed only as an argument. The `request_id` and `audit_id` inside the content equal the argument values (§3.1).
 - **Not accepted.** A request hand-off that is not accepted never gets a final-result hand-off.
 - **Possibly recorded.** A request hand-off that timed out may still have been recorded, with an audit id the caller never received. The audit plugin keeps such an event identifiable. "Possibly recorded" and "final result unknown" are the same observable state: an event with no final result, which the audit plugin marks "final result unknown" at a time it decides.
 - **Late results.** A `timed_out` section outcome means the outcome is unknown, and the gear never sends a late result.
@@ -919,7 +952,7 @@ The audit contract, on the gear's side:
 
 How the rules apply here. The `SecurityContext` propagates to every platform client. Plugins receive `CallerIdentity` instead, which is the one deliberate narrowing of the propagation rule (§3.3). The gear talks to no external system. Its only adapters reach platform services and plugin gears.
 
-The gear declares `deps = [types_registry, authz_resolver]` and the capabilities `db`, `rest`, and `stateful`, with a hand-implemented start capability rather than a lifecycle helper. It uses no tenant service, because it never resolves a tenant (ADR 0007). Plugin gears depend on `application-manager-sdk` and on the types registry, as the platform plugin pattern does. The Application Manager depends on neither plugin crates nor plugin gears, in line with the platform plugin isolation rule. The order in which the gear and the plugin gears run `init` does not matter, because the types registry validates instances against types when it enters ready mode, after every gear's `init` and before the start phase.
+The gear declares `deps = [types_registry, authz_resolver]` and the capabilities `db`, `rest`, and `stateful`, with a hand-implemented start capability rather than a lifecycle helper (phasing: §4.12). The gear macro takes the dependencies as `types_registry` and `authz_resolver`, and the gear registry lists them under the gear names `types-registry` and `authz-resolver`. It uses no tenant service, because it never resolves a tenant (ADR 0007). Plugin gears depend on `application-manager-sdk` and on the types registry, as the platform plugin pattern does. The Application Manager depends on neither plugin crates nor plugin gears, in line with the platform plugin isolation rule. The order in which the gear and the plugin gears run `init` does not matter, because the types registry validates instances against types when it enters ready mode, after every gear's `init` and before the start phase.
 
 ### 3.5 External Dependencies
 
@@ -1227,7 +1260,7 @@ The gear owns one table in the platform database, created by its migrations. The
 
 **PK**: `application_id`
 
-**Constraints**: every column NOT NULL. `application_id` and `version` are non-empty. `last_result` is limited to the listed values, so changing that list needs a migration. The text columns compare with a binary, no-pad collation on every backend: `C` on PostgreSQL, `BINARY` on SQLite, and a binary no-pad collation such as `utf8mb4_0900_bin` on MySQL. Case, trailing spaces, and Unicode normalization forms therefore always make ids distinct. The column size of `application_id` and `version` is the gear constant `REGISTRY_TEXT_MAX_BYTES`, in bytes of UTF-8, fixed by the initial migration. It caps the accepted range of `max_envelope_text_length`, and `init` rejects a larger value. It is also the ceiling of the uninstall storable-id rule: an id longer than it can never name an entry (§3.2).
+**Constraints**: every column NOT NULL. `application_id` and `version` are non-empty. `last_result` is limited to the listed values, so changing that list needs a migration. The text columns compare with a binary, no-pad collation on every backend: `C` on PostgreSQL, `BINARY` on SQLite, and a binary no-pad collation such as `utf8mb4_0900_bin` on MySQL. Case, trailing spaces, and Unicode normalization forms therefore always make ids distinct. The column size of `application_id` and `version` is the gear constant `REGISTRY_TEXT_MAX_BYTES`, in bytes of UTF-8, fixed by the initial migration. Its value is 255 bytes, held in `application-manager/src/domain/limits.rs`, and changing it needs a migration. It caps the accepted range of `max_envelope_text_length`, and `init` rejects a larger value. It is also the ceiling of the uninstall storable-id rule: an id longer than it can never name an entry (§3.2).
 
 **Additional info**: no secondary indexes, because the primary key is the only lookup. The entity derives `Scopable` and is declared `#[secure(unrestricted)]`: it has no tenant, resource, owner, or type column, and no `pep_prop`, which the secure ORM forbids with `unrestricted` ([unrestricted entities](../../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md#unrestricted-entities-secureunrestricted), ADR 0007). `secure_insert` needs no tenant id, and a query with a scope that contains tenant ids is denied, so the repository uses only the unscoped scope of a permit. It has no foreign keys and no triggers. Adding or removing a section plugin never requires a migration. The complete query list is: read one entry by primary key, upsert on the primary key, delete on the primary key, and list all entries under the scope. One initial migration creates the table. The gear returns it from `DatabaseCapability::migrations()`, and the platform migration phase runs it before `init`, under the platform's per-gear migration history. Its down step drops the table, which loses only data that re-seeding rebuilds.
 
@@ -1281,7 +1314,7 @@ These terms add to the [PRD glossary](./PRD.md#14-glossary) and do not redefine 
 | AuthN, DTO, NFR, OpenAPI | Authentication; data transfer object; non-functional requirement; the OpenAPI format for describing REST interfaces. |
 | SDK, TLS | Software development kit, here the `application-manager-sdk` crate that holds the plugin contracts; Transport Layer Security, which encrypts caller traffic at the platform gateway. |
 | Control character | Any Unicode code point in the general category Cc: U+0000 to U+001F, which includes NUL, and U+007F to U+009F. The envelope limits, the never-storable id rule, and the log escaping rule all use this one definition. |
-| Never-storable id | An application id that no registry entry can have: empty, containing a control character, or longer than `REGISTRY_TEXT_MAX_BYTES` (§3.2 step 3, §3.7). |
+| Never-storable id | An application id that no registry entry can have: empty, containing a control character, or longer than `REGISTRY_TEXT_MAX_BYTES` (§3.2 step 3, §3.7). The request hand-off carries it only as its length in bytes and its digest, `sha256:` followed by 64 lowercase hex digits (§3.1). |
 | Unrestricted entity | A secure-ORM entity declared `#[secure(unrestricted)]`: a truly global table with no scoping column, which a query with tenant ids in its scope cannot reach ([AuthN, AuthZ and secure ORM](../../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md#unrestricted-entities-secureunrestricted)). The registry table is one (§3.7). |
 | Section plugin set | The immutable, startup-built list of section plugins: key, priority, GTS instance id, and client, in priority order. |
 | Key set | The section keys of the section plugin set. A manifest's `sections` must have exactly this set. |
@@ -1328,7 +1361,7 @@ The registry entry ends with whichever request wrote last. A seed that finishes 
 | Oversized or unstorable id, version, or key | The envelope limits (maximum length, no control characters) are checked on seed at receive time, before any hand-off. Uninstall decides a never-storable id as not found with no registry read, and looks up any other id. A never-storable id is never carried as a field: the hand-off carries its length and digest, and the 404 names no resource. Keys follow the token pattern, checked at startup. The gateway body limit bounds the manifest. Comparison is exact on every backend. | None |
 | Log injection: an id or version with control characters forges or splits log lines | Logs and span attributes carry ids and versions escaped, with every control character (§4.1) written as an escape, and cut at `LOG_TEXT_MAX_BYTES` (§4.6) | None |
 | Parser differential: the id that is authorized differs from the id that is applied, through repeated members such as two `id` or two `application` members, including names written with escapes | The seed body is parsed once, and a repeated member name in any object makes the manifest invalid (`duplicate_member`). Names are compared after unescaping. The PDP property, the registry step, both hand-offs, validation, `apply`, and the registry write take the id from that one parse (§3.2 invariant). | None |
-| A deeply nested body exhausts the stack before authorization and aborts the host | The parse stops at `MAX_JSON_DEPTH`, at or below the `serde_json` recursion limit, and the body ends as invalid manifest with rule `malformed_json` (§3.2 step 1) | None |
+| A deeply nested body exhausts the stack before authorization and aborts the host | The parse stops at `MAX_JSON_DEPTH`, at or below the SDK's `HANDOFF_MANIFEST_MAX_DEPTH` (126), which is below the `serde_json` recursion limit, and the body ends as invalid manifest with rule `malformed_json` (§3.2 step 1) | None |
 | Callers that disconnect pile up detached request tasks, because the gateway frees its in-flight slot on disconnect | `max_request_tasks` bounds the request tasks on a replica, and the REST layer takes a permit before any task starts. A request with no free permit is refused as temporarily unavailable, with reason `at_capacity`, and the request-task alert fires (§4.6). | While the cap is full, new seeds and uninstalls on that replica are refused |
 | Errors or logs leak manifest content | `cpt-cf-application-manager-constraint-no-manifest-content`. Validation messages never include instance values. The section plugin contract forbids manifest values and secrets in any plugin text. Plugin `Internal` text is logged length-bounded under the plugin-diagnostic classification, and late results are logged by metadata only. | A section plugin that echoes values in its text breaks its contract and puts content into gear logs. Detail is truncated, and the contract conformance review covers it. |
 | A section plugin acts with caller credentials | Plugins receive `CallerIdentity`, which has no bearer token. The contract requires the plugin's own service credentials. For its own PolicyEnforcer check, the plugin builds a token-less `SecurityContext` with the SDK constructor, which copies the subject, the tenant, and the token scopes (§3.3). | A section plugin that needs the caller's raw token for its own downstream calls cannot make them with the caller's credentials. It uses its own service credentials, or it refuses. |
@@ -1439,7 +1472,7 @@ Every reason is an immediate start failure. No reason is retried, and none waits
 
 | Reason | Phase | Trigger | Operator action |
 |---|---|---|---|
-| `invalid_setting` | `init` | A required setting is missing or invalid, or the time settings exceed the gateway deadline even with no section plugin (§4.7); the event names the settings | Fix the configuration |
+| `invalid_setting` | `init` | Every configuration failure (§4.7), including time settings that exceed the gateway deadline even with no section plugin | Fix the configuration |
 | `types_registry_unreachable` | `start` | The types registry listing failed or did not answer within `plugin_call_timeout` | Restore the types registry, then restart |
 | `priority_unreadable` | `start` | An instance has no readable priority | Fix the instance registration |
 | `equal_priority` | `start` | Two instances share a priority; the event names both | Change one priority |
@@ -1447,7 +1480,7 @@ Every reason is an immediate start failure. No reason is retried, and none waits
 | `multiple_audit_plugins` | `start` | More than one audit plugin instance is registered; the event names them | Remove the extra audit plugins |
 | `plugin_client_unresolved` | `start` | A scoped client could not be resolved | Check the plugin gear's registration |
 | `section_key_unavailable` | `start` | A `key` call failed, timed out, or was not sent | Restore the section plugin, then restart |
-| `invalid_section_key` | `start` | A key is empty or breaks the token pattern | Fix the section plugin |
+| `invalid_section_key` | `start` | A key is empty, longer than `SECTION_KEY_MAX_LEN`, `.` or `..`, or breaks the token pattern (§3.3) | Fix the section plugin |
 | `duplicate_section_key` | `start` | Two instances report the same key; the event names both | Remove or re-key one section plugin |
 
 `init` reports `invalid_setting`. `start` reports every other reason, in the order of its steps (§3.2), and stops at the first failure.
@@ -1456,18 +1489,18 @@ Every reason is an immediate start failure. No reason is retried, and none waits
 
 ### 4.7 Configuration
 
-The gear's settings live under `gears.application-manager.config` in the host configuration. The gear reads them with the strict accessor, so a missing section fails `init`. Durations are humantime strings with a unit, such as seconds or milliseconds. Values may differ per environment.
+The gear's settings live under `gears.application-manager.config` in the host configuration. The gear reads them with the strict accessor, so a missing section fails `init`. Every setting is required and has no default, and an unknown key fails `init`. There is no startup retry setting, so a `startup_retry_deadline` key is an unknown key. Durations are humantime strings with a unit, such as seconds or milliseconds. Values may differ per environment.
 
 | Setting | Meaning | Validation |
 |---|---|---|
-| `plugin_call_timeout` | The PRD's time-limit setting: the one time limit for every plugin call, including `key` at startup and both hand-offs. It also bounds the single startup call to the types registry (§3.2). | Required, no default, a positive duration |
-| `plugin_max_in_flight` | Per plugin instance, the most calls in flight at once, counting detached calls still running after their timeout | Required, no default, a positive integer |
-| `max_request_tasks` | Per replica, the most seed and uninstall request tasks in flight at once, counting tasks whose HTTP request was dropped. A request that finds no free permit is refused with reason `at_capacity`. | Required, no default, a positive integer |
-| `max_envelope_text_length` | The maximum length of the application id and of the version on seed, in bytes of UTF-8 | Required, no default, a positive integer no larger than `REGISTRY_TEXT_MAX_BYTES` (§3.7) |
-| `pdp_call_timeout` | The deadline for one PDP decision, set through the PolicyEnforcer deadline option. A decision that exceeds it counts as access control cannot answer. | Required, no default, a positive duration |
-| `registry_operation_timeout` | The bound that the registry repository applies around every registry operation (read, upsert, delete, and listing) on every backend. An operation that exceeds it counts as storage cannot answer. | Required, no default, a positive duration |
+| `plugin_call_timeout` | The PRD's time-limit setting: the one time limit for every plugin call, including `key` at startup and both hand-offs. It also bounds the single startup call to the types registry (§3.2). | A positive duration |
+| `plugin_max_in_flight` | Per plugin instance, the most calls in flight at once, counting detached calls still running after their timeout | An integer from 1 to 1,000,000 (`MAX_CONCURRENCY`) |
+| `max_request_tasks` | Per replica, the most seed and uninstall request tasks in flight at once, counting tasks whose HTTP request was dropped. A request that finds no free permit is refused with reason `at_capacity`. | An integer from 1 to 1,000,000 (`MAX_CONCURRENCY`) |
+| `max_envelope_text_length` | The maximum length of the application id and of the version on seed, in bytes of UTF-8 | An integer from 1 to `REGISTRY_TEXT_MAX_BYTES` (255, §3.7) |
+| `pdp_call_timeout` | The deadline for one PDP decision, set through the PolicyEnforcer deadline option. A decision that exceeds it counts as access control cannot answer. | A positive duration |
+| `registry_operation_timeout` | The bound that the registry repository applies around every registry operation (read, upsert, delete, and listing) on every backend. An operation that exceeds it counts as storage cannot answer. | A positive duration |
 
-A missing or invalid setting fails `init` with reason `invalid_setting`. There is no extra handling margin on the time limit. Audit exposure settings belong to the audit plugin's own configuration, which its documentation describes.
+Every configuration failure fails `init`: a missing section, a missing key, a malformed value, a wrong type, an unknown key, and every validation failure. The top-level text of the `init` error starts with the reason `invalid_setting` and names the setting, or the section when the section is missing. There is no extra handling margin on the time limit. Audit exposure settings belong to the audit plugin's own configuration, which its documentation describes.
 
 `max_envelope_text_length` applies to seed only. Lowering it affects new seeds only: an existing entry whose id is longer stays listed and can still be uninstalled, because uninstall looks up every id that could be stored (§3.2). A re-seed of that id ends as invalid manifest until the setting is raised again.
 
@@ -1501,9 +1534,9 @@ Every test level and its scope:
 | REST and Problem contract | Each route through the real HTTP stack: the status per category, the `application/problem+json` type, the `outcome_report` member surviving the canonical error middleware, the `unavailable` member on single-schema and combined-schema read 503s per cause (a `section_schema` item per key, an `access_control` item when the PDP cannot answer, and no member on a not-ready read or on the listing and key-list routes), the 422 override, field and precondition violations, the 200 body validating against the outcome report type, and the `items` listing | The gear's REST layer in an in-process host |
 | End to end | Seed, re-seed, both uninstall forms, listing, and discovery through the gateway with test plugins, including a dropped HTTP request and a request past the gateway deadline | The platform E2E lane ([testing guide](../../../../docs/TESTING.md)) |
 | Security | (a) Schemas with an external or file reference, a `$ref` that relies on the served `$id`, another dialect, an integer beyond 2^53, a size above `SERVED_SCHEMA_MAX_BYTES`, or an uncompilable body become `unusable`, with no network or file access. (b) A catastrophic pattern runs on the linear-time engine, and the request ends within its bound. A pattern beyond the regex compile limits, or one with lookaround or a backreference, makes the schema `unusable`. (c) A sentinel manifest value sent through every outcome path is absent from logs, spans, metric labels, and Problem bodies. (d) Plugin `Internal` text is absent from responses. (e) No plugin observes a bearer token. (f) Ids that differ by case, trailing space, or Unicode normalization form stay distinct on every backend lane, and ids such as `.`, `..`, and `a/b` uninstall through the body form. (g) A seed body that repeats `id`, `application`, or `sections`, or repeats a member inside a section, ends as invalid manifest with rule `duplicate_member`. No `application_id` property reaches the test PDP, and no section plugin is called. A member name written with escapes, such as `"\u0069d"` next to `"id"`, counts as a repeat. A body nested deeper than `MAX_JSON_DEPTH` ends as invalid manifest with rule `malformed_json`, and the host keeps running. For every other body, the test PDP, the registry, both hand-offs, and `apply` observe one and the same id. (h) An uninstall id with a control character or above `REGISTRY_TEXT_MAX_BYTES` reaches no hand-off field, the report, or the 404 resource name: the request hand-off carries only its length and digest. Ids with control characters appear only escaped in logs and spans. | Integration lane |
-| Fuzz | The duplicate-detecting body parser and envelope reader, including deep nesting, escaped member names, and non-UTF-8 and non-JSON bodies; the assembly of the audit content's raw manifest member from such bodies; and schema compilation with served schemas as input | Fuzz lane |
+| Fuzz | The duplicate-detecting body parser and envelope reader, including deep nesting, escaped member names, and non-UTF-8 and non-JSON bodies; the assembly of the hand-off's `manifest` member from such bodies, which is omitted for an invalid body (§3.1); and schema compilation with served schemas as input | Fuzz lane |
 | Performance | Not a load test. The N + 3 and N + 2 bound tests under a paused clock are the performance check. Capacity is covered by §4.13. | Integration lane |
-| Platform pin | A test pins `GATEWAY_REQUEST_DEADLINE` to the gateway's 30s, and its message cites the gateway's timeout layer, so a change to either needs a deliberate edit. The end-to-end request past the gateway deadline detects a gateway change that the pin cannot see. | Unit, and the platform E2E lane |
+| Platform pin | A test pins `GATEWAY_REQUEST_DEADLINE` to the gateway's 30s, and its message cites the gateway's timeout layer, so a change to either needs a deliberate edit. A second test pins `REGISTRY_TEXT_MAX_BYTES` to 255, because a change needs a migration. The end-to-end request past the gateway deadline detects a gateway change that the pin cannot see. | Unit, and the platform E2E lane |
 | Contract conformance | The section plugin pass-through check compares what a test section plugin receives with what the caller sent. Audit-plugin authors own their conformance test for the recording obligations. | Integration lane |
 | Inspection | No audit read operation, no fill-in or replay operation, no section rules in configuration or source, and no raw SQL | Review |
 
@@ -1514,6 +1547,16 @@ Every test level and its scope:
 **Request task tests.** The HTTP request is dropped at each step: during the permission decision, the registry step, the request hand-off, the schema phase, dispatch, the registry write, and the final-result hand-off. Each time, the request task completes, and the hand-off counts match. A panic is injected at each progress point of the request task: before and after the request hand-off attempted flag is set, during the schema phase, between sections, after "write started" and before the write result, and before and after the final-result attempted flag is set. Each time, the request ends as internal failure, and the counting test audit plugin sees at most one request hand-off and at most one final-result hand-off, the final one only after an accepted request hand-off. A panic after "write started" reports the registry effect as not confirmed. The in-flight request task gauge returns to zero after each test, and a stop test shows `drain` abandoning a never-ending request task at the stop deadline with a log.
 
 **Test seams and data.** The ports of §3.2 are the seams. The clock and the request id source are injectable. Shared test plugins and fixtures (manifests, served schemas, and sentinel values) live in the gear's test-support module. Each test gets its own database, or its own application ids on a shared one.
+
+**SDK and configuration contract tests.** Unit tests pin these check families:
+
+- Wire shape: member names and tokens of the outcome report and both hand-off contents, absent optional members omitted, `manifest` omitted for an invalid body and kept as `null` for a JSON `null` body, the never-storable id digest, the tolerant `ApplicationEnvelope`, and the redacted debug form (§3.1).
+- Bounds: the key check including `.` and `..`, detail truncation at a UTF-8 boundary, the served schema bound, and `HANDOFF_MANIFEST_MAX_DEPTH` (§1.3, §3.1, §3.3).
+- Identity conversion: `CallerIdentity` with exactly five members and no token member, and its conversion to and from `SecurityContext` with no bearer token (§3.3).
+- Error mappings: plugin error kinds to section outcomes and reasons, and the exact GTS ids and action names (§3.3).
+- Configuration edges: missing settings, unknown keys, edge values, the count bounds, each budget term, and huge durations, each failing with `invalid_setting` and the setting's name (§4.7).
+
+**Test layout.** Unit tests sit next to their module in a `_tests.rs` file and are excluded from coverage.
 
 **Coverage target.** 90% or more, as the PRD testing strategy states. That is above the platform-wide threshold.
 
@@ -1562,32 +1605,33 @@ Status values: **Accepted** means recorded in the PRD. **Proposed** means record
 
 ### 4.11 Guidance for Plugin Authors
 
-This guidance is for section plugin authors (`cpt-cf-application-manager-actor-section-plugin-author`) and audit plugin authors (`cpt-cf-application-manager-actor-audit-plugin-author`). The SDK crate is the normative contract once it exists; until then, the PRD contracts and ADR 0004 are, as §3.3 states.
+This guidance is for section plugin authors (`cpt-cf-application-manager-actor-section-plugin-author`) and audit plugin authors (`cpt-cf-application-manager-actor-audit-plugin-author`). The SDK crate is the normative contract, as §3.3 states.
 
 Section plugin authors:
 
 - Choose a priority as the registered instance priority. Lower values run earlier on seed and on uninstall. Leave gaps between values so later plugins can be placed between existing ones, and document why the plugin needs its position. Two plugins with the same priority stop the gear from starting, and a priority change is an intentional order change.
-- Choose a key that follows the SDK token pattern: lower-case letters, digits, `-`, `_`, and `.`, within the bounded length. Any other key stops the gear from starting.
+- Choose a key that follows the SDK token pattern: 1 to `SECTION_KEY_MAX_LEN` (64) bytes of lower-case letters, digits, `-`, `_`, and `.`, other than `.` and `..`. Check it with the SDK's `validate_section_key`. Any other key stops the gear from starting.
 - Register the instance, its priority, and the scoped client during your `init`, and answer `key` as soon as `init` has finished. Neither may wait for your gear's start phase, because the Application Manager may read them before your gear starts.
 - Keep `schema` cheap and free of side effects, because it runs on every seed and every schema read, under the time limit. During an environment-wide re-seed, it is called once per seed, so its cost is a capacity obligation (§4.13).
 - Serve JSON Schema Draft 2020-12, with every reference inside the served document. A missing `$schema` is read as Draft 2020-12. Do not rely on a top-level `$id`. The gear replaces it with its own `urn:cf:application-manager:section:<key>` when it composes the schema, so a `$ref` that relies on your `$id` becomes external and makes the schema `unusable`. Use references local to the document, such as `#/$defs/item`.
-- Write `pattern` and `patternProperties` in the syntax of the `regex` crate, which has no lookaround and no backreferences. A pattern that the crate cannot compile, or one beyond the gear's regex compile limits, makes the schema `unusable`. So does a schema larger than `SERVED_SCHEMA_MAX_BYTES`, which the SDK publishes, or one with an integer beyond 2^53 in magnitude (§3.1).
+- Write `pattern` and `patternProperties` in the syntax of the `regex` crate, which has no lookaround and no backreferences. A pattern that the crate cannot compile, or one beyond the gear's regex compile limits, makes the schema `unusable`. So does a schema larger than `SERVED_SCHEMA_MAX_BYTES` (1 MiB of compact JSON), which the SDK publishes, or one with an integer beyond 2^53 in magnitude (§3.1).
 - Make `apply` and `remove` tolerate repeats and concurrent calls for the same application. The gear neither serializes nor deduplicates them (§4.2), and it never undoes a call that timed out.
-- Never put manifest values or secrets in `Rejected`, `NotPermitted`, or `Internal` detail. Use a JSON Pointer location inside the section instead.
+- Never put manifest values or secrets in `Rejected`, `NotPermitted`, or `Internal` detail. Use a JSON Pointer location inside the section instead. Build errors with the SDK constructors, which cut detail and location to `PLUGIN_DETAIL_MAX_BYTES` (1024 bytes).
 - Identify the caller from `CallerIdentity` and make your own authorization decision before acting on its behalf. For a PolicyEnforcer check, build the `SecurityContext` with the SDK constructor, which copies the subject, the tenant, and the token scopes and carries no bearer token (§3.3). Use your own service credentials for any work, including downstream calls, because the caller's token is never available. Clean up your own data when the plugin is removed from the environment.
 
 Audit plugin authors (`cpt-cf-application-manager-usecase-audit-recording`):
 
 - Accept or refuse each hand-off quickly and within the time limit. Return an opaque audit id on the request hand-off. Accepting means you take responsibility for recording it.
-- Treat all hand-off content as untrusted input. The raw manifest bytes may be any bytes: not UTF-8, or not JSON, as the format flag shows (§3.1). Ids and versions may hold any text that the envelope rules allow, and a never-storable uninstall id arrives only as its length and digest.
+- Treat all hand-off content as untrusted input. The `manifest` member is omitted when the seed body was invalid (it did not parse, nested too deep, or repeated a member name), and is `null` when the body was the JSON value `null` (§3.1). A stored hand-off reads back as JSON for every manifest the gear accepts, up to `HANDOFF_MANIFEST_MAX_DEPTH`. Ids and versions may hold any text that the envelope rules allow, and a never-storable uninstall id arrives only as its length and digest.
 - Deduplicate on the request id. Expect no final-result hand-off for a request hand-off that the gear counted as not accepted. Treat "possibly recorded" and "final result unknown" as the same state, and treat `timed_out` section outcomes as unknown.
 - Meet every obligation of `cpt-cf-application-manager-contract-audit-plugin`, including retrying until recorded, the "final result unknown" marking, identifying possibly recorded events, and exposure that is off by default, and ship the conformance test that shows it.
 
 ### 4.12 Assumptions, Dependencies and Migration Impact
 
-- **Assumptions**: the platform plugin model lets each section plugin instance carry a priority, through the plugin base type's priority. Section plugins and the audit plugin are gears in the same host process that register during their own `init`. The types registry is in ready mode before the start phase. The host runs the gears' start capabilities one after another ([host_runtime.rs](../../../../libs/toolkit/src/runtime/host_runtime.rs)). The gear declares `deps` on `types_registry` and `authz_resolver` only, and uses no tenant service (ADR 0007). The PDP decides a request that names no context tenant by its own rules, for example by falling back to the subject's own tenant ([enforcer.rs](../../../../gears/system/authz-resolver/authz-resolver-sdk/src/pep/enforcer.rs), lines 419-423). Section plugins and the audit plugin answer `key` and have their registrations in place once their `init` has finished (§3.3). The gear bounds the PDP decision and the registry operations itself, so it assumes no database timeout setting. Gateway authentication is enabled: the gear is not supported in the gateway's `auth_disabled` mode, which gives every request one fixed default subject (§4.3).
-- **Dependencies**: the types registry at startup; the PDP, the platform database, and the plugins at run time; platform telemetry for signals. The build adds a vetted RFC 8785 implementation as a new workspace dependency for schema fingerprints, or the gear implements RFC 8785 itself if none passes review (§3.1).
-- **Platform dependencies and open questions for platform owners**:
+- **Assumptions**: the platform plugin model lets each section plugin instance carry a priority, through the plugin base type's priority. Section plugins and the audit plugin are gears in the same host process that register during their own `init`. The types registry is in ready mode before the start phase. The host runs the gears' start capabilities one after another ([host_runtime.rs](../../../../libs/toolkit/src/runtime/host_runtime.rs)). The gear declares `deps` on `types_registry` and `authz_resolver` only, listed in the gear registry as `types-registry` and `authz-resolver` (§3.4), and uses no tenant service (ADR 0007). The PDP decides a request that names no context tenant by its own rules, for example by falling back to the subject's own tenant ([enforcer.rs](../../../../gears/system/authz-resolver/authz-resolver-sdk/src/pep/enforcer.rs), lines 419-423). Section plugins and the audit plugin answer `key` and have their registrations in place once their `init` has finished (§3.3). The gear bounds the PDP decision and the registry operations itself, so it assumes no database timeout setting. Gateway authentication is enabled: the gear is not supported in the gateway's `auth_disabled` mode, which gives every request one fixed default subject (§4.3).
+- **Dependencies**: the types registry at startup; the PDP, the platform database, and the plugins at run time; platform telemetry for signals. The build adds a vetted RFC 8785 implementation as a new workspace dependency for schema fingerprints, or the gear implements RFC 8785 itself if none passes review (§3.1). The SDK depends on `toolkit-security` for the `CallerIdentity` conversion.
+- **Phasing**: Until the later phases land, the gear is the SDK crate and the gear declaration with its `deps`. `init` loads the configuration strictly and validates it (§4.7), and does nothing else: the gear declares no capabilities, registers no GTS types, and runs no plugin discovery. `db`, `rest`, and `stateful` arrive with the phases that need them. The outcome report and application resource GTS ids are SDK constants with no registered schema until the phases that use them.
+- **Platform dependencies and open questions**:
   1. The canonical error middleware must keep RFC 9457 extension members, so that `outcome_report`, and `unavailable` on read 503s, reach the caller. Owners: ToolKit REST and canonical error system owners. Status: pending platform decision. Seed and uninstall failures cannot carry the outcome report until it lands, so PRD `cpt-cf-application-manager-fr-response-content` is not yet met for failed responses; the PRD lists this as a p1 dependency with a matching risk. Until it lands, a read 503 carries the status and the problem detail only.
   2. Enabling `extra` with derived error types chained under each category, so that the outcome report can move there. Owners: canonical error system owners. Status: pending platform decision. Until then, the extension member is the carrier.
   3. A guarantee that out-of-process gears register their scoped clients and instances before dependants start. Owners: platform plugin model owners. Status: open. Until then, only in-process plugins are supported.
@@ -1595,6 +1639,8 @@ Audit plugin authors (`cpt-cf-application-manager-usecase-audit-recording`):
   5. A failed start must end the server process with a failure exit status. Owners: ToolKit runtime owners. Status: open, for verification only. All startup discovery and checks run inside `start`, so every startup failure is a start-phase error. The host's start phase returns `RegistryError::Start` at once, with no retry, and the error propagates out of the host runtime ([host_runtime.rs](../../../../libs/toolkit/src/runtime/host_runtime.rs)). That the example server then exits with a non-zero status is not yet verified end to end. A smoke test in the implementation proves it (§4.8). If it does not hold, the replica still never becomes ready, so the rollout still fails, and the startup failure event and the startup failure count remain the operator's signals. A restart policy that restarts only after a failure exit depends on this item. The PRD lists it as a dependency with a matching risk.
   6. Exposing the gateway request deadline to gears. Owners: api-gateway owners. Status: open. The gateway fixes it at 30s in code ([gear.rs](../../../../gears/system/api-gateway/src/gear.rs)). Until it is exposed, the gear holds the same value as `GATEWAY_REQUEST_DEADLINE`, whose source comment cites the gateway's timeout layer. A change of the gateway value needs a matching gear change, which the pin test and the end-to-end deadline test surface (§4.8).
   7. The authorization policy must grant `seed`, `uninstall`, `list`, and `read_schema` on `gts.cf.core.application_manager.application.v1~` only through a platform-level permission. A tenant-level role, such as the administrator of any tenant, must not grant them. Owners: authz policy owners. Status: open. The gear names no context tenant in its decisions, so the PDP may fall back to the caller's own tenant (§3.3), and the gear cannot tell how a permit was granted. A permit must also carry no constraint, or the gear treats it as not permitted. Until the policy owners confirm the rule, a policy that grants these actions to a tenant-level role would give that role platform-wide seed, uninstall, and read access. The PRD lists this as an obligation on platform access control, with a matching risk.
+  8. How the gear generates the time-ordered request id, for example as UUID version 7. Owners: application-manager maintainers. Status: open, decide before the request path first builds hand-off content. The decision fixes the request id source of §3.2 and the `request_id` member of both hand-offs (§3.1).
+  9. The SDK type of the hand-off times `received_at` and `completed_at`: RFC 3339 text, or a typed timestamp with an RFC 3339 wire form. Owners: application-manager maintainers. Status: open, decide before the request path first builds hand-off content.
 - **Migration impact**: this is a new gear with one new table and no data to migrate. Adding or removing a section plugin never changes the schema. A future change to the outcome categories or the status mapping would supersede ADR 0006 and would be a breaking API change under the PRD breaking-change policy. A future need for tenant-owned applications would need a new ADR that supersedes ADR 0007, and a migration that adds a scoping column to the registry table.
 
 ### 4.13 Capacity and Resource Efficiency

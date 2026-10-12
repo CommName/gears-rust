@@ -725,9 +725,9 @@ For every seed and uninstall request that reaches the system, the system **MUST*
 - the validation result, with any problems found;
 - per-section outcomes, including the schema identity used for each section;
 - the overall result;
-- the full manifest as sent.
+- the manifest, when the body is a valid manifest body; a body that cannot be parsed is not recorded.
 
-Privacy by design applies, because a caller subject can identify a person. The full manifest is kept on purpose: it is the only record of what an application sent, and the system cannot tell which section content matters for tracing, because it never interprets sections. Manifests must not carry secrets and are not expected to carry personal data (see section 3.1), so the caller subject is the only personal data expected in an audit event. Pseudonymization is not applicable beyond that: how caller subjects are stored, pseudonymized, or erased is the audit plugin's concern. Purpose limitation, exposure that is off by default, and retention are covered by section 3.1, `cpt-cf-application-manager-fr-audit-exposure`, and `cpt-cf-application-manager-contract-audit-plugin`.
+Privacy by design applies, because a caller subject can identify a person. The full parsed manifest is kept on purpose: it is the only record of what an application sent, and the system cannot tell which section content matters for tracing, because it never interprets sections. A body that cannot be parsed is not a manifest, so its content is not recorded; the audit event still records the request and its invalid-manifest result with the rule that failed. Manifests must not carry secrets and are not expected to carry personal data (see section 3.1), so the caller subject is the only personal data expected in an audit event. Pseudonymization is not applicable beyond that: how caller subjects are stored, pseudonymized, or erased is the audit plugin's concern. Purpose limitation, exposure that is off by default, and retention are covered by section 3.1, `cpt-cf-application-manager-fr-audit-exposure`, and `cpt-cf-application-manager-contract-audit-plugin`.
 
 - **Rationale**: A complete trail lets teams answer what was sent, by whom, and what each section plugin did.
 - **Actors**: `cpt-cf-application-manager-actor-audit-plugin`, `cpt-cf-application-manager-actor-audit-plugin-author`, `cpt-cf-application-manager-actor-security-reviewer`
@@ -980,7 +980,7 @@ Define the public API surface, versioning/compatibility guarantees, and integrat
 - **Direction**: required from client
 - **Actors**: `cpt-cf-application-manager-actor-section-plugin`, `cpt-cf-application-manager-actor-section-plugin-author`
 - **Protocol/Format**: Platform plugin model, with section schemas in JSON Schema. Each section plugin:
-  - announces one section key and one priority at startup, where the key follows a stated token pattern (lower-case letters, digits, `-`, `_` and `.`, within a bounded length);
+  - announces one section key and one priority at startup, where the key follows a stated token pattern (lower-case letters, digits, `-`, `_` and `.`, within a bounded length, other than `.` and `..`);
   - serves the schema for its section as JSON Schema Draft 2020-12, with references that stay inside the served document, so that a schema that declares another dialect, uses an external reference, or does not compile is a section-plugin defect;
   - applies its section for an application;
   - removes an application on uninstall;

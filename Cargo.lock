@@ -1800,6 +1800,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-application-manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-application-manager-sdk",
+ "cf-gears-authz-resolver",
+ "cf-gears-toolkit",
+ "cf-gears-types-registry",
+ "humantime-serde",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-application-manager-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "gts",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-authn-resolver"
 version = "0.2.37"
 dependencies = [
