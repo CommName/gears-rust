@@ -4,6 +4,10 @@
 mod doubles;
 mod fakes;
 mod log_capture;
+// Registry persistence (P4): migrated test databases and the backend-independent cases
+// that the SQLite, Postgres and MySQL lanes all run.
+pub mod registry_cases;
+pub mod registry_db;
 #[allow(
     clippy::doc_markdown,
     clippy::manual_assert_eq,

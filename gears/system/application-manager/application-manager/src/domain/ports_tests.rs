@@ -24,21 +24,36 @@
 //! impl PolicyAction { pub fn name(&self) -> &'static str }  // the SDK ACTION_* constants
 //!
 //! // PHASE MARKERS: `Permit` will carry the `AccessScope` and `Unavailable` a reason
-//! // (P6, policy adapter); `RegistryStore` will take a scope argument and use the
-//! // DESIGN §3.7 `RegistryEntry` instead of `ApplicationEnvelope` (P4, registry).
-//! // The P2 shapes below are placeholders for exactly those items.
+//! // (P6, policy adapter). `RegistryStore` stays scope-less: DESIGN §3.2 "Ports and
+//! // Composition" (ADR 0007: the scope is always unscoped, so the registry repository
+//! // supplies it). P4 replaces the `ApplicationEnvelope` stand-in by the §3.7
+//! // `RegistryEntry` (`crate::domain::registry`) and refines `RegistryError`.
 //! pub enum PolicyDecision { Permit, Refused, Unavailable }
-//! pub enum RegistryError { Unavailable }                  // P4 refines
+//! pub enum RegistryError {
+//!     /// Storage cannot answer: a storage error, a pool acquire timeout, a backend
+//!     /// statement timeout (DESIGN §3.2 "Registry Repository").
+//!     Unavailable,
+//!     /// `registry_operation_timeout` expired. For `upsert` and `delete` this means
+//!     /// NOT CONFIRMED: the statement may still commit (DESIGN §3.2, §4.5).
+//!     TimedOut,
+//! }
+//! impl RegistryError {
+//!     /// The `unavailable` member reason of the `registry_storage` dependency:
+//!     /// `Unavailable` -> `Unreachable`, `TimedOut` -> `TimedOut`. DESIGN §3.2 names one
+//!     /// "distinct error kind" and §3.3 gives these reasons for access control only; the
+//!     /// DESIGN update after this phase records the two kinds for `registry_storage`.
+//!     pub fn reason(&self) -> UnavailableReason;
+//! }
 //!
 //! #[async_trait] pub trait PolicyPort: Send + Sync {
 //!     async fn decide(&self, caller: &CallerIdentity, action: PolicyAction,
 //!                     application_id: Option<&str>) -> PolicyDecision;
 //! }
 //! #[async_trait] pub trait RegistryStore: Send + Sync {
-//!     async fn get(&self, id: &str) -> Result<Option<ApplicationEnvelope>, RegistryError>;
-//!     async fn upsert(&self, entry: &ApplicationEnvelope) -> Result<(), RegistryError>;
-//!     async fn delete(&self, id: &str) -> Result<(), RegistryError>;
-//!     async fn list(&self) -> Result<Vec<ApplicationEnvelope>, RegistryError>;
+//!     async fn get(&self, id: &str) -> Result<Option<RegistryEntry>, RegistryError>;
+//!     async fn upsert(&self, entry: &RegistryEntry) -> Result<(), RegistryError>;
+//!     async fn delete(&self, id: &str) -> Result<(), RegistryError>;   // missing id: Ok
+//!     async fn list(&self) -> Result<Vec<RegistryEntry>, RegistryError>; // no defined order
 //! }
 //! #[async_trait] pub trait SectionPluginPort: Send + Sync {
 //!     async fn key(&self) -> Result<String, PluginCallError<SectionPluginError>>;
@@ -72,7 +87,10 @@
 //!
 //! - `ports_are_object_safe_send_sync`: all seven ports are `dyn` + Send + Sync (§3.2).
 //! - `policy_port_signature_is_pinned`: stub called through `Arc<dyn PolicyPort>`.
-//! - `registry_store_signature_is_pinned`: stub called through `Arc<dyn RegistryStore>`.
+//! - `registry_store_signature_is_pinned`: stub called through `Arc<dyn RegistryStore>`
+//!   with the §3.7 `RegistryEntry` (P4).
+//! - `registry_error_reason_table`: `Unavailable` -> `Unreachable`, `TimedOut` -> `TimedOut` (P4).
+//! - `registry_error_variants_differ_and_clone`: the two kinds differ, clone keeps the kind (P4).
 //! - `section_plugin_port_signature_is_pinned`: all four operations through `Arc<dyn>`;
 //!   every one returns the guarded error type (§3.3).
 //! - `audit_sink_signature_is_pinned`: both hand-offs through `Arc<dyn AuditSink>` (§3.3).
@@ -102,6 +120,7 @@ use crate::domain::ports::{
     AuditSink, Clock, PluginCallError, PolicyAction, PolicyDecision, PolicyPort, RegistryError,
     RegistryStore, RequestIdSource, SectionPluginPort, StartupPort,
 };
+use crate::domain::registry::{LastResult, RegistryEntry};
 
 fn assert_dyn_port<T: ?Sized + Send + Sync + 'static>() {}
 
@@ -138,21 +157,32 @@ impl PolicyPort for StubPolicy {
     }
 }
 
+fn registry_entry() -> RegistryEntry {
+    RegistryEntry::new(
+        "app",
+        "1",
+        LastResult::Succeeded,
+        std::time::UNIX_EPOCH,
+        "audit-1",
+    )
+    .expect("a valid registry entry")
+}
+
 struct StubRegistry;
 
 #[async_trait]
 impl RegistryStore for StubRegistry {
-    async fn get(&self, _id: &str) -> Result<Option<ApplicationEnvelope>, RegistryError> {
-        Ok(Some(envelope()))
+    async fn get(&self, _id: &str) -> Result<Option<RegistryEntry>, RegistryError> {
+        Ok(Some(registry_entry()))
     }
-    async fn upsert(&self, _entry: &ApplicationEnvelope) -> Result<(), RegistryError> {
+    async fn upsert(&self, _entry: &RegistryEntry) -> Result<(), RegistryError> {
         Err(RegistryError::Unavailable)
     }
     async fn delete(&self, _id: &str) -> Result<(), RegistryError> {
-        Ok(())
+        Err(RegistryError::TimedOut)
     }
-    async fn list(&self) -> Result<Vec<ApplicationEnvelope>, RegistryError> {
-        Ok(vec![envelope()])
+    async fn list(&self) -> Result<Vec<RegistryEntry>, RegistryError> {
+        Ok(vec![registry_entry()])
     }
 }
 
@@ -232,13 +262,37 @@ async fn policy_port_signature_is_pinned() {
 #[tokio::test]
 async fn registry_store_signature_is_pinned() {
     let port: Arc<dyn RegistryStore> = Arc::new(StubRegistry);
-    assert_eq!(port.get("app").await.expect("get"), Some(envelope()));
+    assert_eq!(port.get("app").await.expect("get"), Some(registry_entry()));
     assert!(matches!(
-        port.upsert(&envelope()).await,
+        port.upsert(&registry_entry()).await,
         Err(RegistryError::Unavailable)
     ));
-    assert!(port.delete("app").await.is_ok());
-    assert_eq!(port.list().await.expect("list"), vec![envelope()]);
+    assert!(matches!(
+        port.delete("app").await,
+        Err(RegistryError::TimedOut)
+    ));
+    assert_eq!(port.list().await.expect("list"), vec![registry_entry()]);
+}
+
+#[test]
+fn registry_error_reason_table() {
+    assert_eq!(
+        RegistryError::Unavailable.reason(),
+        UnavailableReason::Unreachable
+    );
+    assert_eq!(
+        RegistryError::TimedOut.reason(),
+        UnavailableReason::TimedOut
+    );
+}
+
+#[test]
+fn registry_error_variants_differ_and_clone() {
+    assert_ne!(RegistryError::Unavailable, RegistryError::TimedOut);
+    assert_eq!(
+        RegistryError::Unavailable.clone(),
+        RegistryError::Unavailable
+    );
 }
 
 #[tokio::test]

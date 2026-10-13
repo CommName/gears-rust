@@ -28,6 +28,7 @@ async-trait = { workspace = true }
 humantime-serde = { workspace = true }
 serde = { workspace = true }
 toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -35,6 +36,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 types-registry-sdk = { workspace = true }
 futures = { workspace = true }
+toolkit-db = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 # Startup tests (P3): fake types registry (`MockTypesRegistryClient` builders), tenant
@@ -48,3 +53,13 @@ toolkit-security = { workspace = true }
 tracing-subscriber = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+# Registry persistence tests (P4, DESIGN §3.7, §4.8): the backends the tests run against.
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "mysql"] }
+# SQLite file database per test: a second raw connection introspects the schema, which an
+# in-memory database cannot offer.
+tempfile = { workspace = true }
+# Postgres and MySQL lanes (`make test-application-manager-pg`, `make test-application-manager-mysql`,
+# Docker): pinned images via test-containers.
+testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }

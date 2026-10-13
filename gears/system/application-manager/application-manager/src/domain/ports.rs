@@ -8,6 +8,7 @@
 
 use std::time::SystemTime;
 
+use crate::domain::registry::RegistryEntry;
 use application_manager_sdk::gts::{
     ACTION_LIST, ACTION_READ_SCHEMA, ACTION_SEED, ACTION_UNINSTALL,
 };
@@ -18,11 +19,13 @@ use application_manager_sdk::{
 };
 use async_trait::async_trait;
 use serde_json::Value;
+use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 /// Failure of a plugin call made through the Plugin Call Guard (DESIGN §3.2, §4.5).
 ///
 /// `E` is the plugin's own error type. The guard adds the transport-level outcomes.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginCallError<E> {
     /// The plugin answered with its own error.
@@ -81,6 +84,7 @@ impl PluginCallError<AuditPluginError> {
 }
 
 /// Action an operation asks the PDP to authorize (DESIGN §3.2).
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
     /// Seed (create or replace) an application.
@@ -107,6 +111,7 @@ impl PolicyAction {
 }
 
 /// Answer of the policy port.
+#[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyDecision {
     /// The caller may perform the action.
@@ -119,12 +124,26 @@ pub enum PolicyDecision {
 
 /// Failure of the registry store.
 ///
-/// The store reports a single failure kind; richer variants are deferred to the
-/// registry adapter phase (P4).
+/// The store reports whether the backing registry was unreachable or the operation
+/// timed out; no backend detail crosses this boundary.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
     /// The backing registry is unavailable.
     Unavailable,
+    /// The operation timeout expired.
+    TimedOut,
+}
+
+impl RegistryError {
+    /// Reason of the `registry_storage` unavailable item.
+    #[must_use]
+    pub fn reason(&self) -> UnavailableReason {
+        match self {
+            Self::Unavailable => UnavailableReason::Unreachable,
+            Self::TimedOut => UnavailableReason::TimedOut,
+        }
+    }
 }
 
 /// Port to the policy decision point (PDP). The policy adapter is deferred to the
@@ -140,18 +159,18 @@ pub trait PolicyPort: Send + Sync {
     ) -> PolicyDecision;
 }
 
-/// Port to the application registry store. The registry adapter is deferred to the
-/// registry adapter phase (P4).
+/// Port to the application registry store, implemented by the `SeaORM` adapter in
+/// `infra::storage`.
 #[async_trait]
 pub trait RegistryStore: Send + Sync {
     /// Returns the entry with the given id, if any.
-    async fn get(&self, id: &str) -> Result<Option<ApplicationEnvelope>, RegistryError>;
+    async fn get(&self, id: &str) -> Result<Option<RegistryEntry>, RegistryError>;
     /// Creates or replaces an entry.
-    async fn upsert(&self, entry: &ApplicationEnvelope) -> Result<(), RegistryError>;
+    async fn upsert(&self, entry: &RegistryEntry) -> Result<(), RegistryError>;
     /// Deletes the entry with the given id.
     async fn delete(&self, id: &str) -> Result<(), RegistryError>;
     /// Returns all entries.
-    async fn list(&self) -> Result<Vec<ApplicationEnvelope>, RegistryError>;
+    async fn list(&self) -> Result<Vec<RegistryEntry>, RegistryError>;
 }
 
 /// Port to one section plugin, with calls made through the Plugin Call Guard.

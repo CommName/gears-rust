@@ -688,7 +688,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-application-manager-pg test-application-manager-mysql test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -887,6 +887,25 @@ test-pricing-pg: install-tools
 ## same reason: the gate is `#[ignore]` rather than a feature.
 test-coord-pg: install-tools
 	cargo nextest run -p cf-gears-bss-coord --run-ignored ignored-only -E 'binary(/^postgres_/)'
+
+## Run application-manager's Postgres lane (Docker required; testcontainers).
+##
+## The registry tests are written once (`src/test_support/registry_cases.rs`) and run on
+## SQLite in `make test` / `cargo test`. This target runs the very same case bodies on
+## Postgres, plus the Postgres-only schema checks (timestamptz, `C` collation), from
+## `src/infra/storage/postgres_tests.rs`. The gate is `#[ignore]` rather than a feature,
+## hence `--run-ignored ignored-only`, like `test-pricing-pg` above. The filter keeps the
+## run to the lane: the crate's other `#[ignore]`d tests (the MySQL lane) are not selected.
+test-application-manager-pg: install-tools
+	cargo nextest run -p cf-gears-application-manager --run-ignored ignored-only -E 'test(/postgres_tests::/)' --no-fail-fast
+
+## Run application-manager's MySQL lane (Docker required; testcontainers).
+##
+## Same shared cases as the Postgres lane, on MySQL, plus the MySQL-only schema checks
+## (`utf8mb4_0900_bin` collation, `DATETIME(6)`, `LONGTEXT`, octet-length CHECKs), from
+## `src/infra/storage/mysql_tests.rs`.
+test-application-manager-mysql: install-tools
+	cargo nextest run -p cf-gears-application-manager --run-ignored ignored-only -E 'test(/mysql_tests::/)' --no-fail-fast
 
 ## Compile and run `bss-fixtures` on the surface a **gear** actually takes.
 ##
@@ -1385,7 +1404,7 @@ ci_docs: lychee gts-docs
 	$(call print_target_banner)
 
 # Run CI pipeline locally, requires docker
-ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-types-registry-db lychee gts-docs dylint
+ci: fmt clippy test-no-macros test-macros test-db deny test-users-info-pg test-usage-collector-pg test-types-registry-db test-application-manager-pg test-application-manager-mysql lychee gts-docs dylint
 	$(call print_target_banner)
 
 ## Build the cf-gears-example-server release binary, or a single gear when GEAR=<gear> is set

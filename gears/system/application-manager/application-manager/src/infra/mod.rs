@@ -3,3 +3,4 @@
 pub mod call_guard;
 pub mod plugin_adapters;
 pub mod startup;
+pub mod storage;

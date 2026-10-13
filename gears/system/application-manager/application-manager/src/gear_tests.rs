@@ -13,6 +13,24 @@
 //!   rejected (§3.2, ADR 0007, §4.7).
 //! - `init_fails_when_already_initialized`: second init fails (§3.2).
 //! - `gear_declares_types_registry_and_authz_resolver_deps`: registered deps (§3.2).
+//!
+//! Registry persistence (P4, DESIGN §3.2 "Startup and Registration", §3.7): the gear macro
+//! gains the `db` capability (`capabilities = [stateful, db]`) and `ApplicationManagerGear`
+//! implements `toolkit::DatabaseCapability`, whose `migrations()` returns
+//! `crate::infra::storage::migrations::Migrator::migrations()`. `init` still resolves no
+//! database: the registry store is built with the orchestrator (phasing, §4.12), so the P1-P3
+//! `init` tests above keep passing on a `GearCtx` without a database.
+//!
+//! - `gear_declares_the_db_capability_next_to_stateful`: registry capability labels (§3.2).
+//! - `gear_returns_the_registry_migrations_from_database_capability`: same names as the
+//!   `Migrator` (§3.7).
+//! - `gear_migrations_create_the_registry_table_on_an_empty_database`: running the gear's
+//!   migrations the way the platform migration phase does creates `application_registry`
+//!   and nothing tenant-shaped (§3.7, ADR 0007).
+//! - `init_needs_no_database_before_the_orchestrator_phase`: TRANSITIONAL, until `init`
+//!   builds the registry store (the orchestrator phase, §4.12): `init` succeeds with no
+//!   database handle in the context. DESIGN §3.2 has the gear resolve its database at
+//!   startup, so the phase that builds the store replaces this test.
 
 use std::sync::Arc;
 
@@ -20,7 +38,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use toolkit::config::ConfigProvider;
 use toolkit::registry::GearRegistry;
-use toolkit::{ClientHub, Gear, GearCtx};
+use toolkit::{ClientHub, DatabaseCapability, Gear, GearCtx};
 use uuid::Uuid;
 
 use crate::gear::ApplicationManagerGear;
@@ -192,4 +210,80 @@ fn gear_declares_types_registry_and_authz_resolver_deps() {
         ["types-registry", "authz-resolver"],
         "declared deps must be types-registry and authz-resolver"
     );
+}
+
+#[test]
+fn gear_declares_the_db_capability_next_to_stateful() {
+    let registry = GearRegistry::discover_and_build()
+        .expect("the inventory registry must build with the declared deps linked");
+    let entry = registry
+        .gears()
+        .iter()
+        .find(|e| e.name() == GEAR_NAME)
+        .expect("application-manager must be registered via the gear macro");
+
+    assert!(
+        entry.caps().has_db(),
+        "the gear owns a table, so it declares `db`"
+    );
+    let labels = entry.caps().labels();
+    assert!(labels.contains(&"db"), "{labels:?}");
+    assert!(labels.contains(&"stateful"), "{labels:?}");
+}
+
+#[test]
+fn gear_returns_the_registry_migrations_from_database_capability() {
+    use sea_orm_migration::MigratorTrait;
+
+    let gear = ApplicationManagerGear::default();
+
+    let from_gear: Vec<String> = DatabaseCapability::migrations(&gear)
+        .iter()
+        .map(|m| m.name().to_owned())
+        .collect();
+    let from_migrator: Vec<String> = crate::infra::storage::migrations::Migrator::migrations()
+        .iter()
+        .map(|m| m.name().to_owned())
+        .collect();
+
+    assert_eq!(
+        from_gear.len(),
+        1,
+        "one initial migration (DESIGN section 3.7)"
+    );
+    assert_eq!(from_gear, from_migrator);
+}
+
+#[tokio::test]
+async fn gear_migrations_create_the_registry_table_on_an_empty_database() {
+    use crate::test_support::registry_db::{self, REGISTRY_TABLE, real_bounded};
+    use toolkit_db::ConnectOpts;
+    use toolkit_db::migration_runner::run_migrations_for_gear;
+
+    let db = registry_db::sqlite_with(ConnectOpts::default(), false).await;
+    assert!(!registry_db::table_exists(&db, REGISTRY_TABLE).await);
+    let gear = ApplicationManagerGear::default();
+
+    let result = real_bounded(run_migrations_for_gear(
+        &db.provider.db(),
+        GEAR_NAME,
+        DatabaseCapability::migrations(&gear),
+    ))
+    .await
+    .expect("the gear's migrations apply on an empty database");
+
+    assert_eq!(result.applied, 1);
+    assert!(registry_db::table_exists(&db, REGISTRY_TABLE).await);
+    assert_eq!(registry_db::columns_named_like(&db, "tenant").await, 0);
+}
+
+#[tokio::test]
+async fn init_needs_no_database_before_the_orchestrator_phase() {
+    let ctx = ctx_with_config(valid_config());
+    assert!(ctx.db().is_none(), "the test context carries no database");
+
+    ApplicationManagerGear::default()
+        .init(&ctx)
+        .await
+        .expect("init must not require a database handle yet");
 }

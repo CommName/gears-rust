@@ -405,6 +405,15 @@ jobs:
       - name: Test coord with Postgres (integration)
         run: make test-coord-pg
 
+      # application-manager's registry cases run on SQLite in `make test`; the Postgres and
+      # MySQL lanes run the same case bodies against the real engines (byte-length CHECKs,
+      # binary collations, timestamp range) and are `#[ignore]`d without Docker.
+      - name: Test application-manager registry with Postgres (integration)
+        run: make test-application-manager-pg
+
+      - name: Test application-manager registry with MySQL (integration)
+        run: make test-application-manager-mysql
+
       - name: Test redis-cluster-plugin (redis integration)
         run: make test-cluster-redis
 

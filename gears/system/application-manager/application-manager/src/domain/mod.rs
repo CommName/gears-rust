@@ -2,4 +2,5 @@
 
 pub mod limits;
 pub mod ports;
+pub mod registry;
 pub mod startup;

@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use toolkit::{Gear, GearCtx, RunnableCapability};
+use toolkit::{DatabaseCapability, Gear, GearCtx, RunnableCapability};
 
 use crate::config::{ApplicationManagerConfig, REASON};
 use crate::domain::startup::StartupResultHolder;
@@ -22,10 +22,13 @@ use types_registry as _;
 /// once, and builds the startup component. `init` resolves nothing from the hub: the
 /// stateful `start` capability discovers the plugins and publishes the startup result.
 /// No tenant service is resolved (ADR 0007).
+///
+/// Migrations come from `DatabaseCapability::migrations()`; the registry store is built
+/// when the orchestrator lands.
 #[toolkit::gear(
     name = "application-manager",
     deps = [types_registry, authz_resolver],
-    capabilities = [stateful]
+    capabilities = [stateful, db]
 )]
 #[derive(Default)]
 pub struct ApplicationManagerGear {
@@ -69,6 +72,13 @@ impl ApplicationManagerGear {
     #[cfg_attr(not(test), allow(dead_code, reason = "used by the orchestrator phase"))]
     pub(crate) fn startup_holder(&self) -> Option<Arc<StartupResultHolder>> {
         self.startup.get().map(|s| Arc::clone(&s.holder))
+    }
+}
+
+impl DatabaseCapability for ApplicationManagerGear {
+    fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+        use sea_orm_migration::MigratorTrait;
+        crate::infra::storage::migrations::Migrator::migrations()
     }
 }
 

@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use toolkit_macros::domain_model;
+
 use crate::domain::ports::{AuditSink, SectionPluginPort, StartupPort};
 
 /// One resolved section plugin instance.
@@ -16,6 +18,7 @@ use crate::domain::ports::{AuditSink, SectionPluginPort, StartupPort};
 /// id and the scope id of the plugin's `ClientHub` client; `priority` is the
 /// instance's registered priority; `key` passed the SDK key rule and is unique in the
 /// result; `plugin` is the adapter over the client of `instance_id`.
+#[domain_model]
 #[cfg_attr(
     not(test),
     allow(
@@ -35,6 +38,7 @@ pub struct SectionPluginEntry {
 }
 
 /// The immutable outcome of startup: the section plugin set and the audit sink.
+#[domain_model]
 pub struct StartupResult {
     sections: Vec<SectionPluginEntry>,
     audit_instance_id: String,
@@ -83,6 +87,7 @@ impl StartupResult {
 }
 
 /// A startup result was already published.
+#[domain_model]
 #[derive(Debug, PartialEq, Eq)]
 pub struct AlreadyPublished;
 
@@ -90,6 +95,7 @@ pub struct AlreadyPublished;
 ///
 /// Published by the startup component; read by the orchestrator, the read service and
 /// the REST not-ready gate.
+#[domain_model]
 #[derive(Default)]
 pub struct StartupResultHolder {
     result: OnceLock<Arc<StartupResult>>,
