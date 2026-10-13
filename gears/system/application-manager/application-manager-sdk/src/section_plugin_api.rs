@@ -25,6 +25,9 @@ pub trait SectionPluginClientV1: Send + Sync {
     async fn key(&self) -> Result<String, SectionPluginError>;
 
     /// The JSON Schema of the section.
+    ///
+    /// May fail only with [`SectionPluginError::Internal`]; `Rejected` and
+    /// `NotPermitted` here break the contract and the schema is reported `unusable`.
     async fn schema(&self, caller: &CallerIdentity) -> Result<Value, SectionPluginError>;
 
     /// Applies the section of an application.
