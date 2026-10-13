@@ -199,10 +199,12 @@ pub trait AuditSink: Send + Sync {
     ) -> Result<(), PluginCallError<AuditPluginError>>;
 }
 
-/// Port to the startup state holder (DESIGN §3.2).
+/// Read-and-stop port to the startup state holder (DESIGN §3.2).
+///
+/// Publication is not part of the port: the startup component publishes the startup
+/// result through the concrete holder (`StartupResultHolder::publish_result`), and the
+/// domain components and the REST not-ready gate only read and stop through this port.
 pub trait StartupPort: Send + Sync {
-    /// Marks the gear as published (ready to serve).
-    fn publish(&self);
     /// Marks the gear as stopping.
     fn set_stopping(&self);
     /// Whether the gear is published and not stopping.

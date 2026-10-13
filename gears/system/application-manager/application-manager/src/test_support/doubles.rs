@@ -80,11 +80,14 @@ pub struct StartupHolder {
     stopping: AtomicBool,
 }
 
-impl StartupPort for StartupHolder {
-    fn publish(&self) {
+impl StartupHolder {
+    /// Marks the holder published (ready unless stopping). Not part of the port.
+    pub fn publish(&self) {
         self.published.store(true, Ordering::SeqCst);
     }
+}
 
+impl StartupPort for StartupHolder {
     fn set_stopping(&self) {
         self.stopping.store(true, Ordering::SeqCst);
     }

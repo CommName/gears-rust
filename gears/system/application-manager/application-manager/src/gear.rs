@@ -1,33 +1,42 @@
 //! Gear declaration and lifecycle for `application-manager` (DESIGN §3.2, §4.7).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use toolkit::{Gear, GearCtx};
+use tokio_util::sync::CancellationToken;
+use toolkit::{Gear, GearCtx, RunnableCapability};
 
 use crate::config::{ApplicationManagerConfig, REASON};
+use crate::domain::startup::StartupResultHolder;
+use crate::infra::startup::StartupComponent;
 
 // Linked so the `types_registry` and `authz_resolver` gears named in `deps`
 // are present in the inventory of every binary that links this crate.
 use authz_resolver as _;
 use types_registry as _;
-// The SDK is not used by gear code yet (P1); linked so its plugin-spec GTS schemas
-// reach the inventory.
-use application_manager_sdk as _;
 
 /// Application Manager gear.
 ///
 /// At `init` the gear reads the `application-manager` config section with the
 /// strict accessor (a missing section is an error), validates it and stores it
-/// once. P1 declares no capabilities and performs no plugin discovery; no tenant
-/// service is resolved (ADR 0007).
+/// once, and builds the startup component. `init` resolves nothing from the hub: the
+/// stateful `start` capability discovers the plugins and publishes the startup result.
+/// No tenant service is resolved (ADR 0007).
 #[toolkit::gear(
     name = "application-manager",
-    deps = [types_registry, authz_resolver]
+    deps = [types_registry, authz_resolver],
+    capabilities = [stateful]
 )]
 #[derive(Default)]
 pub struct ApplicationManagerGear {
     config: OnceLock<ApplicationManagerConfig>,
+    startup: OnceLock<Startup>,
+}
+
+/// The start capability and the holder it publishes into, built by `init`.
+struct Startup {
+    component: StartupComponent,
+    holder: Arc<StartupResultHolder>,
 }
 
 #[async_trait]
@@ -42,10 +51,41 @@ impl Gear for ApplicationManagerGear {
         // `validate` errors already start with `invalid_setting` and name the setting;
         // no outer context, so a plain `{}` log keeps the reason (DESIGN §4.7).
         cfg.validate()?;
+        let holder = Arc::new(StartupResultHolder::new());
+        let component = StartupComponent::new(&cfg, ctx.client_hub(), Arc::clone(&holder));
+        self.startup
+            .set(Startup { component, holder })
+            .map_err(|_| anyhow::anyhow!("application-manager gear is already initialized"))?;
         self.config
             .set(cfg)
             .map_err(|_| anyhow::anyhow!("application-manager gear is already initialized"))?;
         Ok(())
+    }
+}
+
+impl ApplicationManagerGear {
+    /// The startup result holder; `None` until `init` succeeded.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the orchestrator phase"))]
+    pub(crate) fn startup_holder(&self) -> Option<Arc<StartupResultHolder>> {
+        self.startup.get().map(|s| Arc::clone(&s.holder))
+    }
+}
+
+#[async_trait]
+impl RunnableCapability for ApplicationManagerGear {
+    async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let Some(startup) = self.startup.get() else {
+            anyhow::bail!("application-manager: start called before init");
+        };
+        startup.component.start(cancel).await
+    }
+
+    async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()> {
+        match self.startup.get() {
+            Some(startup) => startup.component.stop(deadline_token).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -54,3 +94,9 @@ impl Gear for ApplicationManagerGear {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "gear_tests.rs"]
 mod gear_tests;
+
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_start_tests.rs"]
+mod gear_start_tests;

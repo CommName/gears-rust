@@ -33,8 +33,18 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+types-registry-sdk = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
+# Startup tests (P3): fake types registry (`MockTypesRegistryClient` builders), tenant
+# resolver tripwire, canonical errors, security context.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# ADR 0007: the gear never uses a tenant service. This crate is a test-only tripwire
+# (it counts calls a startup must not make) and must never become a normal dependency.
+tenant-resolver-sdk = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
 tracing-subscriber = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

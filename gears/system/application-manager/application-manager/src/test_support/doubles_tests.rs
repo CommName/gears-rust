@@ -9,7 +9,7 @@
 //! pub struct ManualClock;  // new(SystemTime); advance(&self, Duration); impl Clock
 //! pub struct SequentialIdSource; // impl RequestIdSource; new() starts at
 //!                                // Uuid::from_u128(1); starting_at(u128); thread-safe
-//! pub struct StartupHolder; // impl StartupPort; Default; flag-only (payload arrives in P3)
+//! pub struct StartupHolder; // impl StartupPort; Default; flag-only; inherent publish()
 //! ```
 //!
 //! `SequentialIdSource` ids are plain counters, ordered by byte order; they are NOT
@@ -198,7 +198,11 @@ fn startup_holder_double_publish_is_harmless() {
 
 #[test]
 fn startup_holder_is_arc_dyn_port() {
-    let port: Arc<dyn StartupPort> = Arc::new(StartupHolder::default());
-    port.publish();
+    let holder = Arc::new(StartupHolder::default());
+    let port: Arc<dyn StartupPort> = holder.clone();
+    assert!(!port.is_ready());
+    holder.publish();
     assert!(port.is_ready());
+    port.set_stopping();
+    assert!(!port.is_ready());
 }

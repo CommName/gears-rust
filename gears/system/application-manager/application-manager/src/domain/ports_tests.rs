@@ -55,8 +55,7 @@
 //!     async fn final_result_handoff(&self, caller: &CallerIdentity, audit_id: &str,
 //!         content: &FinalResultContent) -> Result<(), PluginCallError<AuditPluginError>>;
 //! }
-//! pub trait StartupPort: Send + Sync {   // flag-only in P2; the payload arrives in P3
-//!     fn publish(&self);                 // idempotent
+//! pub trait StartupPort: Send + Sync {   // read and stop only; publication is on the holder
 //!     fn set_stopping(&self);
 //!     fn is_ready(&self) -> bool;        // published && !stopping
 //!     fn is_stopping(&self) -> bool;

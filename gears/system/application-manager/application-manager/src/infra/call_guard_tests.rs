@@ -82,9 +82,8 @@
 //!   `drain_logs_abandoned_count_per_plugin`, `drain_cancels_nothing` (§3.2)
 
 use std::future::Future;
-use std::io::Write;
 use std::pin::pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -97,13 +96,13 @@ use serde_json::{Value, json};
 use tokio::sync::Barrier;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 
 use crate::domain::ports::PluginCallError;
 use crate::infra::call_guard::{CallKind, CallMeta, PluginCallGuard, PluginKind};
 use crate::test_support::{
-    AuditCall, CallBehavior, FakeAuditPlugin, FakeSectionPlugin, SectionCall,
+    AuditCall, CallBehavior, FakeAuditPlugin, FakeSectionPlugin, SectionCall, capture_logs,
+    has_field,
 };
 
 const TIMEOUT: Duration = Duration::from_millis(500);
@@ -203,83 +202,6 @@ fn cancel_after(after: Duration) -> CancellationToken {
         trigger.cancel();
     });
     token
-}
-
-// Log capture. One global subscriber (installed once) writes to a per-thread buffer, so
-// callsite interest is never cached as "disabled" by a parallel test that has no
-// capture. Current-thread runtime tests only: the buffer belongs to the test thread.
-thread_local! {
-    static CURRENT_LOG: std::cell::RefCell<Option<LogBuffer>> = const { std::cell::RefCell::new(None) };
-}
-
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-struct RoutedWriter;
-
-impl Write for RoutedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        CURRENT_LOG.with(|current| {
-            if let Some(buffer) = current.borrow().as_ref() {
-                buffer.0.lock().expect("log lock").extend_from_slice(buf);
-            }
-        });
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for RoutedWriter {
-    type Writer = RoutedWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        RoutedWriter
-    }
-}
-
-impl LogBuffer {
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().expect("log lock").clone()).expect("utf8 log")
-    }
-
-    fn lines_with(&self, message: &str) -> Vec<String> {
-        self.text()
-            .lines()
-            .filter(|line| line.contains(message))
-            .map(str::to_owned)
-            .collect()
-    }
-}
-
-// Stops routing to the buffer when dropped.
-struct CaptureGuard;
-
-impl Drop for CaptureGuard {
-    fn drop(&mut self) {
-        CURRENT_LOG.with(|current| *current.borrow_mut() = None);
-    }
-}
-
-fn capture_logs() -> (LogBuffer, CaptureGuard) {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(RoutedWriter)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("no other global tracing subscriber in this test binary");
-    });
-    let buffer = LogBuffer::default();
-    CURRENT_LOG.with(|current| *current.borrow_mut() = Some(buffer.clone()));
-    (buffer, CaptureGuard)
-}
-
-fn has_field(line: &str, field: &str, value: &str) -> bool {
-    let wanted = format!("{field}={value}");
-    line.split_whitespace().any(|token| token == wanted)
 }
 
 const LATE: &str = "plugin_call_late_result";
@@ -770,6 +692,7 @@ async fn late_result_is_logged_once_by_metadata_only() {
         )
         .await;
     assert_eq!(result, Err(PluginCallError::TimedOut));
+    logs.assert_live();
     assert!(
         logs.lines_with(LATE).is_empty(),
         "nothing logged before the late result"
@@ -835,6 +758,7 @@ async fn result_within_the_limit_logs_no_late_event() {
     );
     assert_eq!(guarded_apply(&guard, "p", &fake).await, Ok(()));
     tokio::time::sleep(Duration::from_secs(5)).await;
+    logs.assert_live();
     assert!(logs.lines_with(LATE).is_empty(), "{}", logs.text());
 }
 
@@ -1000,6 +924,7 @@ async fn result_delivered_but_never_polled_is_logged_once_on_drop() {
         assert!(call.as_mut().poll(&mut cx).is_pending());
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(guard.in_flight("p"), 0, "the plugin has finished");
+        logs.assert_live();
         assert!(
             logs.lines_with(LATE).is_empty(),
             "the supervisor's send succeeded, nothing logged yet"
