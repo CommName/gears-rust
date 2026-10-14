@@ -7,8 +7,13 @@ use tokio_util::sync::CancellationToken;
 use toolkit::{DatabaseCapability, Gear, GearCtx, RunnableCapability};
 
 use crate::config::{ApplicationManagerConfig, REASON};
+use crate::domain::orchestrator::{Orchestrator, OrchestratorSettings};
+use crate::domain::ports::{PolicyPort, RegistryStore};
 use crate::domain::startup::StartupResultHolder;
+use crate::infra::policy::PolicyAdapter;
 use crate::infra::startup::StartupComponent;
+use crate::infra::storage::store::SeaRegistryStore;
+use crate::infra::system_ports::{SystemClock, UuidV7RequestIds};
 
 // Linked so the `types_registry` and `authz_resolver` gears named in `deps`
 // are present in the inventory of every binary that links this crate.
@@ -19,12 +24,15 @@ use types_registry as _;
 ///
 /// At `init` the gear reads the `application-manager` config section with the
 /// strict accessor (a missing section is an error), validates it and stores it
-/// once, and builds the startup component. `init` resolves nothing from the hub: the
-/// stateful `start` capability discovers the plugins and publishes the startup result.
-/// No tenant service is resolved (ADR 0007).
+/// once, and builds the startup component and the request orchestrator (over the policy
+/// adapter, the registry store on the gear database, the startup result holder, the system
+/// clock and `UUIDv7` request ids). `init` resolves nothing from the hub: the policy adapter
+/// resolves the authz client at each decision, and the stateful `start` capability discovers
+/// the plugins and publishes the startup result. A missing database does not fail `init`: no
+/// orchestrator is built and `start` fails with `database_unavailable`. No tenant service is
+/// resolved (ADR 0007).
 ///
-/// Migrations come from `DatabaseCapability::migrations()`; the registry store is built
-/// when the orchestrator lands.
+/// Migrations come from `DatabaseCapability::migrations()`.
 #[toolkit::gear(
     name = "application-manager",
     deps = [types_registry, authz_resolver],
@@ -34,6 +42,7 @@ use types_registry as _;
 pub struct ApplicationManagerGear {
     config: OnceLock<ApplicationManagerConfig>,
     startup: OnceLock<Startup>,
+    orchestrator: OnceLock<Orchestrator>,
 }
 
 /// The start capability and the holder it publishes into, built by `init`.
@@ -55,10 +64,35 @@ impl Gear for ApplicationManagerGear {
         // no outer context, so a plain `{}` log keeps the reason (DESIGN §4.7).
         cfg.validate()?;
         let holder = Arc::new(StartupResultHolder::new());
-        let component = StartupComponent::new(&cfg, ctx.client_hub(), Arc::clone(&holder));
+        let mut component = StartupComponent::new(&cfg, ctx.client_hub(), Arc::clone(&holder));
+        let orchestrator = if let Some(db) = ctx.db() {
+            let policy: Arc<dyn PolicyPort> = Arc::new(PolicyAdapter::from_hub(
+                ctx.client_hub(),
+                cfg.pdp_call_timeout,
+            ));
+            let registry: Arc<dyn RegistryStore> =
+                Arc::new(SeaRegistryStore::new(db, cfg.registry_operation_timeout));
+            Some(Orchestrator::new(
+                policy,
+                registry,
+                Arc::clone(&holder),
+                Arc::new(SystemClock),
+                Arc::new(UuidV7RequestIds),
+                OrchestratorSettings::from_config(&cfg),
+            ))
+        } else {
+            component = component.without_database();
+            None
+        };
+        // The first `set` is the guard of a second `init`: it fails before anything is replaced.
         self.startup
             .set(Startup { component, holder })
             .map_err(|_| anyhow::anyhow!("application-manager gear is already initialized"))?;
+        if let Some(orchestrator) = orchestrator {
+            self.orchestrator
+                .set(orchestrator)
+                .map_err(|_| anyhow::anyhow!("application-manager gear is already initialized"))?;
+        }
         self.config
             .set(cfg)
             .map_err(|_| anyhow::anyhow!("application-manager gear is already initialized"))?;
@@ -69,9 +103,17 @@ impl Gear for ApplicationManagerGear {
 impl ApplicationManagerGear {
     /// The startup result holder; `None` until `init` succeeded.
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code, reason = "used by the orchestrator phase"))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the REST phase"))]
     pub(crate) fn startup_holder(&self) -> Option<Arc<StartupResultHolder>> {
         self.startup.get().map(|s| Arc::clone(&s.holder))
+    }
+
+    /// The request orchestrator `init` built; `None` until `init` succeeded, and when `init`
+    /// found no database handle.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code, reason = "used by the REST phase"))]
+    pub(crate) fn orchestrator(&self) -> Option<&Orchestrator> {
+        self.orchestrator.get()
     }
 }
 
@@ -110,3 +152,9 @@ mod gear_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "gear_start_tests.rs"]
 mod gear_start_tests;
+
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_registry_tests.rs"]
+mod gear_registry_tests;

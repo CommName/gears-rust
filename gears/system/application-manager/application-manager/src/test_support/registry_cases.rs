@@ -1,12 +1,22 @@
 //! Backend-independent registry cases (DESIGN §3.7, §3.2 "Registry Repository", §4.8
 //! "Integration" and "Security", ADR 0005, ADR 0007).
 //!
-//! Each case is an `async fn name(db: &RegistryTestDb)` written once. The `registry_cases!`
-//! macro below turns the list into:
+//! The cases come in two blocks of one `registry_cases!` invocation:
 //!
-//! - the case functions themselves (`pub`), and `all()`, the `(name, case)` list the
-//!   Postgres and `MySQL` lanes iterate (`infra::storage::postgres_tests`, `mysql_tests`,
-//!   through `run_lane`);
+//! - `portable`: `async fn name(store: &dyn RegistryStore)`. They touch only the port, so one
+//!   body runs on every store: `SeaRegistryStore` over `SQLite` (`sqlite_lane`), Postgres and
+//!   `MySQL` (`run_lane`, through the database wrapper below), and the in-memory fake
+//!   `InMemoryRegistryStore` (`fakes_registry_tests`, through `portable::all()`; P6). A store
+//!   that breaks a case (folds case, drops writes) fails it.
+//! - `database`: `async fn name(db: &RegistryTestDb)`. They need the database itself (raw rows,
+//!   scopes, constraints, migrations, a held lock) and stay on the SQL lanes.
+//!
+//! The macro turns the lists into:
+//!
+//! - `portable::<name>` (the store-port bodies) and `portable::all()`;
+//! - the database case functions `<name>(db)` (`pub`; a portable case runs through
+//!   `store(db)`), and `all()`, the `(name, case)` list the Postgres and `MySQL` lanes iterate
+//!   (`infra::storage::postgres_tests`, `mysql_tests`, through `run_lane`);
 //! - the `SQLite` lane, `sqlite_lane::<name>`: one `#[tokio::test]` per case on a fresh
 //!   migrated `SQLite` file database. Run it with
 //!   `cargo test -p cf-gears-application-manager registry_cases::sqlite_lane`.
@@ -15,7 +25,7 @@
 //! §4.8: "`SQLite` always; `PostgreSQL` and `MySQL` ... in the integration lane"). Cases that
 //! need to control the pool (acquire timeouts, unreachable storage) are `SQLite`-only and
 //! live in `infra::storage::store_tests`; a timeout INSIDE a statement (a lock held by a
-//! second connection) is a shared case here.
+//! second connection) is a shared database case here.
 //!
 //! Timestamps in these cases are whole microseconds: `RegistryEntry::new` truncates to
 //! microseconds, the precision every backend keeps.
@@ -149,28 +159,90 @@ where
     failures
 }
 
+/// One portable case as a function pointer: it needs only the registry store port.
+pub type StoreCaseFn = for<'a> fn(&'a dyn RegistryStore) -> StoreCaseFuture<'a>;
+/// The future of one portable case.
+pub type StoreCaseFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 macro_rules! registry_cases {
-    ($( $(#[$meta:meta])* async fn $name:ident($db:ident: &RegistryTestDb) $body:block )*) => {
+    (
+        portable {
+            $( $(#[$pmeta:meta])* async fn $pname:ident($pstore:ident: &dyn RegistryStore) $pbody:block )*
+        }
+        database {
+            $( $(#[$meta:meta])* async fn $name:ident($db:ident: &RegistryTestDb) $body:block )*
+        }
+    ) => {
+        /// The cases that touch only the `RegistryStore` port: every one runs on the `SQLite`,
+        /// Postgres and `MySQL` lanes through `SeaRegistryStore`, and on the in-memory fake
+        /// (`InMemoryRegistryStore`) through `&dyn RegistryStore` (P6).
+        pub mod portable {
+            use super::*;
+
+            $( $(#[$pmeta])* pub async fn $pname($pstore: &dyn RegistryStore) $pbody )*
+
+            /// Every portable case with its name.
+            #[must_use]
+            pub fn all() -> Vec<(&'static str, StoreCaseFn)> {
+                vec![$((
+                    stringify!($pname),
+                    {
+                        fn call(store: &dyn RegistryStore) -> StoreCaseFuture<'_> {
+                            Box::pin($pname(store))
+                        }
+                        call as StoreCaseFn
+                    },
+                )),*]
+            }
+        }
+
+        // The database lanes run a portable case through the store over their database.
+        $( pub async fn $pname(db: &RegistryTestDb) { portable::$pname(&store(db)).await } )*
+
         $( $(#[$meta])* pub async fn $name($db: &RegistryTestDb) $body )*
 
-        /// Every case with its name, for the Postgres lane.
+        /// The names of the database-only cases (the second block), in order.
+        #[must_use]
+        pub fn database_case_names() -> Vec<&'static str> {
+            vec![$(stringify!($name)),*]
+        }
+
+        /// Every case with its name, for the Postgres and `MySQL` lanes.
         #[must_use]
         pub fn all() -> Vec<(&'static str, CaseFn)> {
-            vec![$((
-                stringify!($name),
-                {
-                    fn call(db: &RegistryTestDb) -> CaseFuture<'_> {
-                        Box::pin($name(db))
-                    }
-                    call as CaseFn
-                },
-            )),*]
+            vec![
+                $((
+                    stringify!($pname),
+                    {
+                        fn call(db: &RegistryTestDb) -> CaseFuture<'_> {
+                            Box::pin($pname(db))
+                        }
+                        call as CaseFn
+                    },
+                ),)*
+                $((
+                    stringify!($name),
+                    {
+                        fn call(db: &RegistryTestDb) -> CaseFuture<'_> {
+                            Box::pin($name(db))
+                        }
+                        call as CaseFn
+                    },
+                ),)*
+            ]
         }
 
         /// The `SQLite` lane: one test per case on a fresh migrated database.
         mod sqlite_lane {
             use super::real_bounded;
             use crate::test_support::registry_db;
+            $(
+                #[tokio::test]
+                async fn $pname() {
+                    let db = registry_db::sqlite().await;
+                    real_bounded(super::$pname(&db)).await;
+                }
+            )*
             $(
                 #[tokio::test]
                 async fn $name() {
@@ -185,8 +257,8 @@ macro_rules! registry_cases {
 registry_cases! {
     // ---- store behaviour (DESIGN §3.2 "Registry Repository", §3.7) ----------------------
 
-    async fn upsert_inserts_a_new_entry_and_get_returns_every_field(db: &RegistryTestDb) {
-        let store = store(db);
+    portable {
+    async fn upsert_inserts_a_new_entry_and_get_returns_every_field(store: &dyn RegistryStore) {
         let e = entry("app-1", "2.3.4", LastResult::PartiallyFailed, at(1_800_000_000, 654_321), "audit-9");
 
         store.upsert(&e).await.expect("upsert a new entry");
@@ -194,8 +266,7 @@ registry_cases! {
         assert_eq!(store.get("app-1").await.expect("get"), Some(e));
     }
 
-    async fn get_of_a_missing_id_returns_none(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn get_of_a_missing_id_returns_none(store: &dyn RegistryStore) {
         assert_eq!(store.get("absent").await.expect("get"), None);
 
         store.upsert(&sample("present")).await.expect("upsert");
@@ -204,8 +275,7 @@ registry_cases! {
         assert_eq!(store.get("present ").await.expect("get"), None, "no trailing-space match");
     }
 
-    async fn upsert_overwrites_every_field_on_reseed(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn upsert_overwrites_every_field_on_reseed(store: &dyn RegistryStore) {
         let first = entry("app", "1.0.0", LastResult::Succeeded, at(1_000_000_000, 1), "audit-first");
         let second = entry("app", "2.0.0", LastResult::InternalFailure, at(1_900_000_000, 999_999), "audit-second");
         store.upsert(&first).await.expect("first seed");
@@ -221,8 +291,7 @@ registry_cases! {
         assert_eq!(store.list().await.expect("list").len(), 1, "one row, not two");
     }
 
-    async fn reseed_leaves_other_entries_untouched(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn reseed_leaves_other_entries_untouched(store: &dyn RegistryStore) {
         let other = entry("other", "9", LastResult::NotPermitted, at(1_700_000_000, 5), "audit-other");
         store.upsert(&other).await.expect("upsert other");
         store.upsert(&sample("app")).await.expect("upsert app");
@@ -236,8 +305,7 @@ registry_cases! {
         assert_eq!(store.list().await.expect("list").len(), 2);
     }
 
-    async fn delete_removes_only_the_named_entry(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn delete_removes_only_the_named_entry(store: &dyn RegistryStore) {
         let keep = sample("keep");
         store.upsert(&sample("gone")).await.expect("upsert");
         store.upsert(&keep).await.expect("upsert");
@@ -248,8 +316,7 @@ registry_cases! {
         assert_eq!(store.get("keep").await.expect("get"), Some(keep));
     }
 
-    async fn delete_of_a_missing_entry_counts_as_deleted(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn delete_of_a_missing_entry_counts_as_deleted(store: &dyn RegistryStore) {
         store.delete("never-seeded").await.expect("a missing entry counts as deleted");
 
         store.upsert(&sample("app")).await.expect("upsert");
@@ -258,14 +325,13 @@ registry_cases! {
         assert_eq!(store.get("app").await.expect("get"), None);
     }
 
-    async fn list_of_an_empty_registry_is_empty(db: &RegistryTestDb) {
-        assert_eq!(store(db).list().await.expect("list"), Vec::new());
+    async fn list_of_an_empty_registry_is_empty(store: &dyn RegistryStore) {
+        assert_eq!(store.list().await.expect("list"), Vec::new());
     }
 
-    async fn list_returns_every_entry_exactly_once(db: &RegistryTestDb) {
+    async fn list_returns_every_entry_exactly_once(store: &dyn RegistryStore) {
         // DESIGN §3.2 and §4.10: the listing is never ordered or paginated, so the case
         // compares the set and never the order.
-        let store = store(db);
         let mut expected = Vec::new();
         for (i, result) in LastResult::ALL.into_iter().enumerate() {
             let e = entry(
@@ -284,8 +350,7 @@ registry_cases! {
         assert_eq!(listed, by_id(expected));
     }
 
-    async fn every_last_result_value_round_trips(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn every_last_result_value_round_trips(store: &dyn RegistryStore) {
         for result in LastResult::ALL {
             let id = format!("app-{}", result.as_token());
             let e = entry(&id, "1", result, at(1_800_000_000, 1), "a");
@@ -296,8 +361,7 @@ registry_cases! {
         }
     }
 
-    async fn text_at_exactly_the_byte_bound_round_trips(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn text_at_exactly_the_byte_bound_round_trips(store: &dyn RegistryStore) {
         let ascii = "a".repeat(REGISTRY_TEXT_MAX_BYTES);
         let three_byte = "\u{20ac}".repeat(85);
         assert_eq!(three_byte.len(), REGISTRY_TEXT_MAX_BYTES, "85 x 3 bytes");
@@ -311,8 +375,7 @@ registry_cases! {
         assert_eq!(store.list().await.expect("list").len(), 3);
     }
 
-    async fn timestamps_round_trip_at_microsecond_precision(db: &RegistryTestDb) {
-        let store = store(db);
+    async fn timestamps_round_trip_at_microsecond_precision(store: &dyn RegistryStore) {
         let times = [
             at(0, 0),
             at(0, 1),
@@ -336,11 +399,10 @@ registry_cases! {
         assert_eq!(store.get("ragged").await.expect("get"), Some(ragged));
     }
 
-    async fn ids_differing_by_case_space_or_normalization_stay_distinct(db: &RegistryTestDb) {
+    async fn ids_differing_by_case_space_or_normalization_stay_distinct(store: &dyn RegistryStore) {
         // DESIGN §3.7: binary, no-pad comparison on every backend; §4.8 security (f): an
         // uninstall removes exactly the id it names, never a case, space or normalization
         // variant of it.
-        let store = store(db);
         let ids = ["app", "App", "APP", "app ", " app", "caf\u{e9}", "cafe\u{301}"];
         let seed_all = || async {
             for (i, id) in ids.iter().enumerate() {
@@ -370,10 +432,9 @@ registry_cases! {
         }
     }
 
-    async fn awkward_ids_round_trip_exactly(db: &RegistryTestDb) {
+    async fn awkward_ids_round_trip_exactly(store: &dyn RegistryStore) {
         // `.`, `..` and `a/b` uninstall through the body form (DESIGN §4.8 security (f)); the
         // rest are SQL and pattern metacharacters, which a parameterized query must not read.
-        let store = store(db);
         let ids = [
             ".", "..", "a/b", "%", "_", "a%b", "100%", "a_b", "back\\slash", "\"quoted\"",
             "it's", "'; DROP TABLE application_registry; --", " ", "\u{1f600}",
@@ -395,16 +456,14 @@ registry_cases! {
         assert_eq!(store.list().await.expect("list").len(), ids.len() - 2);
         assert!(store.get("a%b").await.expect("get").is_some());
         assert!(store.get("a_b").await.expect("get").is_some());
-        assert!(registry_db::table_exists(db, REGISTRY_TABLE).await, "the table survived");
     }
 
-    async fn lookups_of_an_id_that_can_never_be_stored_find_nothing_on_every_backend(db: &RegistryTestDb) {
+    async fn lookups_of_an_id_that_can_never_be_stored_find_nothing_on_every_backend(store: &dyn RegistryStore) {
         // DESIGN §3.2: the repository never interprets the id. Postgres cannot bind a NUL
         // in text, so only an id holding NUL is answered without asking the database; the
         // empty id, control characters and an over-long id are real queries that match
         // nothing. (The never-storable uninstall short-circuit belongs to the orchestrator,
         // through `is_storable_text`.)
-        let store = store(db);
         store.upsert(&sample("kept")).await.expect("upsert");
         let too_long = "a".repeat(REGISTRY_TEXT_MAX_BYTES + 1);
         for id in ["", "a\0b", "\0", "a\nb", "a\u{7f}", "a\u{9f}", too_long.as_str()] {
@@ -414,9 +473,8 @@ registry_cases! {
         assert_eq!(store.list().await.expect("list").len(), 1, "nothing was deleted");
     }
 
-    async fn concurrent_upserts_to_one_id_leave_one_complete_entry(db: &RegistryTestDb) {
+    async fn concurrent_upserts_to_one_id_leave_one_complete_entry(store: &dyn RegistryStore) {
         // DESIGN §4.2, §4.5: no coordination, the last writer wins, and a row is never a mix.
-        let store = store(db);
         let candidates: Vec<RegistryEntry> = LastResult::ALL
             .into_iter()
             .enumerate()
@@ -436,17 +494,88 @@ registry_cases! {
         assert_eq!(store.list().await.expect("list").len(), 1);
     }
 
-    async fn a_reader_never_misses_the_row_while_a_writer_re_seeds_it(db: &RegistryTestDb) {
+    async fn a_reader_never_misses_the_row_while_a_writer_re_seeds_it(store: &dyn RegistryStore) {
         // DESIGN §4.2: the upsert is one atomic statement, so a concurrent get never finds a
         // gap between "old row removed" and "new row written" (a delete-then-insert upsert
         // would).
+        let version = |i: u32| entry("hot", &format!("v{i}"), LastResult::Succeeded, at(1_800_000_000, i), "a");
+        store.upsert(&version(0)).await.expect("the first seed");
+        let stop = AtomicBool::new(false);
+        // The reader and the writer run in this one task, interleaved at their await points.
+        let reader = async {
+            let mut reads = 0_u32;
+            while !stop.load(Ordering::Relaxed) {
+                match store.get("hot").await {
+                    Ok(Some(_)) => reads += 1,
+                    other => return Err(format!("read {reads} saw {other:?}")),
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok(reads)
+        };
+        let writer = async {
+            for i in 1..=300 {
+                store.upsert(&version(i)).await.expect("re-seed");
+                tokio::task::yield_now().await;
+            }
+            stop.store(true, Ordering::Relaxed);
+        };
+
+        let (reads, ()) = futures::future::join(reader, writer).await;
+
+        let reads = reads.expect("a get never saw a missing or failed row");
+        assert!(reads > 0, "the reader ran while the writer wrote");
+        assert_eq!(store.get("hot").await.expect("get"), Some(version(300)));
+    }
+
+    async fn audit_ids_round_trip_exactly_at_any_length(store: &dyn RegistryStore) {
+        // The audit id is opaque (DESIGN §3.7 states no bound), so the column must hold
+        // 100 KB of multi-byte text: a VARCHAR(255) or a 64 KB TEXT cannot.
+        let long = "\u{e9}\u{20ac}\u{1f600}".repeat(11_500);
+        assert!(long.len() > 100_000);
+        let medium = "x".repeat(300);
+        let audits = ["", "\t", "\n", "\u{1f600}", "  padded  ", medium.as_str(), long.as_str()];
+        for (i, audit) in audits.into_iter().enumerate() {
+            let e = entry(&format!("audit-{i}"), "1", LastResult::Succeeded, at(1_800_000_000, 0), audit);
+            store.upsert(&e).await.expect("upsert");
+            let got = store.get(e.application_id()).await.expect("get").expect("present");
+            assert_eq!(got.audit_id(), audit, "audit id #{i} ({} bytes)", audit.len());
+            assert_eq!(got, e);
+        }
+    }
+
+    }
+
+    database {
+    async fn awkward_ids_leave_the_table_in_place(db: &RegistryTestDb) {
+        // The SQL-injection-looking id is stored as text and the table survives it: it is
+        // sent through every statement the store has (upsert, get, list, delete) and the
+        // table is checked after each of them, not only at the end.
         let store = store(db);
+        let id = "'; DROP TABLE application_registry; --";
+        store.upsert(&sample(id)).await.expect("upsert");
+        assert!(registry_db::table_exists(db, REGISTRY_TABLE).await, "the table survived the upsert");
+        assert_eq!(store.get(id).await.expect("get"), Some(sample(id)));
+        assert!(registry_db::table_exists(db, REGISTRY_TABLE).await, "the table survived the get");
+        assert_eq!(store.list().await.expect("list"), vec![sample(id)]);
+        assert!(registry_db::table_exists(db, REGISTRY_TABLE).await, "the table survived the list");
+        store.delete(id).await.expect("delete");
+        assert_eq!(store.get(id).await.expect("get"), None);
+        assert_eq!(store.list().await.expect("list"), Vec::new());
+        assert!(registry_db::table_exists(db, REGISTRY_TABLE).await, "the table survived the delete");
+    }
+
+    async fn a_reader_never_misses_the_row_while_a_writer_re_seeds_it_in_separate_tasks(db: &RegistryTestDb) {
+        // The portable case interleaves a reader and a writer inside one task. Here they are two
+        // SPAWNED tasks on the database store, each statement on its own pooled connection, so
+        // the reader can run while the writer's statement is in flight (DESIGN §4.2: the upsert
+        // is one atomic statement, never delete-then-insert).
+        let store = Arc::new(store(db));
         let version = |i: u32| entry("hot", &format!("v{i}"), LastResult::Succeeded, at(1_800_000_000, i), "a");
         store.upsert(&version(0)).await.expect("the first seed");
         let stop = Arc::new(AtomicBool::new(false));
         let reader = tokio::spawn({
-            let store = store.clone();
-            let stop = Arc::clone(&stop);
+            let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
             async move {
                 let mut reads = 0_u32;
                 while !stop.load(Ordering::Relaxed) {
@@ -459,32 +588,22 @@ registry_cases! {
                 Ok(reads)
             }
         });
+        let writer = tokio::spawn({
+            let (store, stop) = (Arc::clone(&store), Arc::clone(&stop));
+            async move {
+                for i in 1..=150 {
+                    store.upsert(&version(i)).await.expect("re-seed");
+                    tokio::task::yield_now().await;
+                }
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
 
-        for i in 1..=300 {
-            store.upsert(&version(i)).await.expect("re-seed");
-        }
-        stop.store(true, Ordering::Relaxed);
-
+        writer.await.expect("the writer task");
         let reads = reader.await.expect("the reader task").expect("a get never saw a missing or failed row");
-        assert!(reads > 0, "the reader ran while the writer wrote");
-        assert_eq!(store.get("hot").await.expect("get"), Some(version(300)));
-    }
 
-    async fn audit_ids_round_trip_exactly_at_any_length(db: &RegistryTestDb) {
-        // The audit id is opaque (DESIGN §3.7 states no bound), so the column must hold
-        // 100 KB of multi-byte text: a VARCHAR(255) or a 64 KB TEXT cannot.
-        let store = store(db);
-        let long = "\u{e9}\u{20ac}\u{1f600}".repeat(11_500);
-        assert!(long.len() > 100_000);
-        let medium = "x".repeat(300);
-        let audits = ["", "\t", "\n", "\u{1f600}", "  padded  ", medium.as_str(), long.as_str()];
-        for (i, audit) in audits.into_iter().enumerate() {
-            let e = entry(&format!("audit-{i}"), "1", LastResult::Succeeded, at(1_800_000_000, 0), audit);
-            store.upsert(&e).await.expect("upsert");
-            let got = store.get(e.application_id()).await.expect("get").expect("present");
-            assert_eq!(got.audit_id(), audit, "audit id #{i} ({} bytes)", audit.len());
-            assert_eq!(got, e);
-        }
+        assert!(reads > 0, "the reader ran while the writer wrote");
+        assert_eq!(store.get("hot").await.expect("get"), Some(version(150)));
     }
 
     async fn an_unreadable_stored_row_is_unavailable_and_never_a_panic(db: &RegistryTestDb) {
@@ -897,22 +1016,78 @@ registry_cases! {
         assert!(registry_db::table_exists(db, REGISTRY_TABLE).await);
         assert_eq!(store(db).list().await.expect("list"), Vec::new(), "re-seeding rebuilds the data");
     }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // The case sets are pinned by name: a case that is dropped, renamed or moved between the two
+    // blocks (and so stops running on the in-memory fake, or on the SQL lanes) fails here.
+    const PORTABLE: [&str; 17] = [
+        "upsert_inserts_a_new_entry_and_get_returns_every_field",
+        "get_of_a_missing_id_returns_none",
+        "upsert_overwrites_every_field_on_reseed",
+        "reseed_leaves_other_entries_untouched",
+        "delete_removes_only_the_named_entry",
+        "delete_of_a_missing_entry_counts_as_deleted",
+        "list_of_an_empty_registry_is_empty",
+        "list_returns_every_entry_exactly_once",
+        "every_last_result_value_round_trips",
+        "text_at_exactly_the_byte_bound_round_trips",
+        "timestamps_round_trip_at_microsecond_precision",
+        "ids_differing_by_case_space_or_normalization_stay_distinct",
+        "awkward_ids_round_trip_exactly",
+        "lookups_of_an_id_that_can_never_be_stored_find_nothing_on_every_backend",
+        "concurrent_upserts_to_one_id_leave_one_complete_entry",
+        "a_reader_never_misses_the_row_while_a_writer_re_seeds_it",
+        "audit_ids_round_trip_exactly_at_any_length",
+    ];
+
+    const DATABASE: [&str; 20] = [
+        "awkward_ids_leave_the_table_in_place",
+        "a_reader_never_misses_the_row_while_a_writer_re_seeds_it_in_separate_tasks",
+        "an_unreadable_stored_row_is_unavailable_and_never_a_panic",
+        "a_listing_returns_every_entry_even_past_a_thousand",
+        "a_timeout_inside_the_statement_leaves_the_row_old_or_complete",
+        "repo_delete_reports_deleted_then_not_found",
+        "repo_runs_every_operation_under_the_allow_all_scope",
+        "repo_sees_and_changes_nothing_under_a_tenant_scope",
+        "repo_works_on_a_transaction_runner_and_rolls_back_with_it",
+        "secure_insert_with_the_allow_all_scope_needs_no_tenant_id",
+        "a_tenant_scope_reads_nothing_from_the_unrestricted_entity",
+        "database_accepts_text_at_the_byte_bound_and_rejects_one_byte_more",
+        "database_rejects_an_empty_id_or_version",
+        "database_rejects_a_last_result_outside_the_listed_values",
+        "database_rejects_a_seeded_at_outside_the_range",
+        "database_rejects_a_second_row_for_the_same_id",
+        "migration_creates_the_design_table_without_any_tenant_column",
+        "migration_adds_no_secondary_index_foreign_key_or_trigger",
+        "migration_is_idempotent_on_a_second_run",
+        "migration_down_drops_the_table_and_up_recreates_it",
+    ];
+
     #[test]
-    fn the_case_list_names_every_case_once() {
+    fn the_portable_case_set_is_exactly_the_pinned_names() {
+        let names: Vec<&str> = portable::all().into_iter().map(|(name, _)| name).collect();
+
+        assert_eq!(names, PORTABLE);
+    }
+
+    #[test]
+    fn the_database_case_set_is_exactly_the_pinned_names() {
+        assert_eq!(database_case_names(), DATABASE);
+    }
+
+    #[test]
+    fn the_lane_list_is_the_portable_cases_then_the_database_cases_each_named_once() {
         let names: Vec<&str> = all().into_iter().map(|(name, _)| name).collect();
+
+        let expected: Vec<&str> = PORTABLE.into_iter().chain(DATABASE).collect();
+        assert_eq!(names, expected);
         let unique: std::collections::HashSet<&&str> = names.iter().collect();
         assert_eq!(names.len(), unique.len(), "duplicate case names: {names:?}");
-        assert!(
-            names.len() >= 30,
-            "the shared case list shrank: {}",
-            names.len()
-        );
     }
 
     #[tokio::test]

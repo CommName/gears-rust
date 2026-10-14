@@ -28,7 +28,9 @@
 //! // Composition" (ADR 0007: the scope is always unscoped, so the registry repository
 //! // supplies it). P4 replaces the `ApplicationEnvelope` stand-in by the §3.7
 //! // `RegistryEntry` (`crate::domain::registry`) and refines `RegistryError`.
-//! pub enum PolicyDecision { Permit, Refused, Unavailable }
+//! pub enum PolicyDecision { Permit, Refused, Unavailable(PdpUnavailable) }  // P6 (F-010): the
+//!                           // reason is `Unreachable` or `TimedOut`, set by the policy adapter;
+//!                           // `PdpUnavailable` converts into `UnavailableReason`
 //! pub enum RegistryError {
 //!     /// Storage cannot answer: a storage error, a pool acquire timeout, a backend
 //!     /// statement timeout (DESIGN §3.2 "Registry Repository").
@@ -46,7 +48,8 @@
 //! }
 //!
 //! #[async_trait] pub trait PolicyPort: Send + Sync {
-//!     async fn decide(&self, caller: &CallerIdentity, action: PolicyAction,
+//!     async fn decide(&self, ctx: &SecurityContext, action: PolicyAction, // F-008: the caller's
+//!                     // context, bearer token included, to the PDP only
 //!                     application_id: Option<&str>) -> PolicyDecision;
 //! }
 //! #[async_trait] pub trait RegistryStore: Send + Sync {
@@ -114,13 +117,15 @@ use application_manager_sdk::{
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::ports::{
-    AuditSink, Clock, PluginCallError, PolicyAction, PolicyDecision, PolicyPort, RegistryError,
-    RegistryStore, RequestIdSource, SectionPluginPort, StartupPort,
+    AuditSink, Clock, PdpUnavailable, PluginCallError, PolicyAction, PolicyDecision, PolicyPort,
+    RegistryError, RegistryStore, RequestIdSource, SectionPluginPort, StartupPort,
 };
 use crate::domain::registry::{LastResult, RegistryEntry};
+use crate::test_support::security_context;
 
 fn assert_dyn_port<T: ?Sized + Send + Sync + 'static>() {}
 
@@ -149,11 +154,11 @@ struct StubPolicy;
 impl PolicyPort for StubPolicy {
     async fn decide(
         &self,
-        _caller: &CallerIdentity,
+        _ctx: &SecurityContext,
         _action: PolicyAction,
         _application_id: Option<&str>,
     ) -> PolicyDecision {
-        PolicyDecision::Unavailable
+        PolicyDecision::Unavailable(PdpUnavailable::TimedOut)
     }
 }
 
@@ -252,11 +257,17 @@ fn ports_are_object_safe_send_sync() {
 #[tokio::test]
 async fn policy_port_signature_is_pinned() {
     let port: Arc<dyn PolicyPort> = Arc::new(StubPolicy);
-    let caller = caller();
-    let decision = port.decide(&caller, PolicyAction::Seed, Some("app")).await;
-    assert!(matches!(decision, PolicyDecision::Unavailable));
-    let decision = port.decide(&caller, PolicyAction::List, None).await;
-    assert!(matches!(decision, PolicyDecision::Unavailable));
+    let ctx = security_context();
+    let decision = port.decide(&ctx, PolicyAction::Seed, Some("app")).await;
+    assert_eq!(
+        decision,
+        PolicyDecision::Unavailable(PdpUnavailable::TimedOut)
+    );
+    let decision = port.decide(&ctx, PolicyAction::List, None).await;
+    assert_eq!(
+        decision,
+        PolicyDecision::Unavailable(PdpUnavailable::TimedOut)
+    );
 }
 
 #[tokio::test]
@@ -459,4 +470,18 @@ fn policy_action_names_match_sdk_constants() {
     for (action, name) in table {
         assert_eq!(action.name(), name);
     }
+}
+
+// F-010: the policy port can only say `unreachable` or `timed_out`; the type admits no other
+// reason, and each converts into the reason of the `access_control` unavailable item.
+#[test]
+fn pdp_unavailable_converts_into_exactly_its_two_reasons() {
+    assert_eq!(
+        UnavailableReason::from(PdpUnavailable::Unreachable),
+        UnavailableReason::Unreachable
+    );
+    assert_eq!(
+        UnavailableReason::from(PdpUnavailable::TimedOut),
+        UnavailableReason::TimedOut
+    );
 }

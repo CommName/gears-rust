@@ -286,31 +286,32 @@ fn envelope_length_rejects_above_registry_bound() {
 
 // --- Request time budget (DESIGN §4.7, §4.6) --------------------------------------
 //
-// budget = pdp + 2 x registry + 3 x plugin, which must not exceed
+// budget = pdp + 2 x registry + 4 x plugin (F-001: the 4th plugin limit is the
+// whole-manifest validation step, which runs under the same limit), which must not exceed
 // `GATEWAY_REQUEST_DEADLINE`. Each term is isolated by setting the other two to
 // `MIN_TERM` and solving for the term under test.
 
 fn pdp_limit() -> Duration {
-    GATEWAY_REQUEST_DEADLINE - 2 * MIN_TERM - 3 * MIN_TERM
+    GATEWAY_REQUEST_DEADLINE - 2 * MIN_TERM - 4 * MIN_TERM
 }
 
 fn registry_limit() -> Duration {
-    (GATEWAY_REQUEST_DEADLINE - MIN_TERM - 3 * MIN_TERM) / 2
+    (GATEWAY_REQUEST_DEADLINE - MIN_TERM - 4 * MIN_TERM) / 2
 }
 
 fn plugin_limit() -> Duration {
-    (GATEWAY_REQUEST_DEADLINE - MIN_TERM - 2 * MIN_TERM) / 3
+    (GATEWAY_REQUEST_DEADLINE - MIN_TERM - 2 * MIN_TERM) / 4
 }
 
 #[test]
 fn budget_accepts_exactly_the_gateway_deadline() {
-    // 6s + 2 x 3s + 3 x 6s == 30s.
+    // 6s + 2 x 3s + 4 x 4.5s == 30s.
     let (pdp, registry, plugin) = (
         Duration::from_secs(6),
         Duration::from_secs(3),
-        Duration::from_secs(6),
+        Duration::from_millis(4500),
     );
-    assert_eq!(pdp + 2 * registry + 3 * plugin, GATEWAY_REQUEST_DEADLINE);
+    assert_eq!(pdp + 2 * registry + 4 * plugin, GATEWAY_REQUEST_DEADLINE);
     assert!(budget_ok(pdp, registry, plugin), "exactly the deadline");
 }
 
@@ -321,7 +322,7 @@ fn budget_rejects_one_millisecond_above_the_deadline_naming_all_three_settings()
     let msg = validation_error(budget_json(
         Duration::from_millis(6001),
         Duration::from_secs(3),
-        Duration::from_secs(6),
+        Duration::from_millis(4500),
     ));
     assert!(msg.contains(REASON), "{msg}");
     for field in DURATION_SETTINGS {
@@ -354,7 +355,7 @@ fn budget_registry_term_is_bounded_alone() {
     );
 }
 
-// The plugin term has weight 3 (limit 10s less the other terms' share).
+// The plugin term has weight 4 (limit 7.5s less the other terms' share).
 #[test]
 fn budget_plugin_term_is_bounded_alone() {
     let (pdp, registry) = (MIN_TERM, MIN_TERM);
@@ -393,7 +394,7 @@ proptest! {
         plugin in 1u64..15_000,
     ) {
         let reference =
-            u128::from(pdp) + 2 * u128::from(registry) + 3 * u128::from(plugin)
+            u128::from(pdp) + 2 * u128::from(registry) + 4 * u128::from(plugin)
                 <= GATEWAY_REQUEST_DEADLINE.as_millis();
         let actual = budget_ok(
             Duration::from_millis(pdp),

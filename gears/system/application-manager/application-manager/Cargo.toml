@@ -22,6 +22,14 @@ application-manager-sdk = { workspace = true }
 
 types-registry = { workspace = true }
 authz-resolver = { workspace = true }
+# Policy adapter (P6, DESIGN §3.3 "Authorization"): the PolicyEnforcer and the authz API
+# (the gear crate above is only linked for the `deps` entry).
+authz-resolver-sdk = { workspace = true }
+# Request orchestrator (P6, DESIGN §3.2): the caller's `SecurityContext`, and the SHA-256
+# digest of a never-storable uninstall id carried in the request hand-off (DESIGN §3.1),
+# through the FIPS-validated aws-lc-rs provider (DE0708), as lower-case hex text.
+toolkit-security = { workspace = true }
+aws-lc-rs = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -33,7 +41,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
+# `v7`: the production request-id source (time-ordered ids).
+uuid = { workspace = true, features = ["v7"] }
 types-registry-sdk = { workspace = true }
 futures = { workspace = true }
 toolkit-db = { workspace = true }
@@ -53,8 +62,9 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 # (it counts calls a startup must not make) and must never become a normal dependency.
 tenant-resolver-sdk = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
-toolkit-security = { workspace = true }
 tracing-subscriber = { workspace = true }
+# F-008 tests: the bearer token the PDP receives.
+secrecy = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 

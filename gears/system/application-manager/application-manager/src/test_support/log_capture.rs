@@ -5,12 +5,19 @@
 //! test that has no capture, and parallel tests never see each other's events. Use it
 //! from current-thread runtime tests only: the buffer belongs to the test thread, and
 //! detached tasks of such a test run on that thread.
+//!
+//! The per-thread buffer cannot see an event emitted on another thread (a `spawn_blocking`
+//! thread, a multi-thread worker). [`capture_logs_containing`] covers those: a process-wide
+//! capture of the events whose text contains a unique sentinel, from every thread.
 
 use std::cell::RefCell;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
+
+/// Process-wide captures: every event whose text contains the needle goes to its buffer.
+static SENTINELS: Mutex<Vec<(String, LogBuffer)>> = Mutex::new(Vec::new());
 
 thread_local! {
     static CURRENT_LOG: RefCell<Option<LogBuffer>> = const { RefCell::new(None) };
@@ -29,6 +36,12 @@ impl Write for RoutedWriter {
                 buffer.0.lock().expect("log lock").extend_from_slice(buf);
             }
         });
+        let text = String::from_utf8_lossy(buf);
+        for (needle, buffer) in SENTINELS.lock().expect("sentinel lock").iter() {
+            if text.contains(needle.as_str()) {
+                buffer.0.lock().expect("log lock").extend_from_slice(buf);
+            }
+        }
         Ok(buf.len())
     }
 
@@ -85,12 +98,7 @@ impl Drop for CaptureGuard {
     }
 }
 
-/// Starts capturing the events of the current thread.
-///
-/// # Panics
-///
-/// Panics when another global tracing subscriber is already installed in the binary.
-pub fn capture_logs() -> (LogBuffer, CaptureGuard) {
+fn install() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
         let subscriber = tracing_subscriber::fmt()
@@ -101,6 +109,84 @@ pub fn capture_logs() -> (LogBuffer, CaptureGuard) {
         tracing::subscriber::set_global_default(subscriber)
             .expect("no other global tracing subscriber in this test binary");
     });
+}
+
+/// The events of EVERY thread whose text contains one sentinel (a process-wide capture).
+pub struct SentinelCapture {
+    buffer: LogBuffer,
+    needle: String,
+}
+
+impl SentinelCapture {
+    /// The captured text.
+    pub fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    /// Positive control: a probe event carrying the sentinel is emitted from a blocking-pool
+    /// thread and must be captured, so a capture that cannot see other threads cannot make a
+    /// negative assertion pass vacuously.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the probe was not captured.
+    pub async fn assert_live_on_a_blocking_thread(&self) {
+        let needle = self.needle.clone();
+        tokio::task::spawn_blocking(move || tracing::warn!("blocking_probe {needle}"))
+            .await
+            .expect("the probe task");
+        assert!(
+            !self.buffer.lines_with("blocking_probe").is_empty(),
+            "the capture does not see events of a blocking thread"
+        );
+    }
+}
+
+/// Stops the process-wide capture when dropped.
+pub struct SentinelGuard {
+    needle: String,
+}
+
+impl Drop for SentinelGuard {
+    fn drop(&mut self) {
+        SENTINELS
+            .lock()
+            .expect("sentinel lock")
+            .retain(|(needle, _)| *needle != self.needle);
+    }
+}
+
+/// Starts capturing, from every thread of the process, the events whose text contains
+/// `sentinel`. Use a sentinel no other test writes.
+///
+/// # Panics
+///
+/// Panics when another global tracing subscriber is already installed in the binary.
+pub fn capture_logs_containing(sentinel: &str) -> (SentinelCapture, SentinelGuard) {
+    install();
+    let buffer = LogBuffer::default();
+    SENTINELS
+        .lock()
+        .expect("sentinel lock")
+        .push((sentinel.to_owned(), buffer.clone()));
+    (
+        SentinelCapture {
+            buffer,
+            needle: sentinel.to_owned(),
+        },
+        SentinelGuard {
+            needle: sentinel.to_owned(),
+        },
+    )
+}
+
+/// Starts capturing the events of the current thread.
+///
+/// # Panics
+///
+/// Panics when another global tracing subscriber is already installed in the binary.
+pub fn capture_logs() -> (LogBuffer, CaptureGuard) {
+    install();
     let buffer = LogBuffer::default();
     CURRENT_LOG.with(|current| *current.borrow_mut() = Some(buffer.clone()));
     (buffer, CaptureGuard)

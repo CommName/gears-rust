@@ -1,8 +1,10 @@
 //! Test-only support: clock, id and startup doubles and the fake section and audit
 //! plugins (DESIGN §3.2, §4.8).
 
+mod authz_fakes;
 mod doubles;
 mod fakes;
+mod gate_harness;
 mod log_capture;
 // Manifest parser and schema validator tests (P5): generators of JSON values and nesting.
 pub mod manifest_gen;
@@ -17,7 +19,9 @@ pub mod registry_db;
 )]
 mod startup_fakes;
 
+pub use authz_fakes::*;
 pub use doubles::*;
 pub use fakes::*;
+pub use gate_harness::*;
 pub use log_capture::*;
 pub use startup_fakes::*;

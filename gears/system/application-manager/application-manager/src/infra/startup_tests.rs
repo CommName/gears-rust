@@ -749,7 +749,8 @@ async fn start_never_calls_the_tenant_resolver() {
 #[tokio::test(start_paused = true)]
 async fn budget_above_the_gateway_deadline_warns_once_and_start_continues() {
     let (logs, _guard) = capture_logs();
-    // init passes: 2s + 2 x 2s + 3 x 5s = 21s. N = 2: 2s + 2 x 2s + 5 x 5s = 31s.
+    // init passes: 2s + 2 x 2s + 4 x 5s = 26s. N = 2: 2s + 2 x 2s + 6 x 5s = 36s (F-001: N + 4
+    // plugin limits, the fourth is the whole-manifest validation step).
     let mut setup = Setup::new().with_config(config_with(
         Duration::from_secs(5),
         Duration::from_secs(2),
@@ -771,7 +772,7 @@ async fn budget_above_the_gateway_deadline_warns_once_and_start_continues() {
     assert!(lines[0].contains("WARN"), "warn level: {}", lines[0]);
     assert!(has_field(&lines[0], "n", "2"), "N is logged: {}", lines[0]);
     assert!(
-        has_field(&lines[0], "budget_ms", "31000"),
+        has_field(&lines[0], "budget_ms", "36000"),
         "the budget is logged: {}",
         lines[0]
     );
@@ -803,9 +804,9 @@ async fn budget_is_not_checked_when_an_earlier_step_fails() {
 #[tokio::test(start_paused = true)]
 async fn budget_exactly_at_the_gateway_deadline_does_not_warn() {
     let (logs, _guard) = capture_logs();
-    // N = 1: 4s + 2 x 3s + 4 x 5s = 30s.
+    // N = 1: 4s + 2 x 3s + (1 + 4) x 4s = 30s (F-001: N + 4 plugin limits).
     let mut setup = Setup::new().with_config(config_with(
-        Duration::from_secs(5),
+        Duration::from_secs(4),
         Duration::from_secs(4),
         Duration::from_secs(3),
     ));

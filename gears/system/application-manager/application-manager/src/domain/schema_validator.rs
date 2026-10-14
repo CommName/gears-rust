@@ -40,9 +40,10 @@
 //! (`properties` and `allOf`, say) costs `2^d` steps for a manifest `d` levels deep when the
 //! instance is valid (an invalid one stops at the problem cap), and the memory of the compiled
 //! patterns is bounded by the pattern bounds above times the library's per-pattern limits, not
-//! by a global budget. Both are accepted: validation runs on the blocking pool under the
-//! orchestrator step timeout (a plan note for the orchestrator phase), and a manifest is at
-//! most `MAX_JSON_DEPTH` deep.
+//! by a global budget. Both are accepted: the orchestrator runs the validation on the blocking
+//! pool under its step timeout, which abandons the request but cannot stop a validation that is
+//! already running (it keeps its `max_request_tasks` slot until it ends; one still queued is
+//! cancelled), and a manifest is at most `MAX_JSON_DEPTH` deep.
 //!
 //! # Causes
 //!

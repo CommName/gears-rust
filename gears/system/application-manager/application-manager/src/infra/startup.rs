@@ -124,6 +124,7 @@ pub struct StartupComponent {
     hub: Arc<ClientHub>,
     holder: Arc<StartupResultHolder>,
     guard: PluginCallGuard,
+    database_available: bool,
 }
 
 impl StartupComponent {
@@ -149,7 +150,16 @@ impl StartupComponent {
             hub,
             holder,
             guard: PluginCallGuard::new(config.plugin_call_timeout, config.plugin_max_in_flight),
+            database_available: true,
         }
+    }
+
+    /// Marks the gear database as missing: `start` then fails with `database_unavailable`
+    /// before any call (DESIGN §4.6).
+    #[must_use]
+    pub fn without_database(mut self) -> Self {
+        self.database_available = false;
+        self
     }
 
     /// The one guard shared by startup, the published ports and `stop`'s drain.
@@ -314,11 +324,12 @@ impl StartupComponent {
     }
 
     /// Warns when the worst-case request budget exceeds the gateway deadline
-    /// (DESIGN §4.7): PDP + two registry operations + (N + 3) plugin limits.
+    /// (DESIGN §4.7): PDP + two registry operations + (N + 4) plugin limits (the schema listing, N schema
+    /// reads, the audit hand-off and the whole-manifest validation step).
     fn warn_on_budget(&self, section_count: usize) {
         let limits = u32::try_from(section_count)
             .unwrap_or(u32::MAX)
-            .saturating_add(3);
+            .saturating_add(4);
         let budget = self
             .pdp_timeout
             .saturating_add(self.registry_timeout.saturating_mul(2))
@@ -339,6 +350,13 @@ impl StartupComponent {
                 "already_started",
                 vec![],
                 "startup result already published",
+            ));
+        }
+        if !self.database_available {
+            return Err(Failure::new(
+                "database_unavailable",
+                vec![],
+                "no database handle for the registry",
             ));
         }
         let listed = self.list_plugins().await?;
@@ -462,3 +480,8 @@ mod startup_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "startup_host_tests.rs"]
 mod startup_host_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "startup_database_tests.rs"]
+mod startup_database_tests;

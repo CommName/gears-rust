@@ -9,8 +9,16 @@
 //! - `assert_live_passes_while_capturing`
 //! - `fields_are_read_with_or_without_quotes`
 //! - `capture_is_stable_across_parallel_threads`
+//!
+//! Process-wide capture by sentinel (P6): `capture_logs_containing(sentinel) ->
+//! (SentinelCapture, SentinelGuard)`, `SentinelCapture::{text,
+//! assert_live_on_a_blocking_thread}`.
+//!
+//! - `the_sentinel_capture_sees_the_events_of_other_threads_that_carry_the_sentinel`
+//! - `the_sentinel_capture_ignores_events_without_the_sentinel`
+//! - `the_sentinel_capture_stops_when_its_guard_drops`
 
-use crate::test_support::{capture_logs, field_value, has_field};
+use crate::test_support::{capture_logs, capture_logs_containing, field_value, has_field};
 
 #[test]
 fn capture_sees_events_of_its_own_thread_only() {
@@ -63,4 +71,39 @@ fn capture_is_stable_across_parallel_threads() {
     for h in handles {
         assert_eq!(h.join().expect("thread joins"), 50);
     }
+}
+
+#[tokio::test]
+async fn the_sentinel_capture_sees_the_events_of_other_threads_that_carry_the_sentinel() {
+    let (logs, _guard) = capture_logs_containing("SENTINEL-capture-a-5c1");
+
+    logs.assert_live_on_a_blocking_thread().await;
+    std::thread::spawn(|| tracing::warn!("from_a_plain_thread SENTINEL-capture-a-5c1"))
+        .join()
+        .expect("thread joins");
+
+    assert_eq!(logs.text().lines().count(), 2, "{}", logs.text());
+}
+
+#[tokio::test]
+async fn the_sentinel_capture_ignores_events_without_the_sentinel() {
+    let (logs, _guard) = capture_logs_containing("SENTINEL-capture-b-5c1");
+
+    tokio::task::spawn_blocking(|| tracing::warn!("unrelated_event"))
+        .await
+        .expect("task");
+    tracing::warn!("unrelated_event_on_the_test_thread");
+
+    assert_eq!(logs.text(), "");
+}
+
+#[test]
+fn the_sentinel_capture_stops_when_its_guard_drops() {
+    let (logs, guard) = capture_logs_containing("SENTINEL-capture-c-5c1");
+    tracing::warn!("first SENTINEL-capture-c-5c1");
+    drop(guard);
+
+    tracing::warn!("second SENTINEL-capture-c-5c1");
+
+    assert_eq!(logs.text().lines().count(), 1, "{}", logs.text());
 }

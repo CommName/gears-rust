@@ -17,9 +17,10 @@
 //! Registry persistence (P4, DESIGN §3.2 "Startup and Registration", §3.7): the gear macro
 //! gains the `db` capability (`capabilities = [stateful, db]`) and `ApplicationManagerGear`
 //! implements `toolkit::DatabaseCapability`, whose `migrations()` returns
-//! `crate::infra::storage::migrations::Migrator::migrations()`. `init` still resolves no
-//! database: the registry store is built with the orchestrator (phasing, §4.12), so the P1-P3
-//! `init` tests above keep passing on a `GearCtx` without a database.
+//! `crate::infra::storage::migrations::Migrator::migrations()`. `init` resolves no database in
+//! P4; since P6 it builds the registry store from the context's database handle (see
+//! `gear_registry_tests.rs`). A context WITHOUT a database still initializes (the P1-P3 `init`
+//! tests above keep passing); the missing database then fails `start` (§3.2 fault handling).
 //!
 //! - `gear_declares_the_db_capability_next_to_stateful`: registry capability labels (§3.2).
 //! - `gear_returns_the_registry_migrations_from_database_capability`: same names as the
@@ -27,10 +28,6 @@
 //! - `gear_migrations_create_the_registry_table_on_an_empty_database`: running the gear's
 //!   migrations the way the platform migration phase does creates `application_registry`
 //!   and nothing tenant-shaped (§3.7, ADR 0007).
-//! - `init_needs_no_database_before_the_orchestrator_phase`: TRANSITIONAL, until `init`
-//!   builds the registry store (the orchestrator phase, §4.12): `init` succeeds with no
-//!   database handle in the context. DESIGN §3.2 has the gear resolve its database at
-//!   startup, so the phase that builds the store replaces this test.
 
 use std::sync::Arc;
 
@@ -275,15 +272,4 @@ async fn gear_migrations_create_the_registry_table_on_an_empty_database() {
     assert_eq!(result.applied, 1);
     assert!(registry_db::table_exists(&db, REGISTRY_TABLE).await);
     assert_eq!(registry_db::columns_named_like(&db, "tenant").await, 0);
-}
-
-#[tokio::test]
-async fn init_needs_no_database_before_the_orchestrator_phase() {
-    let ctx = ctx_with_config(valid_config());
-    assert!(ctx.db().is_none(), "the test context carries no database");
-
-    ApplicationManagerGear::default()
-        .init(&ctx)
-        .await
-        .expect("init must not require a database handle yet");
 }

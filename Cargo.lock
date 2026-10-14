@@ -1805,8 +1805,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "cf-gears-application-manager-sdk",
  "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
@@ -1822,6 +1824,7 @@ dependencies = [
  "proptest",
  "sea-orm",
  "sea-orm-migration",
+ "secrecy",
  "serde",
  "serde_json",
  "tempfile",

@@ -114,7 +114,7 @@ impl ApplicationManagerConfig {
     ///
     /// Returns an `invalid_setting` error naming the offending setting(s) when a
     /// duration or count is zero, a count is above its bound, or the request time
-    /// budget `pdp + 2 x registry + 3 x plugin` exceeds [`GATEWAY_REQUEST_DEADLINE`].
+    /// budget `pdp + 2 x registry + 4 x plugin` exceeds [`GATEWAY_REQUEST_DEADLINE`].
     pub fn validate(&self) -> anyhow::Result<()> {
         for (name, value) in [
             ("plugin_call_timeout", self.plugin_call_timeout),
@@ -152,11 +152,11 @@ impl ApplicationManagerConfig {
         let within_budget = terms.iter().all(|t| *t <= GATEWAY_REQUEST_DEADLINE)
             && self.pdp_call_timeout
                 + self.registry_operation_timeout * 2
-                + self.plugin_call_timeout * 3
+                + self.plugin_call_timeout * 4
                 <= GATEWAY_REQUEST_DEADLINE;
         if !within_budget {
             anyhow::bail!(
-                "{REASON}: pdp_call_timeout + 2 x registry_operation_timeout + 3 x \
+                "{REASON}: pdp_call_timeout + 2 x registry_operation_timeout + 4 x \
                  plugin_call_timeout must not exceed the gateway request deadline of {GATEWAY_REQUEST_DEADLINE:?}"
             );
         }

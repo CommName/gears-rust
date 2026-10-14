@@ -30,6 +30,11 @@
 //! - `init_performs_no_discovery`, `configured_plugin_call_timeout_bounds_the_start`,
 //!   `registered_capability_is_the_gears_start` (F-023)
 //! - `stop_before_init_succeeds` / `stop_after_start_sets_stopping` (§3.2 stop)
+//!
+//! P6 (registry store): `init` builds the registry store from the context's database handle
+//! and `start` fails at once with `database_unavailable` when there is none (see
+//! `gear_registry_tests.rs`), so every context in this file carries a migrated test
+//! database: `ctx`/`ctx_with` are `async` and return the `RegistryTestDb` to keep alive.
 
 use std::sync::Arc;
 
@@ -47,6 +52,7 @@ use uuid::Uuid;
 
 use crate::domain::ports::StartupPort;
 use crate::gear::ApplicationManagerGear;
+use crate::test_support::registry_db::{self, RegistryTestDb};
 use crate::test_support::{
     CallBehavior, FakeAuditPlugin, FakeSectionPlugin, FakeTypesRegistry, PluginFamily, SectionCall,
     bounded, plugin_instance,
@@ -64,6 +70,17 @@ impl ConfigProvider for StaticConfigProvider {
     }
 }
 
+// The database is created on the real clock (real file IO cannot run under a paused clock:
+// the idle runtime would jump over the pool's timeouts); only afterwards does the clock stop.
+// A clock paused mid-run is not aligned to the timer wheel (an `advance(ZERO)` right after the
+// pause does not align it: a 100ms timeout then still elapses 101ms), so a later timeout elapses
+// its length plus up to one millisecond of rounding (`ROUNDING`), and no more.
+fn pause_clock() {
+    tokio::time::pause();
+}
+
+const ROUNDING: Duration = Duration::from_millis(1);
+
 fn valid_config() -> Value {
     json!({
         "plugin_call_timeout": "500ms",
@@ -76,19 +93,22 @@ fn valid_config() -> Value {
 }
 
 // A context whose hub holds a fake types registry listing one section plugin and, when
-// `with_audit`, one audit plugin, with their scoped clients.
-fn ctx(with_audit: bool) -> toolkit::GearCtx {
-    ctx_with(with_audit, valid_config()).0
+// `with_audit`, one audit plugin, with their scoped clients, and a migrated test database
+// (returned: it must outlive the gear).
+async fn ctx(with_audit: bool) -> (toolkit::GearCtx, RegistryTestDb) {
+    let (ctx, _registry, _section, db) = ctx_with(with_audit, valid_config()).await;
+    (ctx, db)
 }
 
 // Also returns the fake registry and the section fake, for call counts and scripting.
-fn ctx_with(
+async fn ctx_with(
     with_audit: bool,
     config: Value,
 ) -> (
     toolkit::GearCtx,
     Arc<FakeTypesRegistry>,
     Arc<FakeSectionPlugin>,
+    RegistryTestDb,
 ) {
     let hub = Arc::new(ClientHub::new());
     let mut instances = Vec::new();
@@ -112,6 +132,7 @@ fn ctx_with(
     let registry = Arc::new(FakeTypesRegistry::new().with_instances(instances));
     let registry_client: Arc<dyn TypesRegistryClient> = registry.clone();
     hub.register::<dyn TypesRegistryClient>(registry_client);
+    let db = registry_db::sqlite().await;
     let ctx = toolkit::GearCtx::new(
         GEAR_NAME,
         Uuid::new_v4(),
@@ -120,8 +141,9 @@ fn ctx_with(
         }),
         hub,
         CancellationToken::new(),
-    );
-    (ctx, registry, section_fake)
+    )
+    .with_db(db.provider.clone());
+    (ctx, registry, section_fake, db)
 }
 
 #[test]
@@ -154,9 +176,10 @@ async fn start_before_init_fails() {
     assert!(gear.startup_holder().is_none());
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn init_then_start_publishes_the_startup_result() {
-    let ctx = ctx(true);
+    let (ctx, _db) = ctx(true).await;
+    pause_clock();
     let gear = ApplicationManagerGear::default();
     gear.init(&ctx).await.expect("init succeeds");
     let holder = gear.startup_holder().expect("holder exists after init");
@@ -175,9 +198,10 @@ async fn init_then_start_publishes_the_startup_result() {
 }
 
 // DESIGN §3.2: the error of a failed step reaches the host with its reason token.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn failed_start_returns_the_reason_through_the_gear() {
-    let ctx = ctx(false);
+    let (ctx, _db) = ctx(false).await;
+    pause_clock();
     let gear = ApplicationManagerGear::default();
     gear.init(&ctx).await.expect("init succeeds");
 
@@ -202,9 +226,10 @@ async fn stop_before_init_succeeds() {
         .expect("nothing to stop before init");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn stop_after_start_sets_stopping() {
-    let ctx = ctx(true);
+    let (ctx, _db) = ctx(true).await;
+    pause_clock();
     let gear = ApplicationManagerGear::default();
     gear.init(&ctx).await.expect("init succeeds");
     gear.start(CancellationToken::new())
@@ -221,9 +246,10 @@ async fn stop_after_start_sets_stopping() {
 }
 
 // F-023: `init` performs no discovery: nothing is listed and no client is called.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn init_performs_no_discovery() {
-    let (ctx, registry, section) = ctx_with(true, valid_config());
+    let (ctx, registry, section, _db) = ctx_with(true, valid_config()).await;
+    pause_clock();
     let gear = ApplicationManagerGear::default();
 
     gear.init(&ctx).await.expect("init succeeds");
@@ -234,11 +260,12 @@ async fn init_performs_no_discovery() {
 
 // F-023: the validated `plugin_call_timeout` reaches the guard and the registry bound:
 // with 100ms and a section plugin whose `key` never answers, start fails after 100ms.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn configured_plugin_call_timeout_bounds_the_start() {
     let mut config = valid_config();
     config["plugin_call_timeout"] = json!("100ms");
-    let (ctx, _registry, section) = ctx_with(true, config);
+    let (ctx, _registry, section, _db) = ctx_with(true, config).await;
+    pause_clock();
     section.on(SectionCall::Key, CallBehavior::hang());
     let gear = ApplicationManagerGear::default();
     gear.init(&ctx).await.expect("init succeeds");
@@ -252,7 +279,11 @@ async fn configured_plugin_call_timeout_bounds_the_start() {
         format!("{err}").starts_with("section_key_unavailable:"),
         "{err}"
     );
-    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(100) && elapsed <= Duration::from_millis(100) + ROUNDING,
+        "one plugin_call_timeout, no more: {elapsed:?}"
+    );
 }
 
 // F-023: the capability the gear macro registers is this gear's own start: through the

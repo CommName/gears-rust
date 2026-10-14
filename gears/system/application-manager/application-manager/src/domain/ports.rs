@@ -20,6 +20,7 @@ use application_manager_sdk::{
 use async_trait::async_trait;
 use serde_json::Value;
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 /// Failure of a plugin call made through the Plugin Call Guard (DESIGN §3.2, §4.5).
@@ -118,8 +119,29 @@ pub enum PolicyDecision {
     Permit,
     /// The PDP refused the action.
     Refused,
-    /// The PDP could not be reached or did not decide.
-    Unavailable,
+    /// The PDP did not decide, for one of the two reasons a PDP can fail to answer
+    /// ([`PdpUnavailable`]); it appears in the `access_control` unavailable item.
+    Unavailable(PdpUnavailable),
+}
+
+/// Why the PDP did not decide: the only two reasons of an `access_control` unavailable item
+/// (the type admits no other `UnavailableReason`).
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdpUnavailable {
+    /// The PDP could not be asked or did not answer successfully.
+    Unreachable,
+    /// The policy adapter's own deadline expired.
+    TimedOut,
+}
+
+impl From<PdpUnavailable> for UnavailableReason {
+    fn from(reason: PdpUnavailable) -> Self {
+        match reason {
+            PdpUnavailable::Unreachable => Self::Unreachable,
+            PdpUnavailable::TimedOut => Self::TimedOut,
+        }
+    }
 }
 
 /// Failure of the registry store.
@@ -146,14 +168,18 @@ impl RegistryError {
     }
 }
 
-/// Port to the policy decision point (PDP). The policy adapter is deferred to the
-/// policy adapter phase (P6).
+/// Port to the policy decision point (PDP). The implementation owns the PDP deadline; its
+/// expiry is `Unavailable(TimedOut)`, so callers add no second bound.
+///
+/// The PDP gets the caller's `SecurityContext` unchanged, bearer token included, as it does
+/// in the other gears; the token goes to the PDP only, never to a section or audit plugin
+/// (`CallerIdentity` carries none).
 #[async_trait]
 pub trait PolicyPort: Send + Sync {
-    /// Decides whether `caller` may perform `action`, optionally on `application_id`.
+    /// Decides whether the caller `ctx` may perform `action`, optionally on `application_id`.
     async fn decide(
         &self,
-        caller: &CallerIdentity,
+        ctx: &SecurityContext,
         action: PolicyAction,
         application_id: Option<&str>,
     ) -> PolicyDecision;
@@ -200,7 +226,6 @@ pub trait SectionPluginPort: Send + Sync {
 }
 
 /// Port to the audit plugin, with calls made through the Plugin Call Guard.
-/// The audit hand-off client is deferred to the audit hand-off phase (P6).
 #[async_trait]
 pub trait AuditSink: Send + Sync {
     /// Hands the request off for audit and returns the audit id.
