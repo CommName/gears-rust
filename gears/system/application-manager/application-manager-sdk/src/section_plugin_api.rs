@@ -72,30 +72,80 @@ pub fn validate_section_key(key: &str) -> Result<(), String> {
 }
 
 /// Whether the serialized schema is at most [`SERVED_SCHEMA_MAX_BYTES`].
+///
+/// Counts the compact serialization without recursion and without building text, so a very
+/// deep or very large value is measured with a bounded stack and the count stops at the first
+/// byte past the bound. The one size rule of the platform: the gear's schema validator uses it.
 #[must_use]
 pub fn served_schema_within_limit(schema: &Value) -> bool {
-    serde_json::to_writer(LimitedSink::default(), schema).is_ok()
+    !compact_len_exceeds(schema, SERVED_SCHEMA_MAX_BYTES)
 }
 
-/// Counts written bytes and fails once they pass [`SERVED_SCHEMA_MAX_BYTES`], so an
-/// oversized schema is never serialized in full.
-#[derive(Default)]
-struct LimitedSink {
-    written: usize,
-}
-
-impl std::io::Write for LimitedSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.written = self.written.saturating_add(buf.len());
-        if self.written > SERVED_SCHEMA_MAX_BYTES {
-            return Err(std::io::Error::other("served schema over limit"));
-        }
-        Ok(buf.len())
+/// Bytes of `s` as a JSON string, quotes included, escaped as `serde_json` writes it.
+fn json_string_len(s: &str) -> usize {
+    let mut n: usize = 2;
+    for b in s.bytes() {
+        n = n.saturating_add(match b {
+            b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        });
     }
+    n
+}
 
-    fn flush(&mut self) -> std::io::Result<()> {
+/// Counts the bytes a value formats to, without storing them.
+#[derive(Default)]
+struct ByteCount(usize);
+
+impl std::fmt::Write for ByteCount {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0 = self.0.saturating_add(s.len());
         Ok(())
     }
+}
+
+fn number_len(n: &serde_json::Number) -> usize {
+    use std::fmt::Write as _;
+    let mut count = ByteCount::default();
+    // Writing to a counter cannot fail.
+    if write!(count, "{n}").is_err() {
+        return usize::MAX;
+    }
+    count.0
+}
+
+/// Whether the compact serialization of `root` is longer than `limit` bytes: an explicit
+/// stack, no allocation per string or number, an early exit past the limit.
+pub(crate) fn compact_len_exceeds(root: &Value, limit: usize) -> bool {
+    let mut total: usize = 0;
+    let mut stack = vec![root];
+    while let Some(v) = stack.pop() {
+        total = total.saturating_add(match v {
+            Value::Null | Value::Bool(true) => 4,
+            Value::Bool(false) => 5,
+            Value::Number(n) => number_len(n),
+            Value::String(s) => json_string_len(s),
+            Value::Array(items) => {
+                stack.extend(items.iter());
+                // Brackets and the commas between elements.
+                2 + items.len().saturating_sub(1)
+            }
+            Value::Object(members) => {
+                let mut keys: usize = 0;
+                for (k, child) in members {
+                    // The key string and its colon.
+                    keys = keys.saturating_add(json_string_len(k) + 1);
+                    stack.push(child);
+                }
+                2 + members.len().saturating_sub(1) + keys
+            }
+        });
+        if total > limit {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

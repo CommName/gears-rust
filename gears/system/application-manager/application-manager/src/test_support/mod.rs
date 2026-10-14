@@ -4,6 +4,8 @@
 mod doubles;
 mod fakes;
 mod log_capture;
+// Manifest parser and schema validator tests (P5): generators of JSON values and nesting.
+pub mod manifest_gen;
 // Registry persistence (P4): migrated test databases and the backend-independent cases
 // that the SQLite, Postgres and MySQL lanes all run.
 pub mod registry_cases;

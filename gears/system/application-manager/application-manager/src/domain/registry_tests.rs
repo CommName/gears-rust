@@ -568,3 +568,33 @@ fn is_storable_text_agrees_with_entry_validation() {
         );
     }
 }
+
+// F-013: the registry rule is the shared envelope text rule: `is_storable_text` is exactly
+// "`text_limit_violations` at the column bound is empty", and the first violation is the
+// registry fault, over a corpus at the edges (empty, bound, bound + 1, control characters).
+#[test]
+fn the_registry_text_rule_is_the_shared_text_limit_rule() {
+    use crate::domain::manifest::text_limit_violations;
+    let max = REGISTRY_TEXT_MAX_BYTES;
+    let ctl = char::from(7).to_string();
+    let corpus = [
+        String::new(),
+        "a".to_owned(),
+        "a".repeat(max),
+        "a".repeat(max + 1),
+        "\u{e9}".repeat(max.div_euclid(2)),
+        "\u{e9}".repeat(max.div_euclid(2) + 1),
+        ctl.clone(),
+        format!("a{ctl}b"),
+        format!("{ctl}{}", "a".repeat(max)),
+        char::from(0x7f).to_string(),
+        "\u{85}".to_owned(),
+    ];
+    for text in &corpus {
+        assert_eq!(
+            is_storable_text(text),
+            text_limit_violations(text, max).is_empty(),
+            "{text:?}"
+        );
+    }
+}

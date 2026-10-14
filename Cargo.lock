@@ -1818,6 +1818,7 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "futures",
  "humantime-serde",
+ "jsonschema",
  "proptest",
  "sea-orm",
  "sea-orm-migration",

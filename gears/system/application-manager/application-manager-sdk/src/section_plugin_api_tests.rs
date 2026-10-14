@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::errors::{PLUGIN_DETAIL_MAX_BYTES, SectionPluginError};
 use crate::models::{ApplicationEnvelope, CallerIdentity};
 use crate::section_plugin_api::{
-    SECTION_KEY_MAX_LEN, SERVED_SCHEMA_MAX_BYTES, SectionPluginClientV1,
+    SECTION_KEY_MAX_LEN, SERVED_SCHEMA_MAX_BYTES, SectionPluginClientV1, compact_len_exceeds,
     served_schema_within_limit, validate_section_key,
 };
 
@@ -203,4 +203,145 @@ fn section_key_rejects_dot_segments() {
             "{key:?} must be rejected"
         );
     }
+}
+
+// DESIGN §3.3, §4.3: the iterative counter agrees with the serialization at every bound: a value
+// whose compact form is `len` bytes does not exceed `len` and exceeds `len - 1`. Covers
+// every string escape class (quote, backslash, named and numeric control escapes, DEL), multi-byte
+// characters, numbers and the separators of arrays and objects.
+#[test]
+fn the_counter_is_the_compact_serialization_length_at_the_bound() {
+    let ctl = |b: u8| char::from(b).to_string();
+    let escapes = [
+        "plain".to_owned(),
+        "a\"b".to_owned(),
+        "a\\b".to_owned(),
+        "line\nfeed\rreturn\ttab".to_owned(),
+        format!("{}{}{}", ctl(8), ctl(12), ctl(1)),
+        format!("{}{}", ctl(0x1f), ctl(0x7f)),
+        "caf\u{e9} \u{4e2d}\u{6587} \u{1f600}".to_owned(),
+        "a/b".to_owned(),
+        String::new(),
+    ];
+    let mut values = vec![
+        json!(null),
+        json!(true),
+        json!(false),
+        json!(0),
+        json!(-17),
+        json!(u64::MAX),
+        json!(i64::MIN),
+        json!(1.5),
+        json!(-0.0),
+        json!(1e300),
+        json!(5e-324),
+        json!([]),
+        json!({}),
+        json!([[], {}, [[1, 2], {"a": [null]}]]),
+        json!({"b": {"c": [1, 2.5, "x"]}, "a": true, "": null}),
+    ];
+    for e in &escapes {
+        values.push(Value::String(e.clone()));
+        values.push(json!([e, e]));
+        values.push(json!({ e.clone(): e.clone(), "k": [e] }));
+    }
+    for v in &values {
+        let len = serde_json::to_vec(v).expect("ser").len();
+        assert!(!compact_len_exceeds(v, len), "{v} at {len}");
+        assert!(!compact_len_exceeds(v, len + 1), "{v} at {len} + 1");
+        assert!(compact_len_exceeds(v, len - 1), "{v} at {len} - 1");
+    }
+}
+
+// The bound itself, with escapes and multi-byte characters: a schema made of them is within the
+// limit exactly while its serialization is.
+#[test]
+fn the_served_bound_is_exact_for_escaped_and_multibyte_text() {
+    for unit in ["\n", "\"", "\\", "\u{e9}", "\u{1f600}"] {
+        // Fill the string until the serialization reaches the bound exactly.
+        let per = serde_json::to_vec(&Value::String(unit.to_owned()))
+            .expect("ser")
+            .len()
+            - 2;
+        let n = (SERVED_SCHEMA_MAX_BYTES - 2).div_euclid(per);
+        let pad = SERVED_SCHEMA_MAX_BYTES - 2 - n * per;
+        let mut v = Value::String(format!("{}{}", unit.repeat(n), "a".repeat(pad)));
+        assert_eq!(
+            serde_json::to_vec(&v).expect("ser").len(),
+            SERVED_SCHEMA_MAX_BYTES,
+            "{unit:?}"
+        );
+        assert!(served_schema_within_limit(&v), "{unit:?} at the bound");
+        let Value::String(t) = &mut v else {
+            unreachable!()
+        };
+        t.push('a');
+        assert!(!served_schema_within_limit(&v), "{unit:?} over the bound");
+    }
+}
+
+const DEEP_ENV: &str = "AM_SDK_DEEP_VALUE";
+
+// Not a test of its own: the body of `a_very_deep_value_does_not_overflow_the_stack`, run by it
+// in a child process (a stack overflow aborts the process). The 100 000-deep value is built and
+// dropped on a large stack (both are recursive); the check runs on a 128 KiB one.
+#[test]
+#[ignore = "child process of a_very_deep_value_does_not_overflow_the_stack"]
+fn deep_value_child() {
+    if std::env::var(DEEP_ENV).is_err() {
+        return;
+    }
+    std::thread::Builder::new()
+        .stack_size(512 << 20)
+        .spawn(|| {
+            let mut v = json!(1);
+            for _ in 0..100_000 {
+                v = Value::Array(vec![v]);
+            }
+            let mut o = json!(1);
+            for _ in 0..100_000 {
+                o = Value::Object(std::iter::once(("k".to_owned(), o)).collect());
+            }
+            for deep in [&v, &o] {
+                let within = std::thread::scope(|scope| {
+                    std::thread::Builder::new()
+                        .stack_size(128 << 10)
+                        .spawn_scoped(scope, || served_schema_within_limit(deep))
+                        .expect("spawn")
+                        .join()
+                        .expect("the check does not overflow")
+                });
+                assert!(within, "a 100 000-deep value is small");
+            }
+            println!("DEEP-VALUE-OK");
+        })
+        .expect("spawn")
+        .join()
+        .expect("the child body");
+}
+
+// A value nested 100 000 deep is measured without recursion (the previous implementation
+// serialized recursively and overflowed). The measure runs in a child process, so an abort fails
+// this test instead of the run.
+#[test]
+fn a_very_deep_value_does_not_overflow_the_stack() {
+    let exe = std::env::current_exe().expect("the test binary");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "section_plugin_api::section_plugin_api_tests::deep_value_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(DEEP_ENV, "1")
+        .output()
+        .expect("run the child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("DEEP-VALUE-OK"),
+        "child ended with {}\n{stdout}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

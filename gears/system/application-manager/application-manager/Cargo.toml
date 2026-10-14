@@ -40,6 +40,10 @@ toolkit-db = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 time = { workspace = true }
+# Schema Validator (P5, DESIGN §3.2): JSON Schema 2020-12 through the workspace crate, with
+# default features off (no HTTP or file reference resolution) and an explicit retriever and
+# pattern options.
+jsonschema = { workspace = true }
 
 [dev-dependencies]
 # Startup tests (P3): fake types registry (`MockTypesRegistryClient` builders), tenant

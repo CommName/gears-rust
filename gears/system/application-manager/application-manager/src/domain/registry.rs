@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use toolkit_macros::domain_model;
 
 use crate::domain::limits::REGISTRY_TEXT_MAX_BYTES;
+use crate::domain::manifest::{TextLimitViolation, text_limit_violations};
 
 /// Outcome of the last seeding of an application.
 #[domain_model]
@@ -78,24 +79,13 @@ pub enum RegistryEntryError {
     SeededAtOutOfRange,
 }
 
-/// First rule an application id or version text breaks. The one source of the bound and
-/// control-character rules for [`is_storable_text`] and [`RegistryEntry::new`].
-enum TextFault {
-    Empty,
-    TooLong,
-    Control,
-}
-
-fn text_fault(text: &str) -> Option<TextFault> {
-    if text.is_empty() {
-        Some(TextFault::Empty)
-    } else if text.len() > REGISTRY_TEXT_MAX_BYTES {
-        Some(TextFault::TooLong)
-    } else if text.chars().any(char::is_control) {
-        Some(TextFault::Control)
-    } else {
-        None
-    }
+/// First rule an application id or version text breaks: the one shared
+/// [`text_limit_violations`] rule (emptiness or length first, then control characters) at the
+/// registry column bound.
+fn text_fault(text: &str) -> Option<TextLimitViolation> {
+    text_limit_violations(text, REGISTRY_TEXT_MAX_BYTES)
+        .into_iter()
+        .next()
 }
 
 /// Whether `text` is a storable application id or version: non-empty, within the byte
@@ -134,17 +124,21 @@ impl RegistryEntry {
         let application_id = application_id.into();
         let version = version.into();
         match text_fault(&application_id) {
-            Some(TextFault::Empty) => return Err(RegistryEntryError::EmptyApplicationId),
-            Some(TextFault::TooLong) => return Err(RegistryEntryError::ApplicationIdTooLong),
-            Some(TextFault::Control) => {
+            Some(TextLimitViolation::Empty) => return Err(RegistryEntryError::EmptyApplicationId),
+            Some(TextLimitViolation::TooLong) => {
+                return Err(RegistryEntryError::ApplicationIdTooLong);
+            }
+            Some(TextLimitViolation::ControlCharacter) => {
                 return Err(RegistryEntryError::ApplicationIdControlCharacter);
             }
             None => {}
         }
         match text_fault(&version) {
-            Some(TextFault::Empty) => return Err(RegistryEntryError::EmptyVersion),
-            Some(TextFault::TooLong) => return Err(RegistryEntryError::VersionTooLong),
-            Some(TextFault::Control) => return Err(RegistryEntryError::VersionControlCharacter),
+            Some(TextLimitViolation::Empty) => return Err(RegistryEntryError::EmptyVersion),
+            Some(TextLimitViolation::TooLong) => return Err(RegistryEntryError::VersionTooLong),
+            Some(TextLimitViolation::ControlCharacter) => {
+                return Err(RegistryEntryError::VersionControlCharacter);
+            }
             None => {}
         }
         let audit_id = audit_id.into();

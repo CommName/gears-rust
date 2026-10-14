@@ -1,0 +1,11 @@
+{
+  "application": {
+    "id": "app",
+    "version": "1"
+  },
+  "sections": {
+    "net": {
+      "port": 1
+    }
+  }
+}

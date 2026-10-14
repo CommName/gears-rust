@@ -20,3 +20,7 @@
 # Exceptions
 *.bat text eol=crlf
 *.ps1 text eol=crlf
+
+# Fuzz seed corpora are byte-exact inputs (BOMs, CRLF, raw control characters, no final
+# newline, invalid UTF-8): no end-of-line conversion, no text diff.
+gears/system/application-manager/application-manager/fuzz/corpus/** -text -diff
