@@ -50,6 +50,7 @@ fn the_debug_of_a_proceed_and_a_gate_result_hides_the_manifest_and_the_envelope(
             key: "files".to_owned(),
             schema: json!({"description": SENTINEL}),
         }],
+        fingerprints: vec![("files".to_owned(), SENTINEL.to_owned())],
     };
     let result = GateResult {
         request_id: Uuid::from_u128(1),

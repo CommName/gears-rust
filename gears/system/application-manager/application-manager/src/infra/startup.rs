@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::{Healthcheck, HealthcheckResult, RunnableCapability};
-use types_registry_sdk::{GtsInstance, InstanceQuery, TypesRegistryClient};
+use types_registry_sdk::{GtsInstance, InstanceQuery, RegisterResult, TypesRegistryClient};
 
 use crate::config::{ApplicationManagerConfig, GATEWAY_REQUEST_DEADLINE};
 use crate::domain::limits::LOG_TEXT_MAX_BYTES;
@@ -100,6 +100,90 @@ impl Failure {
         );
         anyhow::anyhow!("{}: {}", self.reason, self.detail)
     }
+}
+
+/// Registers the two plugin GTS types (section plugin, audit plugin) in the types registry, as
+/// `init` does (DESIGN §3.2 "Startup and Registration", §3.4): one call, bounded by
+/// `timeout` (`plugin_call_timeout`), never retried (ADR 0001). The documents are the ones the
+/// SDK types generate, which the link-time inventory registers as well, so the call is
+/// create-if-absent and idempotent for the same document.
+///
+/// # Errors
+///
+/// `type_registration_failed` (the error text is that reason and a fixed detail; one
+/// `startup_failed` event names the two type ids) when the types registry client is not
+/// available, a document cannot be rendered, the call fails or does not answer within `timeout`,
+/// or its answer is not exactly one `Ok` per schema, in order, each carrying the id of its schema.
+pub(crate) async fn register_plugin_types(
+    hub: &ClientHub,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let ids = [section_type(), audit_type()];
+    let failure = |detail: &str| Failure::new("type_registration_failed", ids.to_vec(), detail);
+    let Some(registry) = hub.try_get::<dyn TypesRegistryClient>() else {
+        return Err(failure("types registry client not available").report());
+    };
+    let rendered = [
+        ApplicationManagerSectionPluginSpecV1::gts_schema_with_refs_as_string(),
+        ApplicationManagerAuditPluginSpecV1::gts_schema_with_refs_as_string(),
+    ];
+    let schemas = match rendered
+        .iter()
+        .map(|text| serde_json::from_str(text))
+        .collect::<Result<Vec<serde_json::Value>, _>>()
+    {
+        Ok(schemas) => schemas,
+        Err(e) => {
+            return Err(failure("a plugin type is not valid JSON")
+                .with_cause(e.to_string())
+                .report());
+        }
+    };
+    let results = match tokio::time::timeout(timeout, registry.register_type_schemas(schemas)).await
+    {
+        Ok(Ok(results)) => results,
+        Ok(Err(e)) => {
+            return Err(failure("registration failed")
+                .with_cause(e.to_string())
+                .report());
+        }
+        Err(_) => return Err(failure("registration timed out").report()),
+    };
+    let one_ok_each = results.len() == ids.len()
+        && results
+            .iter()
+            .zip(&ids)
+            .all(|(result, id)| matches!(result, RegisterResult::Ok { gts_id } if gts_id == id));
+    if one_ok_each {
+        Ok(())
+    } else {
+        Err(failure("a plugin type was not registered")
+            .with_cause(registration_cause(&results, &ids))
+            .report())
+    }
+}
+
+/// What the registry answered for each type, one clause per item, for the `startup_failed` cause
+/// (the caller escapes and bounds it): the item index, the type id and the registry's own error
+/// for a rejection, and how many items came back when that is not the number asked.
+fn registration_cause(results: &[RegisterResult], ids: &[String]) -> String {
+    let mut parts = Vec::new();
+    if results.len() != ids.len() {
+        parts.push(format!("{} results for {} types", results.len(), ids.len()));
+    }
+    for (index, result) in results.iter().enumerate() {
+        match result {
+            RegisterResult::Ok { gts_id } if ids.get(index) == Some(gts_id) => {}
+            RegisterResult::Ok { gts_id } => {
+                parts.push(format!("item {index}: registered as {gts_id}"));
+            }
+            RegisterResult::Err { gts_id, error } => parts.push(format!(
+                "item {index}: rejected {}: {error:?}",
+                gts_id.as_deref().unwrap_or("(no id)")
+            )),
+        }
+    }
+    parts.join("; ")
 }
 
 /// A discovered plugin instance.

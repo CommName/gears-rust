@@ -2,8 +2,9 @@
 //! Orchestrator" steps 1-5 and its precedence table, §3.6 "Pre-Dispatch Gate" paths 1-9,
 //! §3.3 "Authorization", §4.5, §4.6 logs, §4.8 "Unit" and "Clock" rows, ADR 0001 no retry,
 //! ADR 0007 no tenant). Dispatch, the registry write and the final-result hand-off (steps
-//! 6-8), the detached request task and the supervisor are P7; the not-ready and request-task
-//! cap gate is P8 (REST).
+//! 6-8), the detached request task, the supervisor and the request-task cap (`try_admit`) are
+//! P7 (`request_*_tests.rs`); the REST not-ready gate is P8. `pre_dispatch` itself stays steps
+//! 1-5: no path of it makes a final-result hand-off, which only the full request adds.
 //!
 //! Planned API in `crate::domain::orchestrator`:
 //!
@@ -226,6 +227,10 @@ async fn a_valid_seed_proceeds_with_the_envelope_the_manifest_and_the_live_schem
                 key: "files".to_owned(),
                 schema: json!({"type": "object"}),
             }],
+            fingerprints: vec![(
+                "files".to_owned(),
+                crate::domain::fingerprint::schema_fingerprint(&json!({"type": "object"})),
+            )],
         })
     );
 }
@@ -271,6 +276,7 @@ async fn a_valid_uninstall_proceeds_with_the_id_and_the_last_seeded_version() {
             },
             manifest: None,
             schemas: Vec::new(),
+            fingerprints: Vec::new(),
         })
     );
     assert_eq!(
@@ -1687,6 +1693,8 @@ async fn a_hung_pdp_then_a_hung_hand_off_cost_one_limit_each_and_nothing_else() 
 
 #[test]
 fn the_settings_come_from_the_config_with_the_plugin_limit_as_the_step_timeout() {
+    // `max_request_tasks` (16) and `plugin_max_in_flight` (8) differ on purpose: the request-task
+    // cap and the validation bound are the first, never the per-plugin cap.
     let config: ApplicationManagerConfig = serde_json::from_value(json!({
         "plugin_call_timeout": "700ms",
         "plugin_max_in_flight": 8,
@@ -1702,6 +1710,8 @@ fn the_settings_come_from_the_config_with_the_plugin_limit_as_the_step_timeout()
     assert_eq!(settings.max_envelope_text_length, 77);
     assert_eq!(settings.registry_operation_timeout, Duration::from_secs(3));
     assert_eq!(settings.step_timeout, Duration::from_millis(700));
+    assert_eq!(settings.max_request_tasks, 16);
+    assert_eq!(settings.max_validations, 16);
 }
 
 // ---- logs -------------------------------------------------------------------------------------------
@@ -1868,6 +1878,10 @@ async fn a_re_seed_of_an_existing_entry_proceeds_with_the_manifests_own_envelope
                 key: "files".to_owned(),
                 schema: json!({"type": "object"}),
             }],
+            fingerprints: vec![(
+                "files".to_owned(),
+                crate::domain::fingerprint::schema_fingerprint(&json!({"type": "object"})),
+            )],
         })
     );
     let content = handoff(&gate);

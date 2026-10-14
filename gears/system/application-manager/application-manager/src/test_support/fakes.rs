@@ -523,7 +523,21 @@ pub struct InMemoryRegistryStore {
     calls: Mutex<Vec<RegistryCall>>,
     failures: Mutex<HashMap<RegistryOp, RegistryError>>,
     failures_after_commit: Mutex<HashMap<RegistryOp, RegistryError>>,
+    // P7: a scripted slow, hanging or panicking operation (applied after the call is recorded,
+    // before any change is made).
+    behaviors: Mutex<HashMap<RegistryOp, StoreBehavior>>,
     events: Option<Arc<EventLog>>,
+}
+
+/// How a scripted registry operation misbehaves (P7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreBehavior {
+    /// Waits this long on the tokio clock, then goes on.
+    Delay(Duration),
+    /// Never answers.
+    Hang,
+    /// Panics (a bug in the store, not a failure it reports).
+    Panic,
 }
 
 impl InMemoryRegistryStore {
@@ -561,6 +575,35 @@ impl InMemoryRegistryStore {
     pub fn heal(&self, op: RegistryOp) {
         lock(&self.failures).remove(&op);
         lock(&self.failures_after_commit).remove(&op);
+        lock(&self.behaviors).remove(&op);
+    }
+
+    /// Every later `op` waits `d` on the tokio clock after it was recorded, then goes on
+    /// (P7: a slow registry; a request dropped by its caller meanwhile).
+    pub fn delay(&self, op: RegistryOp, d: Duration) {
+        lock(&self.behaviors).insert(op, StoreBehavior::Delay(d));
+    }
+
+    /// Every later `op` is recorded and never answers (P7: a write that never finishes; the
+    /// orchestrator's `registry_operation_timeout` is the only bound).
+    pub fn hang(&self, op: RegistryOp) {
+        lock(&self.behaviors).insert(op, StoreBehavior::Hang);
+    }
+
+    /// Every later `op` is recorded and then panics, changing nothing (P7: a defect inside the
+    /// request task, after the call began).
+    pub fn panic_on(&self, op: RegistryOp) {
+        lock(&self.behaviors).insert(op, StoreBehavior::Panic);
+    }
+
+    async fn misbehave(&self, op: RegistryOp) {
+        let behavior = lock(&self.behaviors).get(&op).copied();
+        match behavior {
+            None => {}
+            Some(StoreBehavior::Delay(d)) => tokio::time::sleep(d).await,
+            Some(StoreBehavior::Hang) => std::future::pending().await,
+            Some(StoreBehavior::Panic) => panic!("registry fake panic on {}", op.name()),
+        }
     }
 
     /// The calls received so far, in order, failed ones included.
@@ -593,6 +636,7 @@ impl InMemoryRegistryStore {
 impl RegistryStore for InMemoryRegistryStore {
     async fn get(&self, id: &str) -> Result<Option<RegistryEntry>, RegistryError> {
         self.enter(RegistryOp::Get, Some(id))?;
+        self.misbehave(RegistryOp::Get).await;
         let found = lock(&self.entries).get(id).cloned();
         self.committed(RegistryOp::Get)?;
         Ok(found)
@@ -600,18 +644,21 @@ impl RegistryStore for InMemoryRegistryStore {
 
     async fn upsert(&self, entry: &RegistryEntry) -> Result<(), RegistryError> {
         self.enter(RegistryOp::Upsert, Some(entry.application_id()))?;
+        self.misbehave(RegistryOp::Upsert).await;
         lock(&self.entries).insert(entry.application_id().to_owned(), entry.clone());
         self.committed(RegistryOp::Upsert)
     }
 
     async fn delete(&self, id: &str) -> Result<(), RegistryError> {
         self.enter(RegistryOp::Delete, Some(id))?;
+        self.misbehave(RegistryOp::Delete).await;
         lock(&self.entries).remove(id);
         self.committed(RegistryOp::Delete)
     }
 
     async fn list(&self) -> Result<Vec<RegistryEntry>, RegistryError> {
         self.enter(RegistryOp::List, None)?;
+        self.misbehave(RegistryOp::List).await;
         let all = self.entries();
         self.committed(RegistryOp::List)?;
         Ok(all)
@@ -688,6 +735,8 @@ pub enum PolicyScript {
     /// is scripted at the platform client instead (`AuthzScript::Hang` behind the real
     /// `PolicyAdapter`), because the adapter owns the deadline.
     Unavailable(PdpUnavailable),
+    /// The port itself panics (P7: a defect inside the request task's permission step).
+    Panic,
 }
 
 /// One call received by [`FakePolicy`].
@@ -706,6 +755,7 @@ pub struct FakePolicy {
     script: Mutex<PolicyScript>,
     calls: Mutex<Vec<PolicyCall>>,
     events: Option<Arc<EventLog>>,
+    delay: Duration,
 }
 
 impl FakePolicy {
@@ -715,7 +765,16 @@ impl FakePolicy {
             script: Mutex::new(script),
             calls: Mutex::new(Vec::new()),
             events: None,
+            delay: Duration::ZERO,
         }
+    }
+
+    /// Waits `d` on the tokio clock after recording the call, before answering (P7: a slow
+    /// permission step; a request dropped by its caller meanwhile).
+    #[must_use]
+    pub fn with_delay(mut self, d: Duration) -> Self {
+        self.delay = d;
+        self
     }
 
     /// Records `pdp:<action>` in `log` at the start of every call.
@@ -752,8 +811,12 @@ impl PolicyPort for FakePolicy {
             action,
             application_id: application_id.map(str::to_owned),
         });
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         let script = *lock(&self.script);
         match script {
+            PolicyScript::Panic => panic!("policy fake panic"),
             PolicyScript::Permit => PolicyDecision::Permit,
             PolicyScript::Refuse => PolicyDecision::Refused,
             PolicyScript::Unavailable(reason) => PolicyDecision::Unavailable(reason),

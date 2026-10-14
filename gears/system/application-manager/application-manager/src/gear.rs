@@ -8,10 +8,10 @@ use toolkit::{DatabaseCapability, Gear, GearCtx, RunnableCapability};
 
 use crate::config::{ApplicationManagerConfig, REASON};
 use crate::domain::orchestrator::{Orchestrator, OrchestratorSettings};
-use crate::domain::ports::{PolicyPort, RegistryStore};
+use crate::domain::ports::{PolicyPort, RegistryStore, StartupPort};
 use crate::domain::startup::StartupResultHolder;
 use crate::infra::policy::PolicyAdapter;
-use crate::infra::startup::StartupComponent;
+use crate::infra::startup::{StartupComponent, register_plugin_types};
 use crate::infra::storage::store::SeaRegistryStore;
 use crate::infra::system_ports::{SystemClock, UuidV7RequestIds};
 
@@ -22,15 +22,20 @@ use types_registry as _;
 
 /// Application Manager gear.
 ///
-/// At `init` the gear reads the `application-manager` config section with the
-/// strict accessor (a missing section is an error), validates it and stores it
-/// once, and builds the startup component and the request orchestrator (over the policy
-/// adapter, the registry store on the gear database, the startup result holder, the system
-/// clock and `UUIDv7` request ids). `init` resolves nothing from the hub: the policy adapter
-/// resolves the authz client at each decision, and the stateful `start` capability discovers
-/// the plugins and publishes the startup result. A missing database does not fail `init`: no
-/// orchestrator is built and `start` fails with `database_unavailable`. No tenant service is
-/// resolved (ADR 0007).
+/// At `init` the gear reads the `application-manager` config section with the strict accessor (a
+/// missing section is an error), validates it, registers the two plugin GTS types in the types
+/// registry (one call, bounded by `plugin_call_timeout`, never retried; a failure is
+/// `type_registration_failed`), stores the config once, and builds the startup component and the
+/// request orchestrator (over the policy adapter, the registry store on the gear database, the
+/// startup result holder, the system clock and `UUIDv7` request ids). `init` resolves nothing from
+/// the hub but the types registry client: the policy adapter resolves the authz client at each
+/// decision, and the stateful `start` capability discovers the plugins and publishes the startup
+/// result. A missing database does not fail `init`: no orchestrator is built and `start` fails
+/// with `database_unavailable`. No tenant service is resolved (ADR 0007).
+///
+/// `stop` sets the stopping flag, drains the request tasks (closing admission, then waiting for
+/// the permits taken and the running supervisors) and then the plugin calls, against the one stop
+/// deadline token.
 ///
 /// Migrations come from `DatabaseCapability::migrations()`.
 #[toolkit::gear(
@@ -63,6 +68,11 @@ impl Gear for ApplicationManagerGear {
         // `validate` errors already start with `invalid_setting` and name the setting;
         // no outer context, so a plain `{}` log keeps the reason (DESIGN §4.7).
         cfg.validate()?;
+        // A second `init` fails before anything is asked of the types registry or replaced.
+        if self.startup.get().is_some() {
+            anyhow::bail!("application-manager gear is already initialized");
+        }
+        register_plugin_types(ctx.client_hub().as_ref(), cfg.plugin_call_timeout).await?;
         let holder = Arc::new(StartupResultHolder::new());
         let mut component = StartupComponent::new(&cfg, ctx.client_hub(), Arc::clone(&holder));
         let orchestrator = if let Some(db) = ctx.db() {
@@ -134,10 +144,16 @@ impl RunnableCapability for ApplicationManagerGear {
     }
 
     async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()> {
-        match self.startup.get() {
-            Some(startup) => startup.component.stop(deadline_token).await,
-            None => Ok(()),
+        let Some(startup) = self.startup.get() else {
+            return Ok(());
+        };
+        // Stopping first, so the REST not-ready gate refuses new requests; then the request
+        // tasks drain, then the call guard, both against the one stop deadline.
+        startup.holder.set_stopping();
+        if let Some(orchestrator) = self.orchestrator.get() {
+            orchestrator.drain(&deadline_token).await;
         }
+        startup.component.stop(deadline_token).await
     }
 }
 
@@ -158,3 +174,15 @@ mod gear_start_tests;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "gear_registry_tests.rs"]
 mod gear_registry_tests;
+
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_types_registration_tests.rs"]
+mod gear_types_registration_tests;
+
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_stop_drain_tests.rs"]
+mod gear_stop_drain_tests;

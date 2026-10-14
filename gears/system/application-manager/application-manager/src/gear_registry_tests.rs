@@ -237,7 +237,7 @@ async fn start_without_a_database_fails_at_once_with_database_unavailable() {
         "{err}"
     );
     assert_eq!(started.elapsed(), Duration::ZERO, "at once, no retry");
-    assert_eq!(registry.total_calls(), 0, "before any discovery call");
+    assert_eq!(registry.list_calls(), 0, "before any discovery call");
     assert!(
         !gear.startup_holder().expect("holder").is_ready(),
         "not ready"
@@ -321,7 +321,7 @@ async fn a_published_result_wins_over_the_database_check() {
         format!("{err}").starts_with("already_started"),
         "already_started, not database_unavailable: {err}"
     );
-    assert_eq!(registry.total_calls(), 0);
+    assert_eq!(registry.list_calls(), 0);
     assert!(gear.startup_holder().expect("holder").is_ready());
 }
 

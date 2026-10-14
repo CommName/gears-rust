@@ -6,6 +6,8 @@ mod doubles;
 mod fakes;
 mod gate_harness;
 mod log_capture;
+mod request_doubles;
+mod request_helpers;
 // Manifest parser and schema validator tests (P5): generators of JSON values and nesting.
 pub mod manifest_gen;
 // Registry persistence (P4): migrated test databases and the backend-independent cases
@@ -24,4 +26,11 @@ pub use doubles::*;
 pub use fakes::*;
 pub use gate_harness::*;
 pub use log_capture::*;
+pub use request_doubles::*;
+pub use request_helpers::*;
 pub use startup_fakes::*;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "p7_doubles_tests.rs"]
+mod p7_doubles_tests;

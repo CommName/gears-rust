@@ -20,8 +20,9 @@
 //! }
 //! ```
 //!
-//! `init` still performs no discovery and resolves nothing from the hub (the P1 tests
-//! in `gear_tests.rs` run it on an empty hub); everything is resolved in `start`.
+//! `init` still performs no discovery; since P7 it makes one call to the types registry, the
+//! registration of the two plugin GTS types (see `gear_types_registration_tests.rs`);
+//! everything else is resolved in `start`.
 //!
 //! - `gear_declares_the_stateful_capability_and_unchanged_deps` (§3.2, §3.4)
 //! - `start_before_init_fails` (§3.2)
@@ -254,7 +255,12 @@ async fn init_performs_no_discovery() {
 
     gear.init(&ctx).await.expect("init succeeds");
 
-    assert_eq!(registry.total_calls(), 0, "init makes no registry call");
+    assert_eq!(registry.list_calls(), 0, "init lists nothing");
+    assert_eq!(
+        registry.total_calls(),
+        registry.registration_calls(),
+        "since P7 the one registry call of init is the registration of the plugin types"
+    );
     assert_eq!(section.call_count(), 0, "init makes no plugin call");
 }
 

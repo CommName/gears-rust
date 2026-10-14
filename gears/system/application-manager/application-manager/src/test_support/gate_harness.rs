@@ -6,7 +6,7 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
-use application_manager_sdk::models::{OutcomeReport, Problem};
+use application_manager_sdk::models::{HandoffOperation, OutcomeReport, Problem};
 use authz_resolver_sdk::AuthZResolverApi;
 use serde_json::{Value, json};
 use toolkit_security::SecurityContext;
@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::domain::orchestrator::{
     GateOutcome, GateResult, Orchestrator, OrchestratorSettings, RequestInput, ValidationFn,
 };
-use crate::domain::ports::{PolicyPort, RegistryStore};
+use crate::domain::ports::{AuditSink, Clock, PolicyPort, RegistryStore, SectionPluginPort};
+use crate::domain::request::{AtCapacity, RequestHandle};
 use crate::domain::schema_validator::SectionSchema;
 use crate::domain::startup::{SectionPluginEntry, StartupResult, StartupResultHolder};
 use crate::infra::call_guard::PluginCallGuard;
@@ -72,7 +73,20 @@ pub struct GateBuilder {
     guard_cap: usize,
     policy_port: Option<Arc<dyn PolicyPort>>,
     validation: Option<Arc<ValidationFn>>,
+    // P7
+    clock: Option<Arc<dyn Clock>>,
+    policy_delay: Duration,
+    wrap_audit: Option<AuditWrap>,
+    wrap_sections: Vec<(usize, SectionWrap)>,
+    events: Option<Arc<EventLog>>,
+    request_ids_from: u128,
 }
+
+/// Replaces the audit sink by a wrapper around it (P7: a sink that panics).
+type AuditWrap = Box<dyn FnOnce(Arc<dyn AuditSink>) -> Arc<dyn AuditSink>>;
+
+/// Replaces a section plugin port by a wrapper around it (P7: a port that panics).
+type SectionWrap = Box<dyn FnOnce(Arc<dyn SectionPluginPort>) -> Arc<dyn SectionPluginPort>>;
 
 impl Default for GateBuilder {
     fn default() -> Self {
@@ -94,12 +108,70 @@ impl GateBuilder {
                 registry_operation_timeout: REGISTRY_TIMEOUT,
                 step_timeout: PLUGIN_TIMEOUT,
                 max_validations: 64,
+                max_request_tasks: 64,
             },
             audit: FakeAuditPlugin::new(),
             guard_cap: 64,
             policy_port: None,
             validation: None,
+            clock: None,
+            policy_delay: Duration::ZERO,
+            wrap_audit: None,
+            wrap_sections: Vec::new(),
+            events: None,
+            request_ids_from: 1,
         }
+    }
+
+    /// Shares an event log made before the gate (P7: a clock that panics after a given event).
+    #[must_use]
+    pub fn events(mut self, events: Arc<EventLog>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// The first request id the gate's id source gives, `Uuid::from_u128(n)` (P7: a test whose
+    /// log capture is keyed by its own request ids).
+    #[must_use]
+    pub fn request_ids_from(mut self, n: u128) -> Self {
+        self.request_ids_from = n;
+        self
+    }
+
+    /// Replaces the fixed clock (P7: a `ManualClock`, or a clock that panics).
+    #[must_use]
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Makes the scripted policy wait `d` before it answers (P7).
+    #[must_use]
+    pub fn policy_delay(mut self, d: Duration) -> Self {
+        self.policy_delay = d;
+        self
+    }
+
+    /// Wraps the guarded audit sink in the startup result (P7: a sink that panics).
+    #[must_use]
+    pub fn wrap_audit_sink(
+        mut self,
+        wrap: impl FnOnce(Arc<dyn AuditSink>) -> Arc<dyn AuditSink> + 'static,
+    ) -> Self {
+        self.wrap_audit = Some(Box::new(wrap));
+        self
+    }
+
+    /// Wraps the guarded port of the section plugin at `index` (priority order, 0-based) in the
+    /// startup result (P7: a port that panics).
+    #[must_use]
+    pub fn wrap_section_port(
+        mut self,
+        index: usize,
+        wrap: impl FnOnce(Arc<dyn SectionPluginPort>) -> Arc<dyn SectionPluginPort> + 'static,
+    ) -> Self {
+        self.wrap_sections.push((index, Box::new(wrap)));
+        self
     }
 
     /// Adds a section plugin (priority order is the order of the calls) serving `schema`.
@@ -175,8 +247,12 @@ impl GateBuilder {
 
     /// Builds the gate.
     pub fn build(self) -> Gate {
-        let events = EventLog::new();
-        let policy = Arc::new(FakePolicy::new(self.policy).with_event_log(Arc::clone(&events)));
+        let events = self.events.unwrap_or_default();
+        let policy = Arc::new(
+            FakePolicy::new(self.policy)
+                .with_delay(self.policy_delay)
+                .with_event_log(Arc::clone(&events)),
+        );
         let memory = {
             let mut store = InMemoryRegistryStore::new().with_event_log(Arc::clone(&events));
             for e in self.entries {
@@ -204,6 +280,8 @@ impl GateBuilder {
             .collect();
         let audit = Arc::new(self.audit.with_event_log(Arc::clone(&events)));
         let holder = Arc::new(StartupResultHolder::new());
+        let mut wrap_sections = self.wrap_sections;
+        let wrap_audit = self.wrap_audit;
         if self.publish {
             let entries = sections
                 .iter()
@@ -211,12 +289,16 @@ impl GateBuilder {
                 .map(|(i, plugin)| {
                     let key = self.sections[i].0.clone();
                     let instance_id = format!("section-{i}");
-                    let adapter = Arc::new(GuardedSectionPlugin::new(
-                        &instance_id,
-                        &key,
-                        Arc::clone(plugin) as _,
-                        guard.clone(),
-                    ));
+                    let mut adapter: Arc<dyn SectionPluginPort> =
+                        Arc::new(GuardedSectionPlugin::new(
+                            &instance_id,
+                            &key,
+                            Arc::clone(plugin) as _,
+                            guard.clone(),
+                        ));
+                    if let Some(at) = wrap_sections.iter().position(|(index, _)| *index == i) {
+                        adapter = (wrap_sections.remove(at).1)(adapter);
+                    }
                     SectionPluginEntry {
                         instance_id,
                         priority: i16::try_from(i).expect("few sections"),
@@ -225,11 +307,22 @@ impl GateBuilder {
                     }
                 })
                 .collect();
-            let sink = Arc::new(GuardedAuditSink::new(
+            assert!(
+                wrap_sections.is_empty(),
+                "a section wrap names a section the gate does not have: {:?}",
+                wrap_sections
+                    .iter()
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>()
+            );
+            let mut sink: Arc<dyn AuditSink> = Arc::new(GuardedAuditSink::new(
                 "audit-instance",
                 Arc::clone(&audit) as _,
                 guard,
             ));
+            if let Some(wrap) = wrap_audit {
+                sink = wrap(sink);
+            }
             holder
                 .publish_result(StartupResult::new(
                     entries,
@@ -237,6 +330,11 @@ impl GateBuilder {
                     sink,
                 ))
                 .expect("published once");
+        } else {
+            assert!(
+                wrap_sections.is_empty() && wrap_audit.is_none(),
+                "a wrap on an unpublished gate would be ignored"
+            );
         }
         let policy_port: Arc<dyn PolicyPort> = match self.policy_port {
             Some(port) => port,
@@ -246,10 +344,12 @@ impl GateBuilder {
             policy_port,
             registry,
             Arc::clone(&holder),
-            Arc::new(FixedClock::new(
-                UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-            )),
-            Arc::new(SequentialIdSource::new()),
+            self.clock.unwrap_or_else(|| {
+                Arc::new(FixedClock::new(
+                    UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                ))
+            }),
+            Arc::new(SequentialIdSource::starting_at(self.request_ids_from)),
             self.settings,
         );
         if let Some(validation) = self.validation {
@@ -419,6 +519,63 @@ impl Gate {
                 },
             )
             .await
+    }
+
+    /// The full request of a seed (P7): the permit, the detached request task, and its result.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request is refused at the cap or its supervisor fails to join.
+    pub async fn run_seed(&self, body: Vec<u8>) -> OutcomeReport {
+        self.run(RequestInput::Seed { body }).await
+    }
+
+    /// The full request of an uninstall (P7).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request is refused at the cap or its supervisor fails to join.
+    pub async fn run_uninstall(&self, id: &str) -> OutcomeReport {
+        self.run(RequestInput::Uninstall {
+            application_id: id.to_owned(),
+        })
+        .await
+    }
+
+    /// The full request of `input`: what the REST handler does, awaiting the supervisor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request is refused at the cap or its supervisor fails to join.
+    pub async fn run(&self, input: RequestInput) -> OutcomeReport {
+        self.start(input).await.expect("the supervisor joins")
+    }
+
+    /// Starts the full request and returns the supervisor's handle, which the caller may drop (a
+    /// disconnect) or await.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request is refused at the cap.
+    pub fn start(&self, input: RequestInput) -> RequestHandle {
+        self.try_start(input)
+            .expect("the request-task cap is not reached")
+    }
+
+    /// Like [`Self::start`], with the cap refusal returned.
+    ///
+    /// # Errors
+    ///
+    /// [`AtCapacity`] when no request-task permit is free.
+    pub fn try_start(&self, input: RequestInput) -> Result<RequestHandle, AtCapacity> {
+        let operation = match &input {
+            RequestInput::Seed { .. } => HandoffOperation::Seed,
+            RequestInput::Uninstall { .. } => HandoffOperation::Uninstall,
+        };
+        let permit = self.orchestrator.try_admit(operation)?;
+        Ok(self
+            .orchestrator
+            .start_request(permit, security_context(), input))
     }
 
     /// The registry calls the orchestrator made.

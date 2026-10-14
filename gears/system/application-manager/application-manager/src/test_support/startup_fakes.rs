@@ -57,17 +57,42 @@ enum Listing {
     Hang,
 }
 
+/// How [`FakeTypesRegistry::register_type_schemas`] answers (P7: `init` registers the two
+/// plugin GTS types).
+#[derive(Clone)]
+enum Registration {
+    /// Accepts every schema: one `RegisterResult::Ok` per schema, with its `$id` as the id.
+    Accept,
+    /// The call itself fails with an internal canonical error.
+    CallFails,
+    /// The call succeeds but the item at this index (0-based) is rejected.
+    ItemRejected(usize),
+    /// The call succeeds with no per-item result.
+    NoResults,
+    /// The call never answers.
+    Hang,
+    /// The call succeeds with this many `Ok` results, whatever the number of schemas (the ids
+    /// are those of the schemas in turn).
+    ResultCount(usize),
+    /// The call succeeds with one `Ok` per schema, each with an id that is not the schema's.
+    OtherIds,
+}
+
 /// Fake types registry client.
 ///
-/// Only `list_instances` is scripted. Every call to any method of the trait is counted
-/// in [`FakeTypesRegistry::total_calls`], so a test can assert that startup made exactly
-/// one registry call. Methods other than `list_instances` fail with an internal error
-/// (or return an empty answer); the startup component must not use them.
+/// `list_instances` and `register_type_schemas` are scripted. Every call to any method of the
+/// trait is counted in [`FakeTypesRegistry::total_calls`], so a test can assert that startup made
+/// exactly one registry call. Methods other than these two fail with an internal error (or
+/// return an empty answer); the startup component must not use them. Since P7 `init` makes
+/// one `register_type_schemas` call ([`FakeTypesRegistry::registration_calls`]), which
+/// `total_calls` counts too.
 pub struct FakeTypesRegistry {
     listing: Listing,
     delay: Duration,
     queries: Mutex<Vec<InstanceQuery>>,
     other_calls: AtomicUsize,
+    registration: Registration,
+    registered: Mutex<Vec<Vec<Value>>>,
 }
 
 impl Default for FakeTypesRegistry {
@@ -84,7 +109,63 @@ impl FakeTypesRegistry {
             delay: Duration::ZERO,
             queries: Mutex::new(Vec::new()),
             other_calls: AtomicUsize::new(0),
+            registration: Registration::Accept,
+            registered: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Makes `register_type_schemas` fail with an internal canonical error.
+    #[must_use]
+    pub fn registration_failing(mut self) -> Self {
+        self.registration = Registration::CallFails;
+        self
+    }
+
+    /// Makes `register_type_schemas` reject the schema at `index` (0-based) and accept the rest.
+    #[must_use]
+    pub fn registration_rejecting(mut self, index: usize) -> Self {
+        self.registration = Registration::ItemRejected(index);
+        self
+    }
+
+    /// Makes `register_type_schemas` answer with no per-item result.
+    #[must_use]
+    pub fn registration_without_results(mut self) -> Self {
+        self.registration = Registration::NoResults;
+        self
+    }
+
+    /// Makes `register_type_schemas` answer `Ok` with exactly `count` results, however many
+    /// schemas it got.
+    #[must_use]
+    pub fn registration_with_result_count(mut self, count: usize) -> Self {
+        self.registration = Registration::ResultCount(count);
+        self
+    }
+
+    /// Makes `register_type_schemas` answer one `Ok` per schema with an id that is not the
+    /// schema's own.
+    #[must_use]
+    pub fn registration_answering_other_ids(mut self) -> Self {
+        self.registration = Registration::OtherIds;
+        self
+    }
+
+    /// Makes `register_type_schemas` never answer.
+    #[must_use]
+    pub fn registration_hanging(mut self) -> Self {
+        self.registration = Registration::Hang;
+        self
+    }
+
+    /// The schema batches of the `register_type_schemas` calls, in order.
+    pub fn registered(&self) -> Vec<Vec<Value>> {
+        lock(&self.registered).clone()
+    }
+
+    /// Number of `register_type_schemas` calls received (each is also in `total_calls`).
+    pub fn registration_calls(&self) -> usize {
+        lock(&self.registered).len()
     }
 
     /// Lists `instances`, filtered by the query pattern like the real registry does for
@@ -129,7 +210,7 @@ impl FakeTypesRegistry {
 
     /// Number of calls to any trait method, `list_instances` included.
     pub fn total_calls(&self) -> usize {
-        self.list_calls() + self.other_calls.load(Ordering::SeqCst)
+        self.list_calls() + self.registration_calls() + self.other_calls.load(Ordering::SeqCst)
     }
 
     fn other(&self) {
@@ -146,10 +227,56 @@ impl TypesRegistryClient for FakeTypesRegistry {
 
     async fn register_type_schemas(
         &self,
-        _type_schemas: Vec<Value>,
+        type_schemas: Vec<Value>,
     ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.other();
-        Ok(Vec::new())
+        lock(&self.registered).push(type_schemas.clone());
+        let id_of = |schema: &Value| {
+            schema
+                .get("$id")
+                .and_then(Value::as_str)
+                .map(|id| id.strip_prefix("gts://").unwrap_or(id).to_owned())
+        };
+        match &self.registration {
+            Registration::Accept => Ok(type_schemas
+                .iter()
+                .map(|s| RegisterResult::Ok {
+                    gts_id: id_of(s).unwrap_or_default(),
+                })
+                .collect()),
+            Registration::CallFails => Err(internal("fake types registry: registration failed")),
+            Registration::ItemRejected(index) => Ok(type_schemas
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    if i == *index {
+                        RegisterResult::Err {
+                            gts_id: id_of(s),
+                            error: internal("fake types registry: schema rejected"),
+                        }
+                    } else {
+                        RegisterResult::Ok {
+                            gts_id: id_of(s).unwrap_or_default(),
+                        }
+                    }
+                })
+                .collect()),
+            Registration::NoResults => Ok(Vec::new()),
+            Registration::Hang => std::future::pending().await,
+            Registration::ResultCount(count) => Ok((0..*count)
+                .map(|i| RegisterResult::Ok {
+                    gts_id: type_schemas
+                        .get(i % type_schemas.len().max(1))
+                        .and_then(id_of)
+                        .unwrap_or_default(),
+                })
+                .collect()),
+            Registration::OtherIds => Ok(type_schemas
+                .iter()
+                .map(|_| RegisterResult::Ok {
+                    gts_id: "gts.fake.other.type.v1~".to_owned(),
+                })
+                .collect()),
+        }
     }
 
     async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {

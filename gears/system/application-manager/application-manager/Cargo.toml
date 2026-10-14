@@ -37,7 +37,10 @@ humantime-serde = { workspace = true }
 serde = { workspace = true }
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
-serde_json = { workspace = true }
+# `float_roundtrip`: a number parsed from text is the double nearest to it, so the schema
+# fingerprint (RFC 8785, DESIGN §3.1) of a parsed schema is the one of the nearest double. The
+# feature is additive; Cargo unifies it binary-wide.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

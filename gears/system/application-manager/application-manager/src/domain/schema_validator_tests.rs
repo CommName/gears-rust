@@ -2335,6 +2335,8 @@ fn hostile_case(name: &str) -> Hostile {
 /// large value in a debug build: a looser bound that still catches an exponential blow-up.
 const HOSTILE_REFUSAL_BUDGET: Duration = Duration::from_secs(1);
 const HOSTILE_USABLE_BUDGET: Duration = Duration::from_secs(5);
+/// How often a case over its budget is run again before the budget fails it.
+const HOSTILE_ATTEMPTS: usize = 3;
 
 // Not a test of its own: the body of `a_hostile_served_schema_is_refused_without_aborting_the_
 // process`, run by that test in a child process of this very test binary (a stack overflow
@@ -2352,26 +2354,44 @@ fn hostile_schema_child() {
         want,
     } = hostile_case(&name);
     let sections = [sec("s", schema)];
-    let started = Instant::now();
-    let (checked, validated) = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(2 << 20)
-            .spawn_scoped(scope, || {
-                (
-                    check_schemas(&sections),
-                    validate_manifest(&sections, &instance),
-                )
-            })
-            .expect("spawn the worker")
-            .join()
-            .expect("the worker does not panic")
-    });
-    let elapsed = started.elapsed();
     let budget = match want {
         Want::Unusable(_) => HOSTILE_REFUSAL_BUDGET,
         Want::Usable { .. } => HOSTILE_USABLE_BUDGET,
     };
-    assert!(elapsed < budget, "case {name} took {elapsed:?}");
+    // The budget tells linear from exponential, not a loaded machine from an idle one: a case
+    // that is over it is run again, and only the fastest of `HOSTILE_ATTEMPTS` counts. Load
+    // noise does not repeat on every attempt; a blow-up does (the run that exceeded the budget
+    // under CPU load, 3 of 12 loaded runs, is the flake this fixes).
+    let mut fastest: Option<(Duration, _, _)> = None;
+    for _ in 0..HOSTILE_ATTEMPTS {
+        let started = Instant::now();
+        // The check on a 2 MiB thread, what a worker thread has.
+        let (checked, validated) = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(2 << 20)
+                .spawn_scoped(scope, || {
+                    (
+                        check_schemas(&sections),
+                        validate_manifest(&sections, &instance),
+                    )
+                })
+                .expect("spawn the worker")
+                .join()
+                .expect("the worker does not panic")
+        });
+        let elapsed = started.elapsed();
+        if fastest.as_ref().is_none_or(|(best, _, _)| elapsed < *best) {
+            fastest = Some((elapsed, checked, validated));
+        }
+        if elapsed < budget {
+            break;
+        }
+    }
+    let (elapsed, checked, validated) = fastest.expect("at least one attempt ran");
+    assert!(
+        elapsed < budget,
+        "case {name} took {elapsed:?} at best of {HOSTILE_ATTEMPTS} attempts"
+    );
     match want {
         Want::Unusable(cause) => {
             let want = vec![UnusableSchema {

@@ -97,7 +97,7 @@ pub async fn sqlite_with(opts: ConnectOpts, migrate: bool) -> RegistryTestDb {
                 .expect("the registry migration applies on an empty database");
         }
     }
-    let db = connect_db(&dsn, opts).await.expect("connect SQLite");
+    let db = connect_with_retry(&dsn, opts).await;
     let raw = Database::connect(&dsn)
         .await
         .expect("raw SQLite connection");
@@ -107,6 +107,23 @@ pub async fn sqlite_with(opts: ConnectOpts, migrate: bool) -> RegistryTestDb {
         backend: DbBackend::Sqlite,
         _keep: Box::new(dir),
     }
+}
+
+/// Opens the pool with the caller's options, retrying. `connect_db` opens the pool's first
+/// connection within the pool's own `acquire_timeout`, so a test that wants a short one (a 300 ms
+/// pool whose only connection it then holds) could fail here, under load, before it starts. The
+/// file exists and is migrated, so a retry is cheap, and an open pool has its connection ready:
+/// the timeout then measures only the wait the test provokes.
+async fn connect_with_retry(dsn: &str, opts: ConnectOpts) -> toolkit_db::Db {
+    let mut last = None;
+    for _ in 0..200 {
+        match connect_db(dsn, opts.clone()).await {
+            Ok(db) => return db,
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("connect SQLite: {last:?}");
 }
 
 /// One Postgres container for a whole lane run.

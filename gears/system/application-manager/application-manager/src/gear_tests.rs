@@ -14,6 +14,12 @@
 //! - `init_fails_when_already_initialized`: second init fails (§3.2).
 //! - `gear_declares_types_registry_and_authz_resolver_deps`: registered deps (§3.2).
 //!
+//! P7: `init` registers the two plugin GTS types in the types registry, so the contexts of the
+//! tests that must initialize carry a (fake) types registry client; the registration itself is
+//! pinned in `gear_types_registration_tests.rs`. A context WITHOUT a types registry client now
+//! fails `init` (reason `type_registration_failed`), and the configuration tests below still
+//! fail first, on `invalid_setting`, before the registry is asked.
+//!
 //! Registry persistence (P4, DESIGN §3.2 "Startup and Registration", §3.7): the gear macro
 //! gains the `db` capability (`capabilities = [stateful, db]`) and `ApplicationManagerGear`
 //! implements `toolkit::DatabaseCapability`, whose `migrations()` returns
@@ -39,6 +45,8 @@ use toolkit::{ClientHub, DatabaseCapability, Gear, GearCtx};
 use uuid::Uuid;
 
 use crate::gear::ApplicationManagerGear;
+use crate::test_support::FakeTypesRegistry;
+use types_registry_sdk::TypesRegistryClient;
 
 const GEAR_NAME: &str = "application-manager";
 
@@ -63,12 +71,17 @@ fn valid_config() -> Value {
     })
 }
 
+// Since P7 `init` registers the two plugin GTS types in the types registry (DESIGN section 3.2
+// "Startup and Registration"), so a context that is to initialize carries a types registry client.
 fn make_ctx(root: Value) -> GearCtx {
+    let hub = Arc::new(ClientHub::new());
+    let registry: Arc<dyn TypesRegistryClient> = Arc::new(FakeTypesRegistry::new());
+    hub.register::<dyn TypesRegistryClient>(registry);
     GearCtx::new(
         GEAR_NAME,
         Uuid::new_v4(),
         Arc::new(StaticConfigProvider { root }),
-        Arc::new(ClientHub::new()),
+        hub,
         CancellationToken::new(),
     )
 }
