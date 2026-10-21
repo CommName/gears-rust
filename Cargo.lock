@@ -1847,6 +1847,9 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "gts",
  "inventory",
+ "jsonschema 0.60.2",
+ "percent-encoding",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1854,6 +1857,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-test",
  "utoipa",
  "uuid",
 ]

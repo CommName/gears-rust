@@ -18,3 +18,13 @@ fn section_key_grammar() {
         assert!(!is_valid_section_key(key), "{key:?} should be invalid");
     }
 }
+
+#[test]
+fn cut_keeps_whole_characters() {
+    assert_eq!(cut("abc", 3), "abc");
+    assert_eq!(cut("abc", 2), "ab");
+    assert_eq!(cut("abc", 0), "");
+    // "é" is two bytes: a cut inside it keeps only the whole characters.
+    assert_eq!(cut("a\u{e9}", 2), "a");
+    assert_eq!(cut("a\u{e9}", 3), "a\u{e9}");
+}
