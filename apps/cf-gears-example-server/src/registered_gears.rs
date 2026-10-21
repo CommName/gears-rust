@@ -142,3 +142,5 @@ use event_broker as _;
 use sqlite_event_broker_plugin as _;
 #[cfg(feature = "bss-orders")]
 use standalone_cluster_plugin as _;
+#[cfg(feature = "application-manager")]
+use application_manager as _;
