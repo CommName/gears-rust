@@ -138,6 +138,8 @@ use bss_orders_test_authz_plugin as _;
 // standalone deployment selects.
 #[cfg(feature = "application-manager")]
 use application_manager as _;
+#[cfg(feature = "noop-section-plugin")]
+use noop_section_plugin as _;
 #[cfg(feature = "bss-orders")]
 use event_broker as _;
 #[cfg(feature = "bss-orders")]

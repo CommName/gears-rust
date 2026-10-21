@@ -563,6 +563,11 @@ gears:
           actions: [seed, uninstall, read_schema, read_operation]
       storage_call_timeout: "2s"
 
+  noop-section-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
   simple-user-settings:
     # Gear-specific database configuration
     database:

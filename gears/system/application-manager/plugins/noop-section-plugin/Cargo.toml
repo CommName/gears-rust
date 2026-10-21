@@ -1,0 +1,48 @@
+[package]
+name = "cf-gears-noop-section-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Application Manager section plugin that accepts any object section and does nothing - an example and test plugin"
+repository.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "noop_section_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The plugin depends only on the Application Manager SDK, never on the gear.
+application-manager-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Error handling and serialization
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tokio-util = { workspace = true }
+gts = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }

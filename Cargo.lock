@@ -1834,12 +1834,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "cf-gears-application-manager-sdk",
  "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
  "cf-gears-toolkit-utils",
  "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "futures",
  "gts",
  "inventory",
  "serde",
@@ -1847,7 +1854,9 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 
@@ -2962,6 +2971,7 @@ dependencies = [
  "cf-gears-license-resolver",
  "cf-gears-mini-chat",
  "cf-gears-nodes-registry",
+ "cf-gears-noop-section-plugin",
  "cf-gears-oagw",
  "cf-gears-policy-engine",
  "cf-gears-quota-enforcement",
@@ -3792,6 +3802,28 @@ dependencies = [
  "cf-gears-toolkit-node-info",
  "serde_json",
  "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-noop-section-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-application-manager-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "gts",
+ "inventory",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
