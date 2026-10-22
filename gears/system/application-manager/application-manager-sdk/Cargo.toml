@@ -33,3 +33,7 @@ toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 
+
+[dev-dependencies]
+# The generated outcome report schema is checked against a sample report.
+jsonschema = { workspace = true }

@@ -61,3 +61,86 @@ fn gts_application_resource_type_is_exact() {
         "gts.cf.core.application_manager.application.v1~"
     );
 }
+
+const OUTCOME_REPORT_TYPE_ID: &str = "gts.cf.core.application_manager.outcome_report.v1~";
+
+fn outcome_report_schema() -> serde_json::Value {
+    let want = serde_json::json!(format!("gts://{OUTCOME_REPORT_TYPE_ID}"));
+    toolkit_gts::all_inventory_type_schemas()
+        .expect("inventory schemas parse")
+        .into_iter()
+        .find(|s| s["$id"] == want)
+        .expect("the outcome report schema is in the inventory")
+}
+
+fn sample_report() -> crate::models::OutcomeReport {
+    use crate::models::{
+        Dependency, OperationAction, OutcomeReport, ReportApplication, ReportProblem,
+        RequestCategory, SectionOutcome, SectionOutcomeEntry, UnavailableItem,
+        UnavailableReasonCode,
+    };
+    OutcomeReport {
+        operation_id: uuid::Uuid::from_u128(9),
+        action: OperationAction::Seed,
+        category: Some(RequestCategory::InvalidManifest),
+        interrupted: false,
+        application: ReportApplication {
+            id: "acme.app".to_owned(),
+            version: Some("1.0.0".to_owned()),
+        },
+        sections: vec![SectionOutcomeEntry {
+            key: "billing".to_owned(),
+            outcome: SectionOutcome::Rejected,
+            schema_version: Some("2".to_owned()),
+            detail: Some("no".to_owned()),
+            location: Some("/plan".to_owned()),
+        }],
+        problems: vec![ReportProblem {
+            location: "/sections/billing".to_owned(),
+            rule: "required".to_owned(),
+            message: "missing".to_owned(),
+        }],
+        unavailable: vec![UnavailableItem {
+            dependency: Dependency::SectionSchema,
+            key: Some("billing".to_owned()),
+            reason: UnavailableReasonCode::Unusable,
+        }],
+    }
+}
+
+#[test]
+fn outcome_report_type_constant_is_exact() {
+    assert_eq!(OUTCOME_REPORT_TYPE, OUTCOME_REPORT_TYPE_ID);
+}
+
+#[test]
+fn gts_inventory_holds_outcome_report_schema() {
+    let schema = outcome_report_schema();
+    assert_eq!(
+        schema["$id"],
+        serde_json::json!(format!("gts://{OUTCOME_REPORT_TYPE_ID}"))
+    );
+}
+
+#[test]
+fn outcome_report_schema_accepts_a_sample_report() {
+    let schema = outcome_report_schema();
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let completed = serde_json::to_value(sample_report()).unwrap();
+    assert!(validator.is_valid(&completed), "{completed}");
+
+    let mut open = sample_report();
+    open.category = None;
+    open.interrupted = true;
+    let open = serde_json::to_value(open).unwrap();
+    assert!(validator.is_valid(&open), "{open}");
+}
+
+#[test]
+fn outcome_report_schema_refuses_an_unknown_category() {
+    let schema = outcome_report_schema();
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let mut report = serde_json::to_value(sample_report()).unwrap();
+    report["category"] = serde_json::json!("not_a_category");
+    assert!(!validator.is_valid(&report));
+}

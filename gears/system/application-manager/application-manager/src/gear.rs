@@ -8,23 +8,26 @@ use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
 use toolkit::config::ConfigError;
-use toolkit::contracts::{RestApiCapability, RunnableCapability};
+use toolkit::contracts::{DatabaseCapability, RestApiCapability, RunnableCapability};
 use toolkit::{Gear, GearCtx, Healthcheck};
 
 use crate::api::rest;
 use crate::api::rest::health::StartupHealthcheck;
 use crate::config::ApplicationManagerConfig;
 use crate::domain::plugin_set::StartupState;
+use crate::domain::ports::{OperationRepository, PluginCalls};
 use crate::domain::read_service::ReadService;
 use crate::domain::schema_validator::SchemaValidator;
 use crate::infra::startup;
 use crate::sdk::{ApplicationManagerSectionPluginSpecV1, SECTION_BASE_TYPE};
+use crate::sdk::{ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1};
+use crate::infra::storage::SeaOrmOperationRepository;
 
 /// The Application Manager gear.
 #[toolkit::gear(
     name = "application-manager",
     deps = [types_registry, authz_resolver],
-    capabilities = [rest, stateful],
+    capabilities = [rest, stateful, db],
 )]
 #[derive(Default)]
 pub struct ApplicationManager {
@@ -36,6 +39,10 @@ struct Runtime {
     hub: Arc<ClientHub>,
     read: Arc<ReadService>,
     startup: Arc<StartupState>,
+    #[expect(dead_code, reason = "the request orchestrator uses it in PR 5")]
+    operations: Arc<dyn OperationRepository>,
+    run_window_margin: Duration,
+    storage_call_timeout: Duration,
 }
 
 impl ApplicationManager {
@@ -99,6 +106,10 @@ impl Gear for ApplicationManager {
             .validate()
             .map_err(|e| anyhow!("{}: {e}", Self::MODULE_NAME))?;
 
+        let db = ctx
+            .db_required()
+            .map_err(|e| anyhow!("{}: invalid_setting: database: {e}", Self::MODULE_NAME))?;
+
         ensure_sdk_types_linked()?;
 
         tracing::info!(
@@ -122,6 +133,20 @@ impl Gear for ApplicationManager {
             )
         })?;
         let startup = Arc::new(StartupState::default());
+        let guard = Arc::new(CallGuard::new(
+            config.plugin_call_timeout,
+            config.plugin_max_in_flight,
+        ));
+        let read = ReadService::new(
+            access,
+            Arc::clone(&startup),
+            SectionPluginRouter::new(Arc::clone(&guard) as Arc<dyn PluginCalls>),
+            Arc::new(validator),
+        );
+        let operations = Arc::new(SeaOrmOperationRepository::new(
+            Arc::new(db),
+            config.storage_call_timeout,
+        ));
         let runtime = Runtime {
             hub: ctx.client_hub(),
             read: Arc::new(ReadService::new(
@@ -130,11 +155,22 @@ impl Gear for ApplicationManager {
                 Arc::new(validator),
             )),
             startup,
+            operations,
+            run_window_margin: config.run_window_margin,
+            storage_call_timeout: config.storage_call_timeout,
         };
         self.runtime
             .set(runtime)
             .map_err(|_| anyhow!("{}: already initialized", Self::MODULE_NAME))?;
         Ok(())
+    }
+}
+
+impl DatabaseCapability for ApplicationManager {
+    /// The `operations` and `audit_ledger` migrations.
+    fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+        use sea_orm_migration::MigratorTrait;
+        crate::infra::storage::Migrator::migrations()
     }
 }
 

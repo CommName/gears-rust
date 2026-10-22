@@ -6,8 +6,10 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use toolkit::config::ConfigProvider;
-use toolkit::contracts::RestApiCapability;
+use toolkit::contracts::{DatabaseCapability, RestApiCapability};
 use toolkit::{ClientHub, Gear, GearCtx, HealthcheckStatus};
+use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
 use super::*;
@@ -31,11 +33,47 @@ fn valid_config() -> Value {
     valid_config_json()
 }
 
-fn ctx_with(root: Value) -> GearCtx {
-    ctx_with_hub(root, Arc::new(ClientHub::new()))
+/// A runtime of its own for database connections. Several tests here pause the
+/// clock, and a connection opened on a paused clock times out in the pool, so
+/// the connection is opened on a runtime whose clock runs.
+fn db_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("database runtime")
+    })
 }
 
-fn ctx_with_hub(root: Value, hub: Arc<ClientHub>) -> GearCtx {
+/// A fresh in-memory SQLite database, as the host hands one to the gear.
+/// Migrations are the host's job and are not run here.
+async fn test_db() -> DBProvider<DbError> {
+    let dsn = format!(
+        "sqlite:file:application_manager_gear_{}?mode=memory&cache=shared",
+        Uuid::new_v4()
+    );
+    let db = db_runtime()
+        .spawn(async move {
+            connect_db(
+                &dsn,
+                ConnectOpts {
+                    max_conns: Some(1),
+                    min_conns: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("connect sqlite")
+        })
+        .await
+        .expect("database runtime task");
+    DBProvider::new(db)
+}
+
+/// A context with no database configured.
+fn ctx_without_db(root: Value, hub: Arc<ClientHub>) -> GearCtx {
     GearCtx::new(
         ApplicationManager::MODULE_NAME,
         Uuid::from_u128(1),
@@ -45,20 +83,30 @@ fn ctx_with_hub(root: Value, hub: Arc<ClientHub>) -> GearCtx {
     )
 }
 
-fn ctx_with_config(config: &Value) -> GearCtx {
-    ctx_with(json!({ "application-manager": { "config": config } }))
+async fn ctx_with(root: Value) -> GearCtx {
+    ctx_with_hub(root, Arc::new(ClientHub::new())).await
+}
+
+async fn ctx_with_hub(root: Value, hub: Arc<ClientHub>) -> GearCtx {
+    ctx_without_db(root, hub).with_db(test_db().await)
+}
+
+async fn ctx_with_config(config: &Value) -> GearCtx {
+    ctx_with(json!({ "application-manager": { "config": config } })).await
 }
 
 #[tokio::test]
 async fn init_valid_static_config_succeeds() {
     let gear = ApplicationManager::default();
-    gear.init(&ctx_with_config(&valid_config())).await.unwrap();
+    gear.init(&ctx_with_config(&valid_config()).await)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn init_second_call_fails_already_initialized() {
     let gear = ApplicationManager::default();
-    let ctx = ctx_with_config(&valid_config());
+    let ctx = ctx_with_config(&valid_config()).await;
     gear.init(&ctx).await.unwrap();
     let err = gear.init(&ctx).await.expect_err("second init");
     assert!(
@@ -82,17 +130,17 @@ async fn init_invalid_config_fails_with_invalid_setting() {
     let mut no_actions = valid_config();
     no_actions["allowed_callers"][0]["actions"] = json!([]);
     let cases = vec![
-        ("missing_gear_block", ctx_with(json!({}))),
+        ("missing_gear_block", ctx_with(json!({})).await),
         (
             "missing_config_key",
-            ctx_with(json!({ "application-manager": {} })),
+            ctx_with(json!({ "application-manager": {} })).await,
         ),
-        ("missing_field", ctx_with_config(&missing)),
-        ("unknown_field", ctx_with_config(&unknown)),
-        ("bad_duration", ctx_with_config(&bad_duration)),
-        ("invalid_value", ctx_with_config(&zero)),
-        ("shared_caller", ctx_with_config(&shared_caller)),
-        ("caller_without_actions", ctx_with_config(&no_actions)),
+        ("missing_field", ctx_with_config(&missing).await),
+        ("unknown_field", ctx_with_config(&unknown).await),
+        ("bad_duration", ctx_with_config(&bad_duration).await),
+        ("invalid_value", ctx_with_config(&zero).await),
+        ("shared_caller", ctx_with_config(&shared_caller).await),
+        ("caller_without_actions", ctx_with_config(&no_actions).await),
     ];
     for (name, ctx) in cases {
         let gear = ApplicationManager::default();
@@ -133,7 +181,7 @@ async fn start_publishes_the_plugin_set_and_stop_succeeds() {
         "cf.test.a.section.v1",
     )];
     let root = json!({ "application-manager": { "config": valid_config() } });
-    gear.init(&ctx_with_hub(root, hub_with(&plugins)))
+    gear.init(&ctx_with_hub(root, hub_with(&plugins)).await)
         .await
         .unwrap();
     let state = &gear.runtime.get().unwrap().startup;
@@ -153,7 +201,7 @@ async fn failed_startup_fails_start_with_its_reason_and_stays_not_ready() {
     let gear = ApplicationManager::default();
     let registry = MockTypesRegistryClient::new().with_list_error(internal("down"));
     let root = json!({ "application-manager": { "config": valid_config() } });
-    gear.init(&ctx_with_hub(root, hub_with_registry(&[], registry)))
+    gear.init(&ctx_with_hub(root, hub_with_registry(&[], registry)).await)
         .await
         .unwrap();
     let err = gear.start(CancellationToken::new()).await.unwrap_err();
@@ -163,7 +211,7 @@ async fn failed_startup_fails_start_with_its_reason_and_stays_not_ready() {
         "{err:#}"
     );
     assert!(gear.runtime.get().unwrap().startup.plugin_set().is_none());
-    let check = gear.healthcheck(&ctx_with(json!({}))).unwrap();
+    let check = gear.healthcheck(&ctx_with(json!({})).await).unwrap();
     assert_eq!(check.check().await.status, HealthcheckStatus::Unhealthy);
 }
 
@@ -175,7 +223,7 @@ async fn initialized(overrides: &Value, hub: Arc<ClientHub>) -> ApplicationManag
     }
     let gear = ApplicationManager::default();
     let root = json!({ "application-manager": { "config": config } });
-    gear.init(&ctx_with_hub(root, hub)).await.unwrap();
+    gear.init(&ctx_with_hub(root, hub).await).await.unwrap();
     gear
 }
 
@@ -273,7 +321,7 @@ async fn healthcheck_follows_startup() {
         1,
         "cf.test.a.section.v1",
     )];
-    let ctx = ctx_with_hub(root, hub_with(&plugins));
+    let ctx = ctx_with_hub(root, hub_with(&plugins)).await;
     let gear = ApplicationManager::default();
     assert!(gear.healthcheck(&ctx).is_none(), "no check before init");
 
@@ -283,4 +331,103 @@ async fn healthcheck_follows_startup() {
 
     gear.start(CancellationToken::new()).await.unwrap();
     assert_eq!(check.check().await.status, HealthcheckStatus::Healthy);
+}
+
+/// A started gear whose plugin set is one fake plugin `a`, with a permitting
+/// PDP.
+async fn started_with_plugin_a(overrides: &Value) -> ApplicationManager {
+    let plugins = [PluginSpec::new(
+        "cf.test.a.section.v1",
+        1,
+        KeyAnswer::Key("a"),
+    )];
+    let hub = hub_with(&plugins);
+    let pdp: Arc<dyn AuthZResolverApi> = FakeAuthZ::new(Pdp::Permit);
+    hub.register::<dyn AuthZResolverApi>(pdp);
+    let gear = initialized(overrides, hub).await;
+    gear.start(CancellationToken::new()).await.unwrap();
+    gear
+}
+
+#[tokio::test]
+async fn schema_reads_serve_the_started_plugin_set() {
+    let gear = started_with_plugin_a(&json!({ "max_envelope_text_length": 64 })).await;
+    let read = &gear.runtime.get().unwrap().read;
+    let single = read.section_schema(&ctx(), "a").await.unwrap();
+    assert_eq!(single.schema_version, "1");
+    assert_eq!(
+        single.schema,
+        json!({ "$id": "urn:cf:application-manager:section:a" })
+    );
+    let combined = read.manifest_schema(&ctx()).await.unwrap();
+    assert_eq!(combined.sections.len(), 1);
+    assert_eq!(
+        combined.schema["properties"]["sections"]["required"],
+        json!(["a"])
+    );
+    assert_eq!(
+        combined.schema["properties"]["application"]["properties"]["id"]["maxLength"], 16,
+        "max_envelope_text_length (64 bytes) reaches the envelope schema as 16 characters"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_and_schema_reads_share_one_call_guard() {
+    let gear = started_with_plugin_a(&json!({ "plugin_max_in_flight": 1 })).await;
+    let runtime = gear.runtime.get().unwrap();
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let id = instance_id("cf.test.a.section.v1");
+    let held = runtime.guard.call(&id, async move { wait.await.unwrap() });
+    let read = async {
+        let refused = runtime.read.manifest_schema(&ctx()).await;
+        release.send(()).unwrap();
+        refused
+    };
+    let (held, refused) = tokio::join!(held, read);
+    assert_eq!(held, Ok(()));
+    assert_eq!(
+        refused,
+        Err(DomainError::SchemaUnavailable {
+            items: vec![UnavailableSchema {
+                key: "a".to_owned(),
+                reason: UnavailableReason::NotSent,
+            }],
+        })
+    );
+}
+
+#[tokio::test]
+async fn init_without_a_database_fails_with_invalid_setting_database() {
+    let gear = ApplicationManager::default();
+    let root = json!({ "application-manager": { "config": valid_config() } });
+    let err = gear
+        .init(&ctx_without_db(root, Arc::new(ClientHub::new())))
+        .await
+        .expect_err("a database is required");
+    let text = format!("{err:#}");
+    assert!(text.contains("invalid_setting: database"), "{text}");
+    assert!(text.starts_with("application-manager: "), "{text}");
+    // Nothing was published.
+    let err = gear.start(CancellationToken::new()).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("init must run before start"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn init_with_a_sqlite_database_succeeds_and_provides_the_migrations() {
+    let gear = ApplicationManager::default();
+    let db = test_db().await;
+    let root = json!({ "application-manager": { "config": valid_config() } });
+    let ctx = ctx_without_db(root, Arc::new(ClientHub::new())).with_db(db.clone());
+    gear.init(&ctx).await.unwrap();
+
+    let migrations = DatabaseCapability::migrations(&gear);
+    assert!(!migrations.is_empty());
+    // The host runs them; they must apply on the database `init` was given.
+    let applied = run_migrations_for_testing(&db.db(), migrations)
+        .await
+        .expect("the gear's migrations apply");
+    assert!(applied.applied > 0, "{applied:?}");
 }

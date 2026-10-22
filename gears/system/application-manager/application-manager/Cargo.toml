@@ -57,15 +57,36 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
+# Operation storage (DESIGN 3.7); driver features come from the host binary
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+toolkit-db = { workspace = true }
+toolkit-db-macros = { workspace = true }
+time = { workspace = true }
+# SHA-256 of out-of-limit ids (DE0708 bans the `sha2` crate)
+aws-lc-rs = { workspace = true }
+
 # Required by toolkit::gear macro
 inventory = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 
+[features]
+# Gates the container-backed PostgreSQL / MySQL storage tests; they need a
+# Docker daemon. Run with `make test-integration LANE=application-manager-db`.
+integration = ["toolkit-db/pg", "toolkit-db/mysql"]
+
 [dev-dependencies]
 noop-section-plugin = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+time = { workspace = true, features = ["macros"] }
+# PostgreSQL / MySQL bring-up for the `integration` suite; every use is behind
+# `#![cfg(feature = "integration")]`.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "net"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 proptest = { workspace = true }

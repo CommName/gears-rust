@@ -501,6 +501,12 @@ jobs:
         if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=types-registry-db
 
+      - name: Test application-manager (db integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        # The lane sets APPLICATION_MANAGER_DB_REQUIRE_DOCKER=1 (gears-rust.mk),
+        # so a missing Docker fails instead of skipping.
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=application-manager-db
+
       - name: Test oagw (pg/mysql conformance + migrations, integration)
         if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-db
