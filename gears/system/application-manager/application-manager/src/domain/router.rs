@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use application_manager_sdk::{CallerIdentity, Envelope};
 use serde_json::Value;
+use application_manager_sdk::{
+    CallerIdentity, Envelope, SectionOutcomeEntry, SectionPluginError, SectionSchema,
+};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -89,6 +92,58 @@ impl SectionPluginRouter {
                 .remove(plugin, caller, operation_id, application_id)
                 .await;
             routed.push((plugin.key.clone(), answer));
+    ) -> Vec<(&'p SectionPlugin, SchemaFetch)> {
+        futures::future::join_all(
+            plugins
+                .iter()
+                .map(|plugin| async move { (plugin, self.fetch_schema(plugin, caller).await) }),
+        )
+        .await
+    }
+
+    /// Call `apply` of `plugin` with its `section`, unchanged. The entry has
+    /// the plugin's key and no schema version: `Rejected` gives `rejected`
+    /// (detail cut at `PLUGIN_DETAIL_MAX_BYTES`, with its location),
+    /// `NotPermitted` gives `not_permitted` (detail cut), `Internal` or a
+    /// panic gives `internal_failure` (logged only), a timeout `timed_out`, a
+    /// full in-flight cap `not_sent`. Does no deadline check.
+    pub async fn apply_one(
+        &self,
+        _plugin: &SectionPlugin,
+        _caller: &CallerIdentity,
+        _operation_id: Uuid,
+        _envelope: &Envelope,
+        _section: &serde_json::Value,
+    ) -> SectionOutcomeEntry {
+        todo!("PR 5: apply mapping")
+    }
+
+    /// Call `remove` of `plugin`; mapped like [`Self::apply_one`].
+    pub async fn remove_one(
+        &self,
+        _plugin: &SectionPlugin,
+        _caller: &CallerIdentity,
+        _operation_id: Uuid,
+        _application_id: &str,
+    ) -> SectionOutcomeEntry {
+        todo!("PR 5: remove mapping")
+    }
+}
+
+fn classify(
+    key: &str,
+    answer: Result<Result<SectionSchema, SectionPluginError>, CallFailure>,
+) -> SchemaFetch {
+    match answer {
+        Ok(Ok(schema)) => SchemaFetch::Served(schema),
+        Ok(Err(SectionPluginError::NotPermitted { detail })) => {
+            tracing::info!(
+                key,
+                call = "schema",
+                detail = cut(&detail, LOG_TEXT_MAX_BYTES),
+                "application-manager: section plugin refused the caller"
+            );
+            SchemaFetch::NotPermitted { detail }
         }
         routed
     }

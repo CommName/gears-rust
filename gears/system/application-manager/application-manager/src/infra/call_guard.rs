@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use application_manager_sdk::{CallerIdentity, Envelope};
+use application_manager_sdk::{CallerIdentity, Envelope, SectionPluginError, SectionSchema};
 use async_trait::async_trait;
 use futures::FutureExt;
 use tokio::sync::Semaphore;
@@ -134,6 +135,27 @@ impl PluginCalls for CallGuard {
         )
         .await
         .map_err(CallFailure::from)
+    }
+
+    async fn apply(
+        &self,
+        _plugin: &SectionPlugin,
+        _caller: &CallerIdentity,
+        _operation_id: Uuid,
+        _envelope: &Envelope,
+        _section: &serde_json::Value,
+    ) -> Result<Result<(), SectionPluginError>, CallFailure> {
+        todo!("PR 5: call the plugin's apply through the guard")
+    }
+
+    async fn remove(
+        &self,
+        _plugin: &SectionPlugin,
+        _caller: &CallerIdentity,
+        _operation_id: Uuid,
+        _application_id: &str,
+    ) -> Result<Result<(), SectionPluginError>, CallFailure> {
+        todo!("PR 5: call the plugin's remove through the guard")
     }
 }
 

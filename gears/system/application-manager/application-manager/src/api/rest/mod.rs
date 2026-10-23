@@ -2,6 +2,7 @@
 
 pub mod dto;
 pub mod error;
+pub mod gate;
 pub mod handlers;
 pub mod health;
 pub mod routes;

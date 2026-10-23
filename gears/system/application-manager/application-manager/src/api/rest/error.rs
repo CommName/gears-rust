@@ -33,6 +33,23 @@ pub fn to_canonical(err: &DomainError, request_id: Uuid) -> CanonicalError {
                 .with_resource("section_key")
                 .create()
         }
+        DomainError::SchemaUnavailable { items } => {
+            let listed = items
+                .iter()
+                .map(|i| format!("{} ({})", i.key, i.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            unavailable(request_id, &format!("section schema unavailable: {listed}"))
+        }
+        DomainError::SectionNotPermitted { key, detail } => ApplicationError::permission_denied()
+            .with_reason(format!("request {request_id}: section {key}: {detail}"))
+            .create(),
+        DomainError::Conflict { .. }
+        | DomainError::InvalidManifest { .. }
+        | DomainError::OperationNotFound
+        | DomainError::AtCapacity
+        | DomainError::StorageUnavailable
+        | DomainError::Defect => todo!("PR 5: refusal Problems of the operations"),
     }
 }
 

@@ -7,8 +7,10 @@ use axum::http::StatusCode;
 use toolkit::api::operation_builder::ThrottlingSpec;
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
-use super::dto::{ManifestSchemaDto, SectionKeysDto, SectionSchemaDto};
+use super::dto::{AcceptedDto, ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto};
+use super::gate::RequestGate;
 use super::handlers;
+use crate::domain::orchestrator::RequestOrchestrator;
 use crate::domain::read_service::ReadService;
 
 const TAG: &str = "Application Manager";
@@ -28,12 +30,91 @@ fn manifest_schema_throttling() -> ThrottlingSpec {
     }
 }
 
-/// Register the discovery routes.
+/// Register the routes.
 pub fn register_routes(
     router: Router,
     openapi: &dyn OpenApiRegistry,
     read: Arc<ReadService>,
+    orchestrator: Arc<RequestOrchestrator>,
+    gate: Arc<RequestGate>,
 ) -> Router {
+    let router = OperationBuilder::post("/application-manager/v1/applications")
+        .operation_id("application_manager.seed")
+        .summary("Seed an application")
+        .description("Submit a manifest; answers 202 with the operation id.")
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .with_throttling(schema_read_throttling())
+        .handler(handlers::seed)
+        .json_response_with_schema::<AcceptedDto>(openapi, StatusCode::ACCEPTED, "Accepted")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_409(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::delete("/application-manager/v1/applications/{application_id}")
+        .operation_id("application_manager.uninstall_by_id")
+        .summary("Uninstall an application by id")
+        .description("The id is one percent-encoded path segment; answers 202.")
+        .tag(TAG)
+        .path_param("application_id", "The application id, percent-encoded")
+        .authenticated()
+        .no_license_required()
+        .with_throttling(schema_read_throttling())
+        .handler(handlers::uninstall_by_id)
+        .json_response_with_schema::<AcceptedDto>(openapi, StatusCode::ACCEPTED, "Accepted")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_409(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::post("/application-manager/v1/applications:uninstall")
+        .operation_id("application_manager.uninstall")
+        .summary("Uninstall an application")
+        .description("The body carries `application_id`; answers 202.")
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .with_throttling(schema_read_throttling())
+        .handler(handlers::uninstall)
+        .json_response_with_schema::<AcceptedDto>(openapi, StatusCode::ACCEPTED, "Accepted")
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_409(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::get("/application-manager/v1/operations/{operation_id}")
+        .operation_id("application_manager.get_operation")
+        .summary("Read one operation")
+        .description("The operation record and, once final, its outcome report.")
+        .tag(TAG)
+        .path_param("operation_id", "The operation id")
+        .authenticated()
+        .no_license_required()
+        .with_throttling(schema_read_throttling())
+        .handler(handlers::get_operation)
+        .json_response_with_schema::<OperationDto>(openapi, StatusCode::OK, "Operation")
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_429(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     let router = OperationBuilder::get("/application-manager/v1/section-keys")
         .operation_id("application_manager.list_section_keys")
         .summary("List section keys")
@@ -93,7 +174,10 @@ pub fn register_routes(
         .error_503(openapi)
         .register(router, openapi);
 
-    router.layer(axum::Extension(read))
+    router
+        .layer(axum::Extension(read))
+        .layer(axum::Extension(orchestrator))
+        .layer(axum::Extension(gate))
 }
 
 #[cfg(test)]

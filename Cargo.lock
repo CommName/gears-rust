@@ -1836,6 +1836,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
+ "bytes",
  "cf-gears-application-manager-sdk",
  "cf-gears-authz-resolver",
  "cf-gears-noop-section-plugin",

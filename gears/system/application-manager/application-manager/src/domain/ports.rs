@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use application_manager_sdk::{
     CallerIdentity, Envelope, OutcomeReport, RequestCategory, SectionOutcome, SectionPluginError,
+    CallerIdentity, Envelope, OutcomeReport, RequestCategory, SectionPluginError, SectionSchema,
 };
 use async_trait::async_trait;
 use toolkit_macros::domain_model;
@@ -14,6 +15,47 @@ use crate::domain::operation::{
     Accepted, ApplicationRecord, NewOperation, OpenOperation, Operation,
 };
 use crate::domain::plugin_set::SectionPlugin;
+
+/// Why platform access control did not permit an action.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AccessError {
+    /// Access control cannot answer: an evaluation failure or no answer
+    /// within `pdp_call_timeout` (outcome rank 1).
+    #[error("access control cannot answer")]
+    Unavailable,
+    /// Denied, a constraint compile failure, or a permit with any constraint
+    /// (outcome rank 2).
+    #[error("not permitted")]
+    NotPermitted,
+}
+
+/// Platform access control for the gear-level actions of
+/// [`crate::domain::actions`].
+#[async_trait]
+pub trait AccessControl: Send + Sync {
+    /// Decide whether the caller may perform `action`, as a platform-level
+    /// permission with no context tenant (ADR 0005).
+    ///
+    /// `application_id` is sent to the PDP as the resource property
+    /// `application_id`, only when it is within the limits (DESIGN 3.3); the
+    /// schema reads pass `None`.
+    ///
+    /// # Errors
+    /// [`AccessError`] when the action is not permitted or cannot be decided.
+    async fn authorize(
+        &self,
+        ctx: &SecurityContext,
+        action: Action,
+        application_id: Option<&str>,
+    ) -> Result<(), AccessError>;
+}
+
+/// The wall clock, a port so tests can set the time.
+pub trait Clock: Send + Sync {
+    /// The current time.
+    fn now(&self) -> OffsetDateTime;
+}
 
 /// Why a bounded plugin call produced no plugin answer
 /// (`cpt-cf-application-manager-component-plugin-call-guard`).
@@ -51,6 +93,25 @@ pub trait PluginCalls: Send + Sync {
 
     /// Remove the application `application_id` through `plugin` on behalf of
     /// `caller`, within operation `operation_id`.
+    ) -> Result<Result<SectionSchema, SectionPluginError>, CallFailure>;
+
+    /// Apply `section` of the manifest of `envelope` through `plugin`.
+    ///
+    /// # Errors
+    /// [`CallFailure`] when the call produced no plugin answer.
+    async fn apply(
+        &self,
+        plugin: &SectionPlugin,
+        caller: &CallerIdentity,
+        operation_id: Uuid,
+        envelope: &Envelope,
+        section: &serde_json::Value,
+    ) -> Result<Result<(), SectionPluginError>, CallFailure>;
+
+    /// Remove the data of `application_id` through `plugin`.
+    ///
+    /// # Errors
+    /// [`CallFailure`] when the call produced no plugin answer.
     async fn remove(
         &self,
         plugin: &SectionPlugin,
@@ -58,6 +119,7 @@ pub trait PluginCalls: Send + Sync {
         operation_id: Uuid,
         application_id: &str,
     ) -> CallResult;
+    ) -> Result<Result<(), SectionPluginError>, CallFailure>;
 }
 
 /// Why a storage step produced no result.

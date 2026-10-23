@@ -9,6 +9,8 @@ pub mod allowed_callers;
 pub mod error;
 pub mod history;
 pub mod operation;
+pub mod orchestrator;
+pub mod outcome;
 pub mod plugin_set;
 pub mod ports;
 pub mod read_service;
