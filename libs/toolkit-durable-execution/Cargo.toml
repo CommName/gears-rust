@@ -22,6 +22,12 @@ test-util = ["tokio/rt"]
 # PostgreSQL and subprocess recovery tests (testcontainers).
 integration = []
 
+# The unit and integration suites live under `tests/` but are compiled into the
+# library's own test build through `#[cfg(test)] #[path = "../tests/..."]`
+# modules, which cargo-shear cannot follow, so it reports the files as unlinked.
+[package.metadata.cargo-shear]
+ignored-paths = ["tests/unit/*.rs", "tests/integration/*.rs"]
+
 [lints]
 workspace = true
 

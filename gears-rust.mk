@@ -408,7 +408,7 @@ test-graph-storage-pg: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg
+	pricing-pg coord-pg products-pg ledger-pg orders-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -580,6 +580,16 @@ lane_args_products-pg = -p cf-gears-bss-products --run-ignored ignored-only -E '
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not test(grain_fold_timing)' --no-fail-fast
 
+## bss-orders' Postgres tier (Docker required; testcontainers).
+##
+## Same `--run-ignored ignored-only` shape as ledger and products: every Orders test that starts a
+## PostgreSQL container is `#[ignore]` with the Docker reason — the lib's `infra::storage::tests`
+## modules and the gear-boot tests in `gear::tests` — and the attribute marks nothing else, so
+## there is no binary or name filter. The unit tier keeps the config, codec and REST-surface tests
+## that need no container (D-224).
+## `--no-fail-fast` for the reason the pricing lane gives.
+lane_args_orders-pg = -p cf-gears-bss-orders --run-ignored ignored-only --no-fail-fast
+
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))
 
@@ -709,8 +719,8 @@ coverage-durable-execution-pg:
 ## compiles once.
 test-fips: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
-		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-oagw/fips
+	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-toolkit-http-proxy -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
+		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-toolkit-http-proxy/fips,cf-gears-oagw/fips
 
 GM_PG_TAG := $(shell sed -n 's/^pub const POSTGRES_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
 GM_MARIADB_TAG := $(shell sed -n 's/^pub const MARIADB_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
@@ -962,6 +972,14 @@ coverage-e2e-local: check-prereq-e2e-local
 
 .PHONY: mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
 
+# Dockerfiles that use BuildKit cache mounts need the Buildx CLI plugin. Without
+# it `docker build` stops at "BuildKit is enabled but the buildx component is
+# missing or broken", which does not say which plugin to install. $(1) is the
+# Dockerfile that needs it.
+define check_docker_buildx
+    @docker buildx version >/dev/null 2>&1 || (echo "ERROR: 'docker buildx' is not available, and $(1) uses BuildKit cache mounts. Install the Buildx plugin for your Docker distribution - see 'Prepare environment > Docker' in docs/web-docs/build-with-gears/index.mdx." && exit 1)
+endef
+
 ## Build mini-chat Docker image for K8s (dev build by default, RELEASE=1 for optimized)
 ## On linux: builds on host (reuses local target/), then packages the binary.
 ## On other OS: full multi-stage Docker build with BuildKit caching.
@@ -983,6 +1001,7 @@ ifeq ($(shell uname -s),Linux)
 	@rm -rf .docker-stage
 else
 	@echo "==> Non-linux host: full Docker build"
+	$(call check_docker_buildx,mini-chat.Dockerfile)
 	DOCKER_BUILDKIT=1 docker build \
 		-f gears/mini-chat/deploy/docker/mini-chat.Dockerfile \
 		--build-arg CARGO_FEATURES="$(MINI_CHAT_K8S_FEATURES)" \
