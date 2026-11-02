@@ -4,9 +4,8 @@
 ///
 /// From `apply` and `remove`, `Rejected` gives `rejected`, `NotPermitted` gives
 /// `not_permitted`, and `Internal` gives `internal_failure` and is only
-/// logged. The `detail` of `Rejected` and `NotPermitted` is returned cut at
-/// [`crate::PLUGIN_DETAIL_MAX_BYTES`]. From `schema`, see
-/// [`crate::SectionPluginClientV1::schema`] for the mapping.
+/// logged. The `detail` of `Rejected` and `NotPermitted` is returned to the
+/// caller cut at the gear's `PLUGIN_DETAIL_MAX_BYTES`.
 ///
 /// `#[non_exhaustive]` allows additive changes within v1.
 #[derive(Debug, Clone, thiserror::Error)]

@@ -8,14 +8,6 @@ struct FakePlugin;
 
 #[async_trait]
 impl SectionPluginClientV1 for FakePlugin {
-    async fn key(&self) -> Result<String, SectionPluginError> {
-        Ok("fake".to_owned())
-    }
-
-    async fn schema(&self, _caller: &CallerIdentity) -> Result<SectionSchema, SectionPluginError> {
-        Ok(SectionSchema::new(serde_json::json!({}), "v1"))
-    }
-
     async fn apply(
         &self,
         _caller: &CallerIdentity,

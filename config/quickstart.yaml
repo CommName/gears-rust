@@ -515,6 +515,20 @@ gears:
       # must match static-credstore-plugin (default "constructorfabric").
       vendor: "constructorfabric"
 
+  application-manager:
+    config:
+      plugin_call_timeout: "10s"
+      run_window_margin: "30s"
+      operation_retention: "7d"
+      plugin_max_in_flight: 4
+      max_request_tasks: 16
+      max_envelope_text_length: 255
+      pdp_call_timeout: "2s"
+      allowed_callers:
+        - identity: { type: KubernetesServiceAccount, namespace: deploy, service_account: app-seeder }
+          actions: [seed, uninstall, read_schema, read_operation]
+      storage_call_timeout: "2s"
+
   settings-service:
     database:
       server: "sqlite_users"

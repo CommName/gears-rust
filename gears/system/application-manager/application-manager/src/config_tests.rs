@@ -21,21 +21,36 @@ fn with(field: &str, value: Value) -> Value {
     v
 }
 
-fn with_all(fields: &[(&str, Value)]) -> Value {
-    let mut v = valid_json();
-    for (k, val) in fields {
-        v[*k] = val.clone();
-    }
-    v
-}
-
 fn ms(n: u64) -> Value {
     json!(format!("{n}ms"))
 }
 
+fn service_account(namespace: &str, name: &str) -> Value {
+    json!({
+        "type": "KubernetesServiceAccount",
+        "namespace": namespace,
+        "service_account": name
+    })
+}
+
+fn entry(identity: Value, actions: Value) -> Value {
+    let mut v = json!({});
+    v["identity"] = identity;
+    v["actions"] = actions;
+    v
+}
+
+fn with_callers(entries: Value) -> Value {
+    with("allowed_callers", entries)
+}
+
+fn valid_struct() -> ApplicationManagerConfig {
+    parse(valid_json()).unwrap()
+}
+
 #[test]
 fn config_parse_complete_block_with_humantime_values() {
-    let cfg = parse(valid_json()).unwrap();
+    let cfg = valid_struct();
     assert_eq!(cfg.plugin_call_timeout, Duration::from_secs(10));
     assert_eq!(cfg.run_window_margin, Duration::from_secs(30));
     assert_eq!(cfg.operation_retention, Duration::from_hours(7 * 24));
@@ -43,6 +58,21 @@ fn config_parse_complete_block_with_humantime_values() {
     assert_eq!(cfg.max_request_tasks, 16);
     assert_eq!(cfg.max_envelope_text_length, 255);
     assert_eq!(cfg.pdp_call_timeout, Duration::from_secs(2));
+    assert_eq!(
+        cfg.allowed_callers,
+        vec![AllowedCallerEntry {
+            identity: AllowedIdentity::KubernetesServiceAccount {
+                namespace: "deploy".to_owned(),
+                service_account: "app-seeder".to_owned(),
+            },
+            actions: vec![
+                CallerAction::Seed,
+                CallerAction::Uninstall,
+                CallerAction::ReadSchema,
+                CallerAction::ReadOperation,
+            ],
+        }]
+    );
     assert_eq!(cfg.storage_call_timeout, Duration::from_secs(2));
 }
 
@@ -56,6 +86,7 @@ fn config_parse_missing_one_field_fails() {
         "max_request_tasks",
         "max_envelope_text_length",
         "pdp_call_timeout",
+        "allowed_callers",
         "storage_call_timeout",
     ];
     for field in fields {
@@ -81,15 +112,15 @@ fn config_parse_bad_duration_fails() {
 
 #[test]
 fn config_validate_valid_block_passes() {
-    parse(valid_json()).unwrap().validate().unwrap();
+    valid_struct().validate().unwrap();
 }
 
 #[test]
 fn config_validate_rules_table() {
     // (name, overrides, expected failing setting or None for ok)
-    let deadline_ms = u64::try_from(GATEWAY_REQUEST_DEADLINE.as_millis()).unwrap();
-    // pdp + 3 * storage == deadline: storage 2s, pdp 24s.
-    let pdp_at_budget = deadline_ms - 3 * 2000;
+    // 3 x 10s is exactly the 30s deadline.
+    assert_eq!(GATEWAY_REQUEST_DEADLINE, Duration::from_secs(30));
+    let storage_at_budget = 10_000;
     let cases: Vec<(&str, Value, Option<&str>)> = vec![
         (
             "plugin_call_zero",
@@ -106,38 +137,7 @@ fn config_validate_rules_table() {
             with("run_window_margin", ms(0)),
             Some("run_window_margin"),
         ),
-        (
-            "margin_zero_with_storage_zero",
-            with_all(&[
-                ("run_window_margin", ms(0)),
-                ("storage_call_timeout", ms(0)),
-            ]),
-            Some("run_window_margin"),
-        ),
-        (
-            "margin_and_storage_max_overflow_doubling",
-            with_all(&[
-                ("run_window_margin", json!("18446744073709551615s")),
-                ("storage_call_timeout", json!("18446744073709551615s")),
-            ]),
-            Some("run_window_margin"),
-        ),
-        (
-            "margin_equals_twice_storage",
-            with_all(&[
-                ("run_window_margin", ms(4000)),
-                ("storage_call_timeout", ms(2000)),
-            ]),
-            None,
-        ),
-        (
-            "margin_one_ms_below_twice_storage",
-            with_all(&[
-                ("run_window_margin", ms(3999)),
-                ("storage_call_timeout", ms(2000)),
-            ]),
-            Some("run_window_margin"),
-        ),
+        ("margin_one_ms", with("run_window_margin", ms(1)), None),
         (
             "retention_zero",
             with("operation_retention", ms(0)),
@@ -192,25 +192,46 @@ fn config_validate_rules_table() {
             Some("pdp_call_timeout"),
         ),
         (
+            "pdp_large_does_not_count_in_budget",
+            with("pdp_call_timeout", json!("1h")),
+            None,
+        ),
+        ("callers_empty_list", with_callers(json!([])), None),
+        (
+            "callers_empty_actions",
+            with_callers(json!([entry(service_account("deploy", "a"), json!([]))])),
+            Some("allowed_callers"),
+        ),
+        (
+            "callers_duplicate_identity",
+            with_callers(json!([
+                entry(service_account("deploy", "a"), json!(["seed"])),
+                entry(service_account("deploy", "a"), json!(["uninstall"])),
+            ])),
+            Some("allowed_callers"),
+        ),
+        (
+            "callers_same_name_other_namespace",
+            with_callers(json!([
+                entry(service_account("deploy", "a"), json!(["seed"])),
+                entry(service_account("ops", "a"), json!(["seed"])),
+            ])),
+            None,
+        ),
+        (
             "storage_zero",
             with("storage_call_timeout", ms(0)),
             Some("storage_call_timeout"),
         ),
         (
             "budget_equals_deadline",
-            with_all(&[
-                ("pdp_call_timeout", ms(pdp_at_budget)),
-                ("storage_call_timeout", ms(2000)),
-            ]),
+            with("storage_call_timeout", ms(storage_at_budget)),
             None,
         ),
         (
             "budget_one_ms_over_deadline",
-            with_all(&[
-                ("pdp_call_timeout", ms(pdp_at_budget + 1)),
-                ("storage_call_timeout", ms(2000)),
-            ]),
-            Some("pdp_call_timeout"),
+            with("storage_call_timeout", ms(storage_at_budget + 1)),
+            Some("storage_call_timeout"),
         ),
     ];
     for (name, input, expected) in cases {
@@ -242,6 +263,13 @@ fn config_validate_reports_first_failing_rule_in_table_order() {
         max_request_tasks: 0,
         max_envelope_text_length: 0,
         pdp_call_timeout: Duration::ZERO,
+        allowed_callers: vec![AllowedCallerEntry {
+            identity: AllowedIdentity::Spiffe {
+                trust_domain: "example.org".to_owned(),
+                name: "seeder".to_owned(),
+            },
+            actions: vec![],
+        }],
         storage_call_timeout: Duration::ZERO,
     };
     assert_eq!(cfg.validate().unwrap_err().setting, "plugin_call_timeout");
@@ -261,44 +289,118 @@ fn config_validate_reports_first_failing_rule_in_table_order() {
     cfg.max_envelope_text_length = 1;
     assert_eq!(cfg.validate().unwrap_err().setting, "pdp_call_timeout");
     cfg.pdp_call_timeout = Duration::from_secs(1);
+    assert_eq!(cfg.validate().unwrap_err().setting, "allowed_callers");
+    cfg.allowed_callers.clear();
     assert_eq!(cfg.validate().unwrap_err().setting, "storage_call_timeout");
     cfg.storage_call_timeout = Duration::from_millis(500);
     cfg.validate().unwrap();
 }
 
 #[test]
-fn config_validate_huge_durations_error_at_budget_without_panic() {
-    let base = ApplicationManagerConfig {
-        plugin_call_timeout: Duration::from_secs(1),
-        run_window_margin: Duration::from_secs(30),
-        operation_retention: Duration::from_secs(1),
-        plugin_max_in_flight: 1,
-        max_request_tasks: 1,
-        max_envelope_text_length: 1,
-        pdp_call_timeout: Duration::from_secs(1),
-        storage_call_timeout: Duration::from_secs(1),
+fn config_validate_huge_storage_timeout_errors_without_panic() {
+    let cfg = ApplicationManagerConfig {
+        storage_call_timeout: Duration::MAX,
+        ..valid_struct()
     };
-    // Case A: 2x storage fits so the margin rule passes; 3x overflows.
-    let a = ApplicationManagerConfig {
-        run_window_margin: Duration::MAX,
-        pdp_call_timeout: Duration::from_secs(1),
-        storage_call_timeout: Duration::from_secs(u64::MAX >> 1),
-        ..base
-    };
-    assert_eq!(a.validate().unwrap_err().setting, "pdp_call_timeout");
-    // Case B: 3x storage fits, adding the pdp timeout overflows.
-    let b = ApplicationManagerConfig {
-        pdp_call_timeout: Duration::MAX,
-        ..base
-    };
-    assert_eq!(b.validate().unwrap_err().setting, "pdp_call_timeout");
+    assert_eq!(cfg.validate().unwrap_err().setting, "storage_call_timeout");
+}
+
+#[test]
+fn config_parse_spiffe_entry() {
+    let cfg = parse(with_callers(json!([entry(
+        json!({ "type": "Spiffe", "trust_domain": "example.org", "name": "seeder" }),
+        json!(["read_operation"])
+    )])))
+    .unwrap();
+    assert_eq!(
+        cfg.allowed_callers[0].identity,
+        AllowedIdentity::Spiffe {
+            trust_domain: "example.org".to_owned(),
+            name: "seeder".to_owned(),
+        }
+    );
+    assert_eq!(
+        cfg.allowed_callers[0].actions,
+        vec![CallerAction::ReadOperation]
+    );
+}
+
+#[test]
+fn config_parse_refuses_other_identity_kinds_actions_and_fields() {
+    let cases = [
+        (
+            "shared_identity",
+            entry(json!({ "type": "Shared", "name": "dev" }), json!(["seed"])),
+        ),
+        (
+            "unknown_identity",
+            entry(json!({ "type": "Robot", "name": "r" }), json!(["seed"])),
+        ),
+        (
+            "unknown_action",
+            entry(service_account("deploy", "a"), json!(["delete_everything"])),
+        ),
+        (
+            "unknown_identity_field",
+            entry(
+                json!({
+                    "type": "KubernetesServiceAccount",
+                    "namespace": "deploy",
+                    "service_account": "a",
+                    "pod": "p"
+                }),
+                json!(["seed"]),
+            ),
+        ),
+        (
+            "unknown_entry_field",
+            json!({
+                "identity": service_account("deploy", "a"),
+                "actions": ["seed"],
+                "note": "x"
+            }),
+        ),
+    ];
+    for (name, bad) in cases {
+        assert!(parse(with_callers(json!([bad]))).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn config_allowed_callers_error_names_index_not_identity() {
+    let err = parse(with_callers(json!([
+        entry(service_account("deploy", "secret-seeder"), json!(["seed"])),
+        entry(service_account("deploy", "secret-seeder"), json!(["seed"])),
+    ])))
+    .unwrap()
+    .validate()
+    .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.starts_with("invalid_setting: allowed_callers: entry 1 "),
+        "{text}"
+    );
+    assert!(!text.contains("secret-seeder"), "{text}");
+    assert!(!text.contains("deploy"), "{text}");
+
+    let err = parse(with_callers(json!([
+        entry(service_account("deploy", "a"), json!(["seed"])),
+        entry(service_account("deploy", "b"), json!([])),
+    ])))
+    .unwrap()
+    .validate()
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid_setting: allowed_callers: entry 1 has no actions"
+    );
 }
 
 #[test]
 fn config_invalid_setting_display_has_prefix_setting_and_reason() {
     let e = InvalidSetting {
         setting: "max_request_tasks",
-        reason: "must be at least 1",
+        reason: "must be at least 1".into(),
     };
     assert_eq!(
         e.to_string(),
@@ -322,11 +424,11 @@ fn config_reasons_state_the_limits_of_the_constants() {
         "{too_long}"
     );
 
-    let over_budget = parse(with("pdp_call_timeout", json!("1h")))
+    let over_budget = parse(with("storage_call_timeout", json!("1h")))
         .unwrap()
         .validate()
         .unwrap_err();
-    assert_eq!(over_budget.setting, "pdp_call_timeout");
+    assert_eq!(over_budget.setting, "storage_call_timeout");
     assert!(
         over_budget
             .reason

@@ -3,10 +3,36 @@
 use toolkit::gts::PluginV1;
 use toolkit_gts::{gts_id, gts_type_schema};
 
+/// Abstract base of every section type.
+///
+/// Each section plugin registers, in its own `init`, a type derived directly
+/// from this base. The derived type's schema is the section's content rules as
+/// JSON Schema Draft-07, and the gear reads it once at `start`.
+///
+/// The section key is the derived segment without its version and trailing
+/// `~`:
+///
+/// ```text
+/// gts.cf.core.application_manager.section.v1~acme.iam.access.roles.v1.2~  ->  acme.iam.access.roles
+/// ```
+///
+/// Two versions of one section type therefore share a key.
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = true,
+    gts_abstract = true,
+    type_id = gts_id!("cf.core.application_manager.section.v1~"),
+    description = "Application Manager section base type",
+    properties = "",
+)]
+pub struct ApplicationManagerSectionV1;
+
 /// GTS type definition for section plugin instances.
 ///
 /// Each section plugin registers an instance of this type in its own `init`.
-/// Its priority is the instance `priority`, unique across plugins.
+/// Its priority is the instance `priority`, unique across plugins, and its
+/// `section_type` is the GTS id of the exact version of its derived section
+/// type.
 ///
 /// # Instance ID Format
 ///
@@ -23,7 +49,7 @@ use toolkit_gts::{gts_id, gts_type_schema};
 /// fn registration() -> Result<(), Box<dyn std::error::Error>> {
 ///     let (_instance_id, _payload) =
 ///         PluginV1::<ApplicationManagerSectionPluginSpecV1>::build_registration(
-///             "acme.billing.section.v1",
+///             "acme.iam.access_section_plugin.v1",
 ///             "acme",
 ///             100,
 ///         )?;
@@ -36,11 +62,15 @@ use toolkit_gts::{gts_id, gts_type_schema};
     base = PluginV1,
     type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.application_manager_section.plugin.v1~"),
     description = "Application Manager section plugin specification",
-    properties = "",
+    properties = "section_type",
 )]
-pub struct ApplicationManagerSectionPluginSpecV1;
+pub struct ApplicationManagerSectionPluginSpecV1 {
+    /// GTS id of the exact version of the plugin's derived section type.
+    #[schemars(extend("x-gts-type-ref" = "gts.cf.core.application_manager.section.v1~*"))]
+    pub section_type: String,
+}
 
-/// GTS resource type of an application, the PDP resource of ADR 0005.
+/// GTS resource type of an application, the PDP resource of ADR 0004.
 pub const APPLICATION_RESOURCE_TYPE: &str = gts_id!("cf.core.application_manager.application.v1~");
 
 #[cfg(test)]

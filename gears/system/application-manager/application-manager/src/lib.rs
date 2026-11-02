@@ -13,7 +13,8 @@ pub mod gear;
 // types-registry through the link-time inventory.
 pub use application_manager_sdk as sdk;
 pub use application_manager_sdk::{
-    ApplicationManagerSectionPluginSpecV1, SectionPluginClientV1, SectionPluginError,
+    ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1, SectionPluginClientV1,
+    SectionPluginError,
 };
 
 pub use gear::ApplicationManager;

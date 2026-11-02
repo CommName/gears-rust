@@ -67,6 +67,10 @@ async fn init_invalid_config_fails_with_invalid_setting() {
     bad_duration["plugin_call_timeout"] = json!("soon");
     let mut zero = valid_config();
     zero["max_request_tasks"] = json!(0);
+    let mut shared_caller = valid_config();
+    shared_caller["allowed_callers"][0]["identity"] = json!({ "type": "Shared", "name": "dev" });
+    let mut no_actions = valid_config();
+    no_actions["allowed_callers"][0]["actions"] = json!([]);
     let cases = vec![
         ("missing_gear_block", ctx_with(json!({}))),
         (
@@ -77,16 +81,18 @@ async fn init_invalid_config_fails_with_invalid_setting() {
         ("unknown_field", ctx_with_config(&unknown)),
         ("bad_duration", ctx_with_config(&bad_duration)),
         ("invalid_value", ctx_with_config(&zero)),
+        ("shared_caller", ctx_with_config(&shared_caller)),
+        ("caller_without_actions", ctx_with_config(&no_actions)),
     ];
     for (name, ctx) in cases {
         let gear = ApplicationManager::default();
         let err = gear.init(&ctx).await.expect_err(name);
         let text = format!("{err:#}");
         assert!(text.contains("invalid_setting"), "{name}: {text}");
-        let prefix = if name == "invalid_value" {
-            "application-manager: invalid_setting: max_request_tasks: "
-        } else {
-            "application-manager: invalid_setting: config: "
+        let prefix = match name {
+            "invalid_value" => "application-manager: invalid_setting: max_request_tasks: ",
+            "caller_without_actions" => "application-manager: invalid_setting: allowed_callers: ",
+            _ => "application-manager: invalid_setting: config: ",
         };
         assert!(text.starts_with(prefix), "{name}: {text}");
         assert!(!text.contains("invalid config for gear"), "{name}: {text}");
@@ -117,22 +123,28 @@ async fn start_and_stop_after_init_succeed() {
 }
 
 #[test]
-fn section_plugin_type_is_in_inventory_of_the_gear_test_binary() {
-    ensure_section_plugin_type_linked().unwrap();
+fn sdk_types_are_in_inventory_of_the_gear_test_binary() {
+    ensure_sdk_types_linked().unwrap();
 }
 
 #[test]
-fn section_plugin_type_missing_from_inventory_fails() {
-    let others = vec![json!({ "$id": "gts://gts.cf.other.type.v1~" }), json!({})];
-    for registered in [vec![], others] {
-        let err = ensure_section_plugin_type_registered(&registered).unwrap_err();
+fn sdk_type_missing_from_inventory_fails() {
+    let section = json!({ "$id": "gts://gts.cf.core.application_manager.section.v1~" });
+    let spec = json!({
+        "$id": "gts://gts.cf.toolkit.plugins.plugin.v1~cf.core.application_manager_section.plugin.v1~"
+    });
+    let other = json!({ "$id": "gts://gts.cf.other.type.v1~" });
+    for registered in [
+        vec![],
+        vec![other, json!({})],
+        vec![section.clone()],
+        vec![spec.clone()],
+    ] {
+        let err = ensure_sdk_types_registered(&registered).unwrap_err();
         assert!(
             format!("{err:#}").contains("is not in the type inventory"),
             "{err:#}"
         );
     }
-    let spec = json!({
-        "$id": "gts://gts.cf.toolkit.plugins.plugin.v1~cf.core.application_manager_section.plugin.v1~"
-    });
-    ensure_section_plugin_type_registered(&[spec]).unwrap();
+    ensure_sdk_types_registered(&[section, spec]).unwrap();
 }

@@ -12,6 +12,16 @@ pub fn valid_config_json() -> Value {
         "max_request_tasks": 16,
         "max_envelope_text_length": 255,
         "pdp_call_timeout": "2s",
+        "allowed_callers": [
+            {
+                "identity": {
+                    "type": "KubernetesServiceAccount",
+                    "namespace": "deploy",
+                    "service_account": "app-seeder"
+                },
+                "actions": ["seed", "uninstall", "read_schema", "read_operation"]
+            }
+        ],
         "storage_call_timeout": "2s"
     })
 }

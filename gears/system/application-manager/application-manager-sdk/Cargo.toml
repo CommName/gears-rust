@@ -31,5 +31,4 @@ toolkit-gts = { workspace = true }
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-security = { workspace = true }
-toolkit-macros = { workspace = true }
 
