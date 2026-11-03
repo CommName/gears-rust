@@ -70,6 +70,10 @@ opentelemetry = { workspace = true }
 tracing = { workspace = true }
 
 anyhow = { workspace = true }
+# The ingest queue's state lock (synchronous critical sections, no await
+# inside) and the jittered backoff of its flush retries.
+parking_lot = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
@@ -85,7 +89,9 @@ clickhouse = { workspace = true, features = ["test-util"] }
 # `CanonicalError` for the types-registry stub in the `Gear::init` tests;
 # `toolkit` does not re-export it.
 toolkit-canonical-errors = { workspace = true }
-tokio = { workspace = true }
+# `test-util` pauses the clock in the ingest-queue tests, so `max_wait`,
+# backoff and drain deadlines are exercised deterministically and instantly.
+tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 # Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="clickhouse")]-gated.
 testcontainers = { workspace = true }

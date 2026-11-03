@@ -407,6 +407,37 @@ async fn configure_insert_with_async_insert_disabled_applies_only_timeouts() {
     drop(insert);
 }
 
+/// Both modes pin `async_insert` explicitly: a server or profile default of
+/// `1` must never add a buffering layer under a statement the plugin treats
+/// as synchronous, and the group-commit flush relies on exactly that.
+#[test]
+fn insert_settings_pin_async_insert_explicitly_in_both_modes() {
+    let sync = super::insert_settings(false, Some("tok"));
+    assert_eq!(
+        sync,
+        vec![
+            ("async_insert", "0".to_owned()),
+            ("insert_deduplication_token", "tok".to_owned()),
+        ]
+    );
+    assert!(
+        !sync
+            .iter()
+            .any(|(k, _)| k.starts_with("wait_for_async") || k.starts_with("async_insert_dedup")),
+        "a synchronous insert carries no async-insert companions: {sync:?}"
+    );
+
+    let asynchronous = super::insert_settings(true, None);
+    assert_eq!(
+        asynchronous,
+        vec![
+            ("async_insert", "1".to_owned()),
+            ("wait_for_async_insert", "1".to_owned()),
+            ("async_insert_deduplicate", "1".to_owned()),
+        ]
+    );
+}
+
 // ── insert dedup window ───────────────────────────────────────────────────────
 
 /// The live `create_table_query` interleaves server defaults into `SETTINGS`;

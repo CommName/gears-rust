@@ -11,14 +11,18 @@
 //! - **No `FOR UPDATE`, no coordination lock**: `ClickHouse` has no row-level
 //!   locks and this plugin uses no external mutex. Creates are not serialised
 //!   against each other. Two concurrent creates for one dedup key can both
-//!   pass the pre-read; the engine then drops the second *block* when both
-//!   carry the same `insert_deduplication_token` ([`insert_dedup_token`],
-//!   honoured on synchronous inserts against the table's
-//!   `non_replicated_deduplication_window`) — **first-writer-wins** at the
-//!   engine — and otherwise `ReplacingMergeTree(version)` collapses the twin
-//!   rows at the next merge. Consequences: (a) the dedup pre-read is
-//!   best-effort; (b) `IdempotencyConflict` is raised only when the earlier row
-//!   is already visible at pre-read time; (c) `UsageTypeNotFound` comes from a
+//!   pass the pre-read and both write. Inside one plugin instance the ingest
+//!   queue coalesces them onto one row ([`crate::infra::storage::ingest`]);
+//!   across instances both rows are stored — each flush carries its own
+//!   `insert_deduplication_token` ([`insert_dedup_token`]), which the engine
+//!   only matches against an identical flush within the table's finite dedup
+//!   window — and every read resolves them to the highest `version`
+//!   ([`query::dedup`]). Consequences: (a) the dedup pre-read is best-effort;
+//!   (b) `IdempotencyConflict` is raised when the earlier row is already
+//!   visible at pre-read time, or is pending in this instance's queue;
+//!   differing payloads written by two instances inside each other's window
+//!   converge highest-version-wins with both callers answered `Ok` — there is
+//!   no cross-instance first-writer-wins; (c) `UsageTypeNotFound` comes from a
 //!   catalog read with no ordering guarantee against a concurrent
 //!   `create_usage_type`; (d) that same catalog read has no ordering guarantee
 //!   against a concurrent `delete_usage_type` either — the delete's own
@@ -27,20 +31,27 @@
 //!   after the sweep orphans a row. That residual is accepted by design; the
 //!   insert-time catalog check is what bounds it, since a deleted type is
 //!   refused here from the moment its catalog row is gone.
+//! - **Group commit**: with `insert_batch` enabled (the default) neither
+//!   `create` nor `create_batch` issues its own `INSERT`. Each runs its checks
+//!   and pre-read, composes its rows, and submits them to the plugin's one
+//!   [`IngestQueue`]; the batcher writes queued calls as shared synchronous
+//!   `INSERT`s through [`ChFlushSink`] and the call awaits the outcome of the
+//!   flush that carried its rows. A call's rows stay together in one flush,
+//!   so its visibility is that of one statement: one part per
+//!   `toYYYYMM(created_at)` partition and, on a cluster, per shard. The
+//!   deactivation cascade and every catalog write bypass the queue and stay
+//!   synchronous.
 //! - **No `UPDATE`**: deactivation uses versioned marker rows (INSERT with
 //!   `status = 'inactive'` and a higher `version`, same `id`) rather than
 //!   `ALTER TABLE … UPDATE` (an async mutation unsuitable for the request path).
-//! - **No `FINAL`, and no resolution on the range reads**: `get`, the
-//!   deactivation cascade and the create-path dedup lookups resolve
-//!   `ReplacingMergeTree` versions themselves over a tiny candidate set —
-//!   `ORDER BY version DESC LIMIT 1 BY <sort key>`, see [`query::dedup`]. `list`
-//!   and `aggregate` do not resolve at all: they scan raw rows and anti-join
-//!   the ids that carry a deactivation marker (`dedup::resolved_survivors` /
-//!   `dedup::active_survivors`), which is exact for deactivation before any
-//!   merge and costs one hash probe per row instead of a sort or hash
-//!   aggregation over the whole scan. Unmerged duplicate creates the engine
-//!   did not catch are visible to those two reads until the merge; the module
-//!   docs of `query::dedup` carry the full argument.
+//! - **Every read resolves versions itself**: `get`, the deactivation cascade
+//!   and the create-path dedup lookups resolve `ReplacingMergeTree` versions
+//!   over a tiny candidate set — `ORDER BY version DESC LIMIT 1 BY <sort key>`,
+//!   see [`query::dedup`]. `list` and `aggregate` read `FROM usage_records
+//!   FINAL` (`do_not_merge_across_partitions_select_final = 1`), so a
+//!   deactivation marker and a duplicate create are both collapsed before the
+//!   caller's predicates, ordering, limit or aggregation see a row. No read
+//!   waits for or depends on a background merge.
 //!
 //!   [`query::dedup`]: crate::infra::storage::query::dedup
 //! - **`?` placeholders**: `ClickHouse` uses positional `?` (not `$N`).
@@ -69,7 +80,9 @@ use crate::infra::metrics::{InsertMode, Metrics, OpDurationGuard, QueryKind, Tim
 use crate::infra::storage::entity::{
     EpochMicros, UsageRecordRow, UsageRecordStatusCode, ch_decimal128_9,
 };
-use crate::infra::storage::error::{tracked_ch_err, with_deadline};
+use crate::infra::storage::error::{classify, kind_of, tracked_ch_err, with_deadline};
+use crate::infra::storage::ingest::sink::{FlushError, FlushSink};
+use crate::infra::storage::ingest::{CallOutcome, IngestQueue, PendingCall, remaining_budget};
 use crate::infra::storage::mapper::{
     canonical_equal, current_merge_version, make_inactive_marker, record_row_key,
     version_higher_than,
@@ -78,15 +91,13 @@ use crate::infra::storage::pool::configure_insert;
 use crate::infra::storage::query::aggregate::{
     agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
 };
-use crate::infra::storage::query::dedup::{
-    RECORD_DEDUP_KEY, active_survivors, latest_by, resolved_survivors, split_version_invariant,
-};
+use crate::infra::storage::query::dedup::{RECORD_DEDUP_KEY, latest_by};
 use crate::infra::storage::query::effective_page_size;
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
 use crate::infra::storage::query::translate::{
-    SqlBind, SqlCtx, bind_one, record_column, translate_record_filter,
+    SqlBind, SqlCtx, bind_one, record_column, translate_record_conjuncts,
 };
 
 /// Static column list for every `usage_records` SELECT, in [`UsageRecordRow`]
@@ -136,7 +147,16 @@ impl InsertKind {
 /// two statements share a token exactly when they carry the same set of
 /// logical rows of the same kind.
 pub(crate) fn insert_dedup_token(rows: &[UsageRecordRow], kind: InsertKind) -> String {
-    let mut ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    insert_dedup_token_for(rows.iter(), kind)
+}
+
+/// [`insert_dedup_token`] over any row iterator (the ingest queue holds its
+/// rows behind `Arc`).
+pub(crate) fn insert_dedup_token_for<'a>(
+    rows: impl IntoIterator<Item = &'a UsageRecordRow>,
+    kind: InsertKind,
+) -> String {
+    let mut ids: Vec<Uuid> = rows.into_iter().map(|r| r.id).collect();
     ids.sort_unstable();
     ids.dedup();
     let mut buf = Vec::with_capacity(ids.len() * 16);
@@ -146,51 +166,92 @@ pub(crate) fn insert_dedup_token(rows: &[UsageRecordRow], kind: InsertKind) -> S
     Uuid::new_v5(&kind.namespace(), &buf).to_string()
 }
 
+/// Settings every `FINAL` range read (`list`, `aggregate`) carries.
+///
+/// `do_not_merge_across_partitions_select_final = 1` lets `ClickHouse`
+/// collapse each partition on its own instead of one merge across all of
+/// them. It is only correct when every version of a sort key lives in one
+/// partition, which holds here: the partition key `toYYYYMM(created_at)` is a
+/// function of the sort-key column `created_at`, and a marker or duplicate
+/// shares its source row's `created_at`. `ClickHouse` applies the optimisation
+/// automatically only when the partition key is a *prefix* of the sorting key,
+/// so it has to be stated.
+const FINAL_READ_SETTINGS: &[(&str, &str)] =
+    &[("do_not_merge_across_partitions_select_final", "1")];
+
 /// `ClickHouse`-backed implementation of [`RecordStore`] over `usage_records`.
 #[derive(Clone)]
 pub struct ChRecordStore {
     client: clickhouse::Client,
     metrics: Arc<Metrics>,
     request_timeout: Duration,
-    /// Whether `usage_records` `INSERT`s carry `async_insert = 1` /
-    /// `wait_for_async_insert = 1`
+    /// Whether direct single-row `usage_records` `INSERT`s (group commit off)
+    /// carry `async_insert = 1` / `wait_for_async_insert = 1`
     /// ([`crate::config::ClickHousePluginConfig::async_insert`]).
     async_insert: bool,
+    /// The group-commit queue every record write is submitted to; `None`
+    /// keeps the direct path (one `INSERT` per call).
+    ingest: Option<Arc<IngestQueue>>,
+}
+
+impl std::fmt::Debug for ChRecordStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChRecordStore")
+            .field("request_timeout", &self.request_timeout)
+            .field("async_insert", &self.async_insert)
+            .field("group_commit", &self.ingest.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChRecordStore {
     /// Build a store from an existing `ClickHouse` client, metric inventory,
-    /// and per-request client-side deadline.
+    /// per-request client-side deadline, and the ingest queue to write through.
     ///
     /// There is no coordination primitive to inject: every write path is a
     /// plain read-then-insert whose concurrency semantics are described in the
     /// module docs.
     ///
-    /// `request_timeout` bounds every individual `ClickHouse` await; production
-    /// wiring passes `ClickHousePluginConfig::client_deadline()`. It is an
-    /// explicit parameter rather than a defaulted builder step so a future
-    /// wiring change cannot silently leave a store on a default that disagrees
-    /// with the configured budget.
+    /// `request_timeout` bounds every individual `ClickHouse` await and, with
+    /// group commit, the whole wait for a call's flush; production wiring
+    /// passes `ClickHousePluginConfig::client_deadline()`. It is an explicit
+    /// parameter rather than a defaulted builder step so a future wiring
+    /// change cannot silently leave a store on a default that disagrees with
+    /// the configured budget.
     ///
-    /// `async_insert` selects server-side asynchronous inserts for this
-    /// store's `usage_records` writes; production wiring passes
-    /// `ClickHousePluginConfig::async_insert`. Explicit for the same reason as
-    /// `request_timeout` — a store silently defaulting to the opposite of the
-    /// configured value would change durability and part-formation behaviour
-    /// without anything failing.
+    /// `async_insert` selects server-side asynchronous inserts for the direct
+    /// single-row path; production wiring passes
+    /// `ClickHousePluginConfig::async_insert`. `ingest` is the plugin's
+    /// group-commit queue (`Some` when `insert_batch.enabled`); both are
+    /// explicit for the same reason as `request_timeout` — a store silently
+    /// defaulting to the opposite of the configured value would change
+    /// durability and part-formation behaviour without anything failing.
     #[must_use]
     pub fn new(
         client: clickhouse::Client,
         metrics: Arc<Metrics>,
         request_timeout: Duration,
         async_insert: bool,
+        ingest: Option<Arc<IngestQueue>>,
     ) -> Self {
         Self {
             client,
             metrics,
             request_timeout,
             async_insert,
+            ingest,
         }
+    }
+
+    /// The write side of the group-commit queue over this store's client:
+    /// what `Gear::init` hands to `IngestQueue::run`.
+    #[must_use]
+    pub fn flush_sink(&self) -> Arc<dyn FlushSink> {
+        Arc::new(ChFlushSink {
+            client: self.client.clone(),
+            metrics: Arc::clone(&self.metrics),
+            request_timeout: self.request_timeout,
+        })
     }
 
     /// Execute a `SELECT … FROM usage_type_catalog WHERE gts_id = ?` catalog
@@ -363,12 +424,13 @@ impl ChRecordStore {
         // Insert-time timeouts and settings both come from `configure_insert`,
         // so this site cannot drift from the batch and catalog ones.
         //
-        // The dedup token makes a racing retry of this very row a no-op at the
-        // engine — on a synchronous insert. With `async_insert = 1` on the
-        // shipped non-replicated table the token is carried but not enforced
-        // (async dedup is a `Replicated*` feature); twins that land in one
-        // flush still collapse through `optimize_on_insert`, and the rest at
-        // merge. See `config::ClickHousePluginConfig::async_insert`.
+        // The direct path, taken only with group commit disabled. The dedup
+        // token makes a racing retry of this very row a no-op at the engine —
+        // on a synchronous insert. With `async_insert = 1` on the shipped
+        // non-replicated table the token is carried but not enforced (async
+        // dedup is a `Replicated*` feature); twins are then resolved at read
+        // time like any other duplicate. See
+        // `config::ClickHousePluginConfig::async_insert`.
         let token = insert_dedup_token(std::slice::from_ref(row), InsertKind::Record);
         let mut insert: clickhouse::insert::Insert<UsageRecordRow> = configure_insert(
             {
@@ -463,11 +525,11 @@ impl ChRecordStore {
         // * `create_batch` is documented as a whole-batch write (DESIGN.md
         //   §3.6 Batch Ingest).
         //
-        // Nothing is given up by staying synchronous: async inserts exist here
-        // to stop the *one-INSERT-per-request* path writing a part per record,
-        // and a batch statement already carries up to the SPI's batch cap of
-        // rows in a single part. `insert_record` is the site that needs the
-        // buffer, and it has no cross-row invariant to lose.
+        // Nothing is given up by staying synchronous: with group commit on,
+        // this method only writes the deactivation cascade's markers; with it
+        // off, a batch statement already carries its call's rows in one part.
+        // `insert_record` is the one site the server-side buffer can help, and
+        // it has no cross-row invariant to lose.
         let mut insert: clickhouse::insert::Insert<UsageRecordRow> = configure_insert(
             {
                 with_deadline(
@@ -483,13 +545,7 @@ impl ChRecordStore {
         );
         self.metrics
             .record_pool_acquire(pool_start.elapsed().as_secs_f64());
-        // Row counts up to the batch cap (≤1000) fit exactly in f64's 52-bit mantissa.
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "batch size is bounded by the SPI wire-level batch cap (<=1000 rows)"
-        )]
-        let batch_len = rows.len() as f64;
-        self.metrics.record_batch_rows(batch_len);
+        self.metrics.record_batch_rows(as_f64(rows.len()));
 
         {
             for row in rows {
@@ -608,123 +664,141 @@ impl ChRecordStore {
         }
     }
 
-    /// Translate a caller `$filter` into its two halves: the version-invariant
-    /// conjuncts join the scan predicate (which is also repeated inside the
-    /// marker subquery, so they prune both), the `status`-naming rest is
-    /// appended after the survivor predicate, where it reads the raw `status`
-    /// that on every surviving row equals the resolved one.
+    /// Translate a caller `$filter` into conjuncts of the one `WHERE`, binding
+    /// in text order.
     ///
-    /// The split itself, and why it is sound for `OR`/`NOT`, is
-    /// [`split_version_invariant`]. Two things this call order guarantees:
-    ///
-    /// - **Bind order.** `ClickHouse` `?` is positional left-to-right and the
-    ///   scan predicate (twice) precedes the trailing conjuncts in the emitted
-    ///   text, so the invariant half must be translated first — its binds are
-    ///   applied first too.
-    /// - **Clause order within the scan half.** Callers push the metadata
-    ///   side-channel before calling this, so `inner_ctx` already holds those
-    ///   binds and the appended conjuncts land after them in both the text and
-    ///   the bind list.
-    fn push_split_filter(
+    /// The read paths carry a single `WHERE` over a `FINAL` read, so every
+    /// conjunct — key-prefix predicates, metadata, `status`, the keyset tuple —
+    /// lands in the same clause list in the order it is pushed, and `ctx`
+    /// accumulates the binds in exactly that order ([`translate_record_conjuncts`]
+    /// flattens the top-level `AND` spine so the key-prefix conjuncts stay
+    /// visible to the primary-key analysis).
+    fn push_filter(
         node: &FilterNode<UsageRecordFilterField>,
-        inner_ctx: &mut SqlCtx,
-        inner_clauses: &mut Vec<String>,
-        outer_ctx: &mut SqlCtx,
-        outer_clauses: &mut Vec<String>,
+        ctx: &mut SqlCtx,
+        clauses: &mut Vec<String>,
     ) -> Result<(), UsageCollectorPluginError> {
-        let (invariant, version_dependent) = split_version_invariant(node);
-        for conjunct in invariant {
-            let fragment = translate_record_filter(conjunct, inner_ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            inner_clauses.push(fragment);
-        }
-        for conjunct in version_dependent {
-            let fragment = translate_record_filter(conjunct, outer_ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            outer_clauses.push(fragment);
-        }
+        let conjuncts =
+            translate_record_conjuncts(node, ctx).map_err(UsageCollectorPluginError::internal)?;
+        clauses.extend(conjuncts);
         Ok(())
     }
 
-    /// Assemble the single-level aggregate query text.
+    /// Assemble the aggregate query text.
     ///
     /// Split out of [`RecordStore::aggregate`] so the text is unit-testable
     /// without a live `ClickHouse`.
     ///
     /// ```text
-    /// SELECT <aliased_select> FROM usage_records
-    /// WHERE <scan> AND status = 'active' AND id NOT IN (SELECT id FROM usage_records WHERE <scan> AND status = 'inactive')
-    ///   [AND <outer_clauses>]
+    /// SELECT <aliased_select> FROM usage_records FINAL
+    /// WHERE <clauses joined by AND>
     /// [GROUP BY 1, …] [LIMIT …]
     /// ```
     ///
-    /// One `WHERE`, in three parts:
-    ///
-    /// 1. `scan` — `inner_clauses` joined, every version-invariant predicate
-    ///    (`gts_id`, the `corrects_id` partition, metadata side-channel, the
-    ///    invariant half of `$filter`, subject guards). It prunes the scan.
-    /// 2. the survivor predicate (`dedup::active_survivors`), which embeds the
-    ///    *same* `scan` text so the marker subquery prunes identically. That is
-    ///    why the caller binds `gts_id` and the scan binds twice, and why the
-    ///    aggregate no longer needs a version-resolving level at all — one
-    ///    physical row per active logical row survives, and the only `GROUP BY`
-    ///    is the caller's dimension grouping.
-    /// 3. `outer_clauses` — the `status`-naming half of `$filter`, which is
-    ///    sound on the raw column here because every survivor's raw `status`
-    ///    equals its resolved status. Empty for the common call.
-    ///
-    /// The `WHERE` is never empty (`gts_id = ?` is always the first scan
-    /// clause), so no branch omits it.
+    /// One level, one `WHERE`. `FINAL` collapses every sort key to its highest
+    /// `version` before the predicates apply, so `status = 'active'` (always
+    /// among `clauses`) drops deactivated rows — their surviving version is the
+    /// marker — and a duplicate create is one row. The only `GROUP BY` is the
+    /// caller's dimension grouping. The `WHERE` is never empty: `gts_id = ?` is
+    /// always the first clause.
     fn build_aggregate_sql(
         aliased_select: &str,
-        inner_clauses: &[String],
-        outer_clauses: &[String],
+        clauses: &[String],
         group_by: &str,
         limit_clause: &str,
     ) -> String {
-        let scan = inner_clauses.join(" AND ");
-        let mut where_parts = vec![scan.clone(), active_survivors(&scan)];
-        where_parts.extend(outer_clauses.iter().cloned());
         format!(
-            "SELECT {aliased_select} FROM usage_records WHERE {}{group_by}{limit_clause}",
-            where_parts.join(" AND ")
+            "SELECT {aliased_select} FROM usage_records FINAL WHERE {}{group_by}{limit_clause}",
+            clauses.join(" AND ")
         )
     }
 
-    /// Assemble the single-level keyset-list query text.
+    /// Assemble the keyset-list query text.
     ///
     /// Split out of [`RecordStore::list`] for the same reason as
     /// [`Self::build_aggregate_sql`].
     ///
     /// ```text
-    /// SELECT <RECORD_COLUMNS> FROM usage_records
-    /// WHERE <scan> AND (status = 'inactive' OR id NOT IN (SELECT id FROM usage_records WHERE <scan> AND status = 'inactive'))
-    ///   [AND <outer_clauses>]
+    /// SELECT <RECORD_COLUMNS> FROM usage_records FINAL
+    /// WHERE <clauses joined by AND>
     /// ORDER BY <order_sql> LIMIT <limit>
     /// ```
     ///
-    /// Same three-part `WHERE` as the aggregate, with `dedup::resolved_survivors`
-    /// as the survivor predicate because `list` returns inactive rows too: a
-    /// marker survives as the resolved row it is, an active row survives iff
-    /// no marker exists for its id. `outer_clauses` carries the `status`-naming
-    /// half of `$filter` and the keyset tuple predicate (which may name
-    /// `status`); both read the raw column, which on every survivor equals the
-    /// resolved value. `limit` is the caller's look-ahead `LIMIT` (page size
-    /// plus one) and applies after every predicate, so a filtered page is never
-    /// short.
-    fn build_list_sql(
-        inner_clauses: &[String],
-        outer_clauses: &[String],
-        order_sql: &str,
-        limit: u64,
-    ) -> String {
-        let scan = inner_clauses.join(" AND ");
-        let mut where_parts = vec![scan.clone(), resolved_survivors(&scan)];
-        where_parts.extend(outer_clauses.iter().cloned());
+    /// `list` returns inactive rows too, so there is no `status` clause of its
+    /// own: `FINAL` makes each logical row visible once, at its resolved
+    /// status, and the caller's `status` filter, the keyset tuple and the
+    /// `ORDER BY` all read that resolved row. `limit` is the caller's
+    /// look-ahead `LIMIT` (page size plus one) and applies after every
+    /// predicate, so a filtered page is never short.
+    fn build_list_sql(clauses: &[String], order_sql: &str, limit: u64) -> String {
         format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records WHERE {} ORDER BY {order_sql} LIMIT {limit}",
-            where_parts.join(" AND ")
+            "SELECT {RECORD_COLUMNS} FROM usage_records FINAL WHERE {} ORDER BY {order_sql} LIMIT {limit}",
+            clauses.join(" AND ")
         )
+    }
+
+    /// Submit a call's composed rows to the group-commit queue and await the
+    /// flush that carries them, within what is left of the request budget.
+    ///
+    /// # Errors
+    ///
+    /// Admission errors (`Transient` on a bound, `Internal` for an oversize
+    /// call) and the wait's own `Transient` (budget exhausted, queue stopped);
+    /// each applies to every row of the call.
+    async fn write_through_queue(
+        queue: &IngestQueue,
+        rows: Vec<UsageRecordRow>,
+        budget: Duration,
+    ) -> Result<CallOutcome, UsageCollectorPluginError> {
+        queue.submit(PendingCall { rows })?.wait(budget).await
+    }
+}
+
+/// The group-commit queue's write side over the store's `ClickHouse` client:
+/// one synchronous `INSERT` per flush, classified for the batcher's policy.
+pub(crate) struct ChFlushSink {
+    client: clickhouse::Client,
+    metrics: Arc<Metrics>,
+    request_timeout: Duration,
+}
+
+#[async_trait]
+impl FlushSink for ChFlushSink {
+    /// One `INSERT` of exactly `rows` under `token`, always synchronous
+    /// (`async_insert = 0`): the flush *is* the batching layer, and the
+    /// durability ack and the engine-side token check both depend on the
+    /// statement committing before it returns. Classification happens here,
+    /// where the `ClickHouse` error is still at hand (`error::classify`).
+    async fn insert(&self, rows: &[Arc<UsageRecordRow>], token: &str) -> Result<(), FlushError> {
+        let started = Instant::now();
+        let acquired = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client.insert("usage_records"),
+        )
+        .await
+        .map_err(|error| FlushError {
+            kind: kind_of(&error),
+            error,
+        })?;
+        self.metrics
+            .record_pool_acquire(started.elapsed().as_secs_f64());
+        let mut insert: clickhouse::insert::Insert<UsageRecordRow> =
+            configure_insert(acquired, self.request_timeout, false, Some(token));
+        let classified = |e: &clickhouse::error::Error| FlushError {
+            kind: classify(e),
+            error: tracked_ch_err(&self.metrics, e),
+        };
+        for row in rows {
+            insert
+                .write(row.as_ref())
+                .await
+                .map_err(|e| classified(&e))?;
+        }
+        insert.end().await.map_err(|e| classified(&e))?;
+        self.metrics
+            .record_insert(InsertMode::Flush, started.elapsed().as_secs_f64());
+        Ok(())
     }
 }
 
@@ -750,7 +824,7 @@ impl ChRecordStore {
 /// key column) must stay ahead of `idempotency_key` (which is not in the sort
 /// key). Postgres enforces its own order through a real `UNIQUE` index and has
 /// no such constraint.
-type DedupKey = (Uuid, String, i64, String);
+pub(crate) type DedupKey = (Uuid, String, i64, String);
 
 /// Build the catalog existence query for a batch's distinct `gts_id`s:
 /// `SELECT gts_id FROM usage_type_catalog WHERE gts_id IN (?, ?, …)`.
@@ -877,7 +951,7 @@ fn record_dedup_key(r: &UsageRecord) -> DedupKey {
     )
 }
 
-fn row_dedup_key(r: &UsageRecordRow) -> DedupKey {
+pub(crate) fn row_dedup_key(r: &UsageRecordRow) -> DedupKey {
     (
         r.tenant_id,
         r.gts_id.clone(),
@@ -932,14 +1006,16 @@ fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollec
 ///
 /// [`UsageCollectorPluginError`] is intentionally not `Clone` (it is a
 /// foundation-owned SPI contract type — `cpt-cf-usage-collector-dod-*
-/// -plugin-contract-stability`), so [`ChRecordStore::create_batch`]
-/// reconstructs an equivalent value per variant instead of cloning a shared
-/// instance. Its producers — [`ChRecordStore::existing_usage_types`],
+/// -plugin-contract-stability`), so [`ChRecordStore::create_batch`] and the
+/// ingest queue reconstruct an equivalent value per variant instead of
+/// cloning a shared instance. The read producers — [`ChRecordStore::existing_usage_types`],
 /// [`ChRecordStore::batch_dedup_lookup`] and [`ChRecordStore::insert_records`]
-/// — only yield `Transient` / `Internal`; the `UsageTypeNotFound` arm is kept
-/// so a caller-visible variant is never downgraded should a producer change,
-/// and the fallback arm exists only because the enum is `#[non_exhaustive]`.
-fn err_for_slot(err: &UsageCollectorPluginError) -> UsageCollectorPluginError {
+/// — only yield `Transient` / `Internal`; the queue adds `IdempotencyConflict`
+/// (a row refused against a differing pending row). The `UsageTypeNotFound`
+/// arm is kept so a caller-visible variant is never downgraded should a
+/// producer change, and the fallback arm exists only because the enum is
+/// `#[non_exhaustive]`.
+pub(crate) fn err_for_slot(err: &UsageCollectorPluginError) -> UsageCollectorPluginError {
     match err {
         UsageCollectorPluginError::Transient {
             detail,
@@ -947,6 +1023,13 @@ fn err_for_slot(err: &UsageCollectorPluginError) -> UsageCollectorPluginError {
         } => UsageCollectorPluginError::Transient {
             detail: detail.clone(),
             retry_after_seconds: *retry_after_seconds,
+        },
+        UsageCollectorPluginError::IdempotencyConflict {
+            idempotency_key,
+            existing_id,
+        } => UsageCollectorPluginError::IdempotencyConflict {
+            idempotency_key: idempotency_key.clone(),
+            existing_id: *existing_id,
         },
         UsageCollectorPluginError::UsageTypeNotFound { gts_id } => {
             UsageCollectorPluginError::UsageTypeNotFound {
@@ -958,6 +1041,36 @@ fn err_for_slot(err: &UsageCollectorPluginError) -> UsageCollectorPluginError {
         }
         other => UsageCollectorPluginError::internal(other.to_string()),
     }
+}
+
+/// Fan the group-commit queue's per-row outcomes out across the slots each
+/// composed row backs. A row's `Ok` leaves its slots as the composition
+/// decided them (the composed record); a row's error — the flush failure, or
+/// an `IdempotencyConflict` against a differing pending row — is written to
+/// every slot behind it.
+fn apply_row_outcomes(
+    outcome: CallOutcome,
+    row_slots: &[Vec<usize>],
+    outcomes: &mut [Option<Result<UsageRecord, UsageCollectorPluginError>>],
+) {
+    for (row_idx, result) in outcome.rows.into_iter().enumerate() {
+        let Err(err) = result else {
+            continue;
+        };
+        for &idx in row_slots.get(row_idx).map_or(&[][..], Vec::as_slice) {
+            if let Some(slot) = outcomes.get_mut(idx) {
+                *slot = Some(Err(err_for_slot(&err)));
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a batch is bounded by the gear's batch cap, far below f64's mantissa"
+)]
+fn as_f64(n: usize) -> f64 {
+    n as f64
 }
 
 /// Fan a failed batch write out across the outcome slots that depended on it.
@@ -1076,23 +1189,30 @@ impl ChRecordStore {
 impl RecordStore for ChRecordStore {
     // @cpt-flow:cpt-cf-uc-ch-plugin-seq-ingest-dedup
     /// Create one record: local value check, catalog existence check, dedup
-    /// pre-read, `INSERT`.
+    /// pre-read, then the write — through the group-commit queue when it is
+    /// enabled, as its own `INSERT` otherwise.
     ///
     /// The value check ([`unrepresentable_value`]) runs before any statement:
     /// a `value` the `Decimal128(9)` column cannot hold exactly is rejected
     /// rather than rounded, and never reaches the backend.
     ///
-    /// The three statements are independent — nothing serialises two creates
-    /// for the same dedup key, so both can pass the pre-read and both insert.
-    /// They share a sort key (`id` is derived from the dedup tuple), so
-    /// `ReplacingMergeTree(version)` converges them to the higher `version`;
-    /// a differing payload inside that window is resolved last-writer-wins
-    /// rather than reported as `IdempotencyConflict`. Once the earlier row is
-    /// visible the pre-read sees it and the usual absorb / conflict rules
+    /// The statements are independent — nothing serialises two creates for
+    /// the same dedup key, so both can pass the pre-read. In this instance the
+    /// queue then coalesces the second onto the first (identical payload) or
+    /// refuses it as `IdempotencyConflict` (differing payload); across
+    /// instances both rows are written and every read resolves them to the
+    /// higher `version`, so a differing payload converges
+    /// highest-version-wins rather than being reported. Once the earlier row
+    /// is visible the pre-read sees it and the usual absorb / conflict rules
     /// apply.
+    ///
+    /// The whole call — pre-checks, queue wait and flush — must fit the
+    /// client-side deadline: what the pre-checks used is subtracted from the
+    /// budget the queue wait gets.
     #[instrument(skip(self, record), fields(gts_id = %record.gts_id.as_ref()))]
     async fn create(&self, record: UsageRecord) -> Result<UsageRecord, UsageCollectorPluginError> {
         let op_start = Instant::now();
+        let entered = tokio::time::Instant::now();
         if let Some(err) = unrepresentable_value(&record) {
             return Err(err);
         }
@@ -1107,15 +1227,31 @@ impl RecordStore for ChRecordStore {
         }
 
         let row = UsageRecordRow::from((&record, current_merge_version()));
-        self.insert_record(&row, op_start).await?;
+        match &self.ingest {
+            Some(queue) => {
+                let budget = remaining_budget(entered, self.request_timeout);
+                let outcome = Self::write_through_queue(queue, vec![row.clone()], budget).await?;
+                outcome.rows.into_iter().next().unwrap_or_else(|| {
+                    Err(UsageCollectorPluginError::internal(
+                        "ingest outcome carried no row (invariant break)",
+                    ))
+                })?;
+                self.metrics
+                    .record_insert(InsertMode::Single, op_start.elapsed().as_secs_f64());
+            }
+            None => self.insert_record(&row, op_start).await?,
+        }
         UsageRecord::try_from(row)
     }
 
     // @cpt-flow:cpt-cf-uc-ch-plugin-seq-ingest-batch
-    /// Create a batch with three statements regardless of how many usage
-    /// types it spans: one catalog existence query over the distinct
-    /// `gts_id`s, one dedup pre-read over every record that passed it, one
-    /// multi-row `INSERT` of the composed rows.
+    /// Create a batch with two read statements regardless of how many usage
+    /// types it spans — one catalog existence query over the distinct
+    /// `gts_id`s, one dedup pre-read over every record that passed it — and
+    /// one write of the composed rows: a submission to the group-commit queue
+    /// (the rows travel together in one flush `INSERT`, possibly alongside
+    /// other calls' rows), or a multi-row `INSERT` of their own when group
+    /// commit is off.
     ///
     /// Before the first statement, a local value check
     /// ([`split_by_representable`]) decides every record whose `value` the
@@ -1124,13 +1260,16 @@ impl RecordStore for ChRecordStore {
     ///
     /// Outcomes are positional. A failed catalog or dedup read is a failure
     /// for every slot that depended on it (every slot that passed the value
-    /// check for the catalog read); a failed `INSERT` is reported only
-    /// in the slots backed by a composed row, so rows absorbed from storage
-    /// keep the outcome the pre-read decided. The single `INSERT` commits one
-    /// part per `toYYYYMM(created_at)` partition it touches, so a reader sees
-    /// all of the batch's rows for a given month or none of them; a batch
-    /// spanning several months can be observed part-way through (see
-    /// [`Self::insert_records`]).
+    /// check for the catalog read); a failed write is reported only in the
+    /// slots backed by a composed row, so rows absorbed from storage keep the
+    /// outcome the pre-read decided, and with group commit each composed row
+    /// carries its own outcome (a row coalesced onto a pending twin succeeds
+    /// or fails with that twin; one refused against a differing pending row is
+    /// an `IdempotencyConflict`). The write commits one part per
+    /// `toYYYYMM(created_at)` partition it touches (and per shard on a
+    /// cluster), so a reader sees all of the batch's rows for a given month or
+    /// none of them; a batch spanning several months can be observed part-way
+    /// through (see [`Self::insert_records`]).
     #[instrument(skip(self, records), fields(batch_size = records.len()))]
     async fn create_batch(
         &self,
@@ -1147,6 +1286,7 @@ impl RecordStore for ChRecordStore {
         }
 
         let op_start = Instant::now();
+        let entered = tokio::time::Instant::now();
         let mut outcomes: Vec<Option<Result<UsageRecord, UsageCollectorPluginError>>> =
             (0..records.len()).map(|_| None).collect();
 
@@ -1189,16 +1329,36 @@ impl RecordStore for ChRecordStore {
         let (to_insert, row_slots) =
             self.compose_batch(&records, &passed, &existing, base, &mut outcomes);
 
-        // 4. One multi-row INSERT (a no-op when nothing was composed). A failed
-        //    write does not invalidate the outcomes already decided for
-        //    absorbed rows, so it is reported per backed slot rather than as a
-        //    batch-level error that would discard them too.
-        if let Err(e) = self
-            .insert_records(&to_insert, op_start, InsertKind::Record)
-            .await
-        {
-            tracing::warn!(error = %e, "create-batch insert failed; reporting per-record outcomes");
-            apply_insert_failure(&e, &row_slots, &mut outcomes);
+        // 4. One write of the composed rows (a no-op when nothing was
+        //    composed). A failed write does not invalidate the outcomes
+        //    already decided for absorbed rows, so it is reported per backed
+        //    slot rather than as a batch-level error that would discard them.
+        match &self.ingest {
+            Some(queue) if !to_insert.is_empty() => {
+                self.metrics.record_batch_rows(as_f64(to_insert.len()));
+                let budget = remaining_budget(entered, self.request_timeout);
+                match Self::write_through_queue(queue, to_insert, budget).await {
+                    Ok(outcome) => {
+                        apply_row_outcomes(outcome, &row_slots, &mut outcomes);
+                        self.metrics
+                            .record_insert(InsertMode::Batch, op_start.elapsed().as_secs_f64());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "create-batch write failed; reporting per-record outcomes");
+                        apply_insert_failure(&e, &row_slots, &mut outcomes);
+                    }
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Err(e) = self
+                    .insert_records(&to_insert, op_start, InsertKind::Record)
+                    .await
+                {
+                    tracing::warn!(error = %e, "create-batch insert failed; reporting per-record outcomes");
+                    apply_insert_failure(&e, &row_slots, &mut outcomes);
+                }
+            }
         }
 
         Ok(finalize_outcomes(outcomes, &records))
@@ -1212,13 +1372,10 @@ impl RecordStore for ChRecordStore {
         // mismatched-`id` twin (the case `prefer_dedup_row` exists for) lets
         // one `id` span two sort keys. A global highest-`version` pick could
         // then return a row that is not its own key's resolved version.
-        // Resolving per key and taking the first row is what `FINAL` plus
-        // `fetch_optional` did.
-        //
-        // The `use_skip_indexes_if_final*` settings that used to accompany this
-        // query are gone with `FINAL`: `idx_records_id` is consulted for this
-        // non-sort-key-prefix `id` predicate by default once no merge-on-read
-        // is involved.
+        // Resolving per key and taking the first row keeps this a bloom-filter
+        // point read (`idx_records_id` prunes the non-sort-key-prefix `id`
+        // predicate) over a candidate set of a few rows — cheaper than a
+        // `FINAL` merge for a single key.
         let resolve_latest = latest_by(RECORD_DEDUP_KEY);
         let sql =
             format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = ?{resolve_latest}");
@@ -1253,49 +1410,31 @@ impl RecordStore for ChRecordStore {
         let limit =
             effective_page_size(query.limit, crate::infra::storage::query::DEFAULT_PAGE_SIZE);
 
-        // The `WHERE` has two halves (see `Self::build_list_sql`), so the binds
-        // are collected in two contexts and applied scan-then-trailing to
-        // match the order the `?`s appear in the text.
+        // One `WHERE` over a `FINAL` read (see `Self::build_list_sql`): every
+        // clause is pushed into `clauses` in text order and its binds into
+        // `ctx` in the same order, so applying `ctx.binds` after the leading
+        // `gts_id` bind matches the `?`s exactly.
         //
-        // The scan half takes every predicate over version-invariant columns:
-        // `gts_id`, the metadata side-channel, and the version-invariant half
-        // of the caller `$filter` (`Self::push_split_filter`) — which is where
-        // `tenant_id` and `created_at`, two thirds of the key prefix, arrive.
-        // It is rendered twice — as the scan predicate and inside the marker
-        // subquery — so its binds are applied twice.
-        //
-        // The trailing half takes the `status`-naming half of the `$filter`
-        // and the whole keyset predicate, after the survivor predicate. Both
-        // read the raw `status` column, which on every surviving row equals the
-        // resolved status (`dedup::resolved_survivors`). The keyset predicate
-        // stays whole — it is a lexicographic tuple over the sort order, not a
-        // conjunction that can be split, and it may name `status`.
-        //
-        // `gts_id = ?` is bound separately and is the first `?` in each copy.
-        let mut inner_ctx = SqlCtx::new();
-        let mut inner_clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
-        let mut outer_ctx = SqlCtx::new();
-        let mut outer_clauses: Vec<String> = Vec::new();
+        // The key-prefix predicates — `tenant_id` and `created_at`, which
+        // reach `list` only through `$filter` — are conjuncts of that one
+        // `WHERE`, where the primary-key analysis prunes the read on them; the
+        // `status`-naming conjuncts and the keyset tuple sit beside them and
+        // read the resolved row `FINAL` produced.
+        let mut ctx = SqlCtx::new();
+        let mut clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
 
-        // Metadata side-channel — pushed before `$filter` so the inner binds
-        // precede the outer ones.
-        Self::push_metadata_filters(metadata_filter, &mut inner_ctx, &mut inner_clauses);
+        // Metadata side-channel.
+        Self::push_metadata_filters(metadata_filter, &mut ctx, &mut clauses);
 
-        // `$filter` (validated AST → typed node → parameterised fragments),
-        // split inner/outer on version-invariance.
+        // `$filter` (validated AST → typed node → parameterised conjuncts).
         if let Some(expr) = query.filter() {
             let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
                 .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            Self::push_split_filter(
-                &node,
-                &mut inner_ctx,
-                &mut inner_clauses,
-                &mut outer_ctx,
-                &mut outer_clauses,
-            )?;
+            Self::push_filter(&node, &mut ctx, &mut clauses)?;
         }
 
-        // Keyset continuation (forward only).
+        // Keyset continuation (forward only). The predicate stays whole — it
+        // is a lexicographic tuple over the sort order, not a conjunction.
         if let Some(cursor) = query.cursor.as_ref() {
             ensure_forward_cursor(cursor).map_err(UsageCollectorPluginError::internal)?;
             if cursor.f.as_deref() != query.filter_hash.as_deref() {
@@ -1320,33 +1459,24 @@ impl RecordStore for ChRecordStore {
                 record_column,
                 |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
                 is_keyset_safe_record_field,
-                &mut outer_ctx,
+                &mut ctx,
             )
             .map_err(UsageCollectorPluginError::internal)?;
-            outer_clauses.push(predicate);
+            clauses.push(predicate);
         }
 
         let order_sql = render_order_by(&query.order, record_column)
             .map_err(UsageCollectorPluginError::internal)?;
 
-        let sql = Self::build_list_sql(
-            &inner_clauses,
-            &outer_clauses,
-            &order_sql,
-            limit.saturating_add(1),
-        );
+        let sql = Self::build_list_sql(&clauses, &order_sql, limit.saturating_add(1));
 
-        // Scan binds twice (scan predicate, then the marker subquery), then the
-        // trailing binds — the order the `?`s appear in `build_list_sql`.
-        let mut q = self.client.query(&sql);
-        for _ in 0..2 {
-            q = q.bind(gts_id.as_ref());
-            for b in &inner_ctx.binds {
-                q = bind_one(q, b);
-            }
-        }
-        for b in &outer_ctx.binds {
+        // `gts_id` first, then every clause bind in text order.
+        let mut q = self.client.query(&sql).bind(gts_id.as_ref());
+        for b in &ctx.binds {
             q = bind_one(q, b);
+        }
+        for (name, value) in FINAL_READ_SETTINGS {
+            q = q.with_setting(*name, *value);
         }
 
         let mut rows: Vec<UsageRecordRow> =
@@ -1412,71 +1542,52 @@ impl RecordStore for ChRecordStore {
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
 
-        // Same two-half `WHERE` as `list` (see `Self::build_aggregate_sql`):
-        // the version-invariant predicates form the scan half, rendered twice
-        // (scan and marker subquery); the survivor predicate
-        // (`dedup::active_survivors`) keeps one raw row per *active* logical
-        // row, so no version-resolving level is needed and aggregating the
-        // survivors directly counts neither a deactivated row nor its marker;
-        // only the `status`-naming half of the caller `$filter` — which may be
-        // an unsplittable `OR` / `NOT` over any allowlisted column — trails,
-        // reading the raw `status` that on every survivor equals the resolved
-        // one.
+        // One `WHERE` over a `FINAL` read, as in `list` (see
+        // `Self::build_aggregate_sql`): `FINAL` collapses every sort key to its
+        // highest version, so `status = 'active'` on the resolved row drops a
+        // deactivated record (its surviving version is the marker) and a
+        // duplicate create is one row; no further resolution step is needed
+        // and the only `GROUP BY` is the caller's dimension grouping.
         //
-        // Pushing the invariant half of the `$filter` into the scan half
-        // matters most here: `tenant_id` and `created_at` reach this method
-        // only through `$filter`, and with `gts_id` they are the whole key
-        // prefix, so an aggregate over one tenant's time window is a key-range
-        // scan (twice — the marker subquery prunes on the same range).
+        // Pushing the whole `$filter` into that `WHERE` matters most here:
+        // `tenant_id` and `created_at` reach this method only through
+        // `$filter`, and with `gts_id` they are the whole key prefix, so an
+        // aggregate over one tenant's time window is a key-range read.
         //
-        // Binds are collected in two contexts and applied scan-twice-then-
-        // trailing to match the `?` order in the emitted text; the SELECT-list
-        // metadata binds precede both (see below).
-        let mut inner_ctx = SqlCtx::new();
-        let mut inner_clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
-        let mut outer_ctx = SqlCtx::new();
-        // Only the `status`-naming half of the caller `$filter` can land here,
-        // so this vector is empty for the common call.
-        let mut outer_clauses: Vec<String> = Vec::new();
+        // Binds are applied in text order: the SELECT-list metadata keys first
+        // (see below), then `gts_id`, then every clause bind.
+        let mut ctx = SqlCtx::new();
+        let mut clauses: Vec<String> =
+            vec!["gts_id = ?".to_owned(), "status = 'active'".to_owned()];
 
-        // `corrects_id` partition (plugin-spi.md §Method 3). `corrects_id` is
-        // version-invariant, so this prunes the scan.
+        // `corrects_id` partition (plugin-spi.md §Method 3).
         if let Some(clause) = corrects_id_partition_clause(spec.op) {
-            inner_clauses.push(clause.to_owned());
+            clauses.push(clause.to_owned());
         }
 
-        // Metadata side-channel — pushed before `$filter` so the inner binds
-        // precede the outer ones.
-        Self::push_metadata_filters(metadata_filter, &mut inner_ctx, &mut inner_clauses);
+        // Metadata side-channel.
+        Self::push_metadata_filters(metadata_filter, &mut ctx, &mut clauses);
 
-        // `$filter`, split inner/outer on version-invariance.
+        // `$filter`.
         if let Some(expr) = query.filter() {
             let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
                 .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            Self::push_split_filter(
-                &node,
-                &mut inner_ctx,
-                &mut inner_clauses,
-                &mut outer_ctx,
-                &mut outer_clauses,
-            )?;
+            Self::push_filter(&node, &mut ctx, &mut clauses)?;
         }
 
         // Dimension SELECT exprs + subject-not-null guards.
-        // SELECT-list binds (metadata keys) are collected separately from both
-        // WHERE contexts: they appear first in the SQL text and must be applied
+        // SELECT-list binds (metadata keys) are collected separately from the
+        // WHERE context: they appear first in the SQL text and must be applied
         // before `gts_id` and every WHERE `?`.
         let mut select_dims: Vec<String> = Vec::with_capacity(spec.group_by.len());
         let mut select_binds: Vec<SqlBind> = Vec::new();
         for dim in &spec.group_by {
             match dim {
-                // Both guards are over version-invariant columns, so they
-                // belong in the scan half with the rest of the pruning.
                 AggregationDimension::SubjectId => {
-                    inner_clauses.push("subject_id IS NOT NULL".to_owned());
+                    clauses.push("subject_id IS NOT NULL".to_owned());
                 }
                 AggregationDimension::SubjectType => {
-                    inner_clauses.push("subject_type IS NOT NULL".to_owned());
+                    clauses.push("subject_type IS NOT NULL".to_owned());
                 }
                 _ => {}
             }
@@ -1518,32 +1629,22 @@ impl RecordStore for ChRecordStore {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let sql = Self::build_aggregate_sql(
-            &aliased_select,
-            &inner_clauses,
-            &outer_clauses,
-            &group_by,
-            &limit_clause,
-        );
+        let sql = Self::build_aggregate_sql(&aliased_select, &clauses, &group_by, &limit_clause);
 
         // Bind order matches left-to-right `?` in `sql`: SELECT metadata keys,
-        // then `gts_id` and the scan binds for the scan predicate, then
-        // `gts_id` and the scan binds again for the marker subquery, then the
-        // trailing (`$filter` status half) binds.
+        // then `gts_id`, then the clause binds.
         let mut q = self
             .client
             .query(&sql)
             .with_setting("output_format_json_quote_decimals", "1");
+        for (name, value) in FINAL_READ_SETTINGS {
+            q = q.with_setting(*name, *value);
+        }
         for b in &select_binds {
             q = bind_one(q, b);
         }
-        for _ in 0..2 {
-            q = q.bind(gts_id.as_ref());
-            for b in &inner_ctx.binds {
-                q = bind_one(q, b);
-            }
-        }
-        for b in &outer_ctx.binds {
+        q = q.bind(gts_id.as_ref());
+        for b in &ctx.binds {
             q = bind_one(q, b);
         }
 

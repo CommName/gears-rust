@@ -10,11 +10,12 @@
 //!
 //! **Shard-colocation invariant.** `usage_records` is sharded by
 //! `cityHash64(tenant_id)`. A deactivation marker clones its source row
-//! (`mapper::make_inactive_marker`), and a compensation row belongs to the
-//! tenant of the row it corrects, so every version of a row — and every row an
-//! `id NOT IN (SELECT id … status = 'inactive')` anti-join must see — lives on
-//! one shard. That is what makes `distributed_product_mode = 'local'` (see
-//! [`Topology::client_settings`]) exact rather than an approximation.
+//! (`mapper::make_inactive_marker`), a duplicate create carries the same
+//! tenant, and a compensation row belongs to the tenant of the row it
+//! corrects, so every version of a row lives on one shard. That is what makes
+//! the per-shard `FINAL` collapse of `list` / `aggregate` exact (each shard
+//! sees every version of its keys, so the initiator never receives two rows
+//! for one key) and the shard-local `LIMIT 1 BY` of the point reads complete.
 
 use crate::config::ClickHousePluginConfig;
 
@@ -66,11 +67,12 @@ impl Topology {
     /// Settings attached to the shared client — and therefore to every request
     /// — in this topology. Empty on a single node.
     ///
-    /// * `distributed_product_mode = 'local'` — rewrites the `IN` subqueries
-    ///   over `usage_records` to the shard-local table, so each shard
-    ///   anti-joins against its own markers. Exact by the shard-colocation
-    ///   invariant (module docs); without it `ClickHouse` rejects the
-    ///   subquery (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
+    /// * `distributed_product_mode = 'local'` — would rewrite an `IN` / `JOIN`
+    ///   subquery over `usage_records` to the shard-local table. The request
+    ///   path issues none today (the range reads collapse versions with
+    ///   `FINAL`), so the setting is inert; it is kept so a future subquery is
+    ///   shard-local by the colocation invariant (module docs) instead of
+    ///   being refused outright (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
     /// * `optimize_skip_unused_shards = 1` — a query pinning `tenant_id`
     ///   reads only the owning shard.
     /// * `skip_unavailable_shards = 0` — pinned so a server settings profile

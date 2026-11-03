@@ -2,8 +2,8 @@ use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, ODataValue};
 use usage_collector_sdk::UsageRecordFilterField;
 
 use super::{
-    SqlBind, SqlCtx, record_column, translate_record_filter, translate_usage_type_filter,
-    usage_type_column,
+    SqlBind, SqlCtx, record_column, translate_record_conjuncts, translate_record_filter,
+    translate_usage_type_filter, usage_type_column,
 };
 
 fn record_node_status_eq_active() -> FilterNode<UsageRecordFilterField> {
@@ -284,5 +284,69 @@ fn not_wraps_inner_fragment() {
 #[test]
 fn default_ctx_starts_empty() {
     let ctx = SqlCtx::default();
+    assert!(ctx.binds.is_empty());
+}
+
+// ── translate_record_conjuncts ───────────────────────────────────────────────
+
+/// `<name> eq 'x'` — the value is irrelevant to the spine walk.
+fn eq(name: &str) -> FilterNode<UsageRecordFilterField> {
+    let field = <UsageRecordFilterField as FilterField>::from_name(name).unwrap();
+    FilterNode::binary(field, FilterOp::Eq, ODataValue::String("x".to_owned()))
+}
+
+/// The shape the gateway sends — tenant, `[from, to)` window, status — is one
+/// conjunct per comparison, each its own fragment, bound in text order.
+#[test]
+fn conjuncts_split_the_top_level_and_spine() {
+    let node = FilterNode::and(vec![eq("tenant_id"), eq("resource_id"), eq("status")]);
+    let mut ctx = SqlCtx::new();
+    let out = translate_record_conjuncts(&node, &mut ctx).unwrap();
+    assert_eq!(out, vec!["tenant_id = ?", "resource_id = ?", "status = ?"]);
+    assert_eq!(ctx.binds.len(), 3);
+}
+
+/// Nested `AND`s are flattened; the primary-key analysis sees bare conjuncts.
+#[test]
+fn nested_and_spine_is_flattened() {
+    let node = FilterNode::and(vec![
+        eq("tenant_id"),
+        FilterNode::and(vec![eq("resource_id"), FilterNode::and(vec![eq("status")])]),
+    ]);
+    let mut ctx = SqlCtx::new();
+    let out = translate_record_conjuncts(&node, &mut ctx).unwrap();
+    assert_eq!(out, vec!["tenant_id = ?", "resource_id = ?", "status = ?"]);
+}
+
+/// An `OR` or `NOT` is not a conjunction: it stays one parenthesised fragment.
+#[test]
+fn or_and_not_stay_whole_conjuncts() {
+    let node = FilterNode::and(vec![
+        eq("tenant_id"),
+        FilterNode::or(vec![eq("status"), eq("resource_id")]),
+        FilterNode::not(eq("subject_id")),
+    ]);
+    let mut ctx = SqlCtx::new();
+    let out = translate_record_conjuncts(&node, &mut ctx).unwrap();
+    assert_eq!(
+        out,
+        vec![
+            "tenant_id = ?",
+            "(status = ? OR resource_id = ?)",
+            "NOT (subject_id = ?)"
+        ]
+    );
+    assert_eq!(ctx.binds.len(), 4);
+}
+
+/// An empty `AND` spine yields no conjunct at all, so a caller emits no clause.
+/// Translating it whole would render a bare `()`, which `ClickHouse` rejects as
+/// a syntax error.
+#[test]
+fn empty_and_yields_no_conjuncts() {
+    let node: FilterNode<UsageRecordFilterField> = FilterNode::and(Vec::new());
+    let mut ctx = SqlCtx::new();
+    let out = translate_record_conjuncts(&node, &mut ctx).unwrap();
+    assert!(out.is_empty());
     assert!(ctx.binds.is_empty());
 }

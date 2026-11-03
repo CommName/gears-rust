@@ -13,7 +13,10 @@ use super::super::entity::{
     EpochMicros, RawMetadata, UsageRecordRow, UsageRecordStatusCode, UsageTypeKindCode,
     UsageTypeRow, ValidatedMetadata,
 };
-use super::{canonical_equal, make_inactive_marker, record_row_key, version_higher_than};
+use super::{
+    canonical_equal, canonical_equal_rows, make_inactive_marker, record_row_key,
+    version_higher_than,
+};
 
 const VALID_GTS_ID: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
 
@@ -380,4 +383,46 @@ fn epoch_micros_rejects_out_of_range_value() {
     let err = OffsetDateTime::try_from(EpochMicros(i64::MAX))
         .expect_err("i64::MAX microseconds is far past year 9999");
     assert!(matches!(err, UsageCollectorPluginError::Internal(_)));
+}
+
+// ── canonical_equal_rows ─────────────────────────────────────────────────────
+
+/// Two composed rows compare by the same predicate the dedup pre-read uses:
+/// an identical payload is equal whatever its `version`, `status` or
+/// `ingested_at`; a differing `value` is not.
+#[test]
+fn canonical_equal_rows_agrees_with_canonical_equal() {
+    let id = Uuid::from_u128(11);
+    let base = UsageRecordRow {
+        id,
+        tenant_id: Uuid::from_u128(2),
+        gts_id: VALID_GTS_ID.to_owned(),
+        value: Decimal::new(5, 0),
+        created_at: 1_700_000_000_000_000,
+        resource_id: "res".to_owned(),
+        resource_type: "vm".to_owned(),
+        subject_id: None,
+        subject_type: None,
+        idempotency_key: "k".to_owned(),
+        corrects_id: None,
+        status: UsageRecordStatusCode::Active,
+        metadata: HashMap::new(),
+        ingested_at: 1,
+        version: 1,
+    };
+    let mut twin = base.clone();
+    twin.version = 9;
+    twin.ingested_at = 9;
+    twin.status = UsageRecordStatusCode::Inactive;
+    assert!(canonical_equal_rows(&base, &twin).unwrap());
+
+    let mut differing = base.clone();
+    differing.value = Decimal::new(6, 0);
+    assert!(!canonical_equal_rows(&base, &differing).unwrap());
+
+    let incoming = UsageRecord::try_from(twin.clone()).unwrap();
+    assert_eq!(
+        canonical_equal_rows(&base, &twin).unwrap(),
+        canonical_equal(&base, &incoming).unwrap()
+    );
 }

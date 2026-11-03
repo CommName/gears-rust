@@ -35,6 +35,31 @@ const DURATION_BOUNDARIES_SECS: &[f64] = &[
 /// so write amortization is observable (`uc_clickhouse_batch_rows`).
 const BATCH_ROW_BOUNDARIES: &[f64] = &[1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0];
 
+/// Seconds-valued bucket boundaries for the ingest queue's wait and age
+/// histograms: finer at the low end than [`DURATION_BOUNDARIES_SECS`], since
+/// `insert_batch.max_wait_ms` defaults to tens of milliseconds.
+const QUEUE_WAIT_BOUNDARIES_SECS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+
+/// Row-count boundaries for one group-commit flush, spanning a lone call up
+/// to the default `insert_batch.max_rows` and beyond.
+const FLUSH_ROW_BOUNDARIES: &[f64] = &[
+    1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10_000.0, 50_000.0,
+];
+
+/// Estimated-byte boundaries for one group-commit flush (1 KiB … 64 MiB).
+const FLUSH_BYTE_BOUNDARIES: &[f64] = &[
+    1024.0,
+    16_384.0,
+    65_536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+];
+
 /// Bounded metric label keys and values.
 ///
 /// Centralizing the `&'static str` constants keeps every call site on the
@@ -47,6 +72,47 @@ pub mod label {
     pub const MODE_SINGLE: &str = "single";
     /// `mode` value: a batch (multi-row) ingest.
     pub const MODE_BATCH: &str = "batch";
+    /// `mode` value: one group-commit flush `INSERT` (several calls' rows).
+    pub const MODE_FLUSH: &str = "flush";
+
+    /// Label key for the outstanding-work state dimension.
+    pub const STATE: &str = "state";
+    /// `state` value: admitted, not yet cut into a flush.
+    pub const STATE_QUEUED: &str = "queued";
+    /// `state` value: cut into a flush whose `INSERT` has not resolved.
+    pub const STATE_IN_FLIGHT: &str = "in_flight";
+
+    /// Label key for the flush / drain outcome dimension.
+    pub const OUTCOME: &str = "outcome";
+    /// `outcome` value: the flush `INSERT` succeeded.
+    pub const OUTCOME_OK: &str = "ok";
+    /// `outcome` value: a transient failure after bounded retries.
+    pub const OUTCOME_TRANSIENT: &str = "transient";
+    /// `outcome` value: a non-retryable failure fanned out to every waiter.
+    pub const OUTCOME_INTERNAL: &str = "internal";
+    /// `outcome` value: a row-attributable failure, retried per call.
+    pub const OUTCOME_ISOLATED: &str = "isolated";
+    /// `outcome` value: a transient failure with no waiter left to retry for.
+    pub const OUTCOME_ABANDONED: &str = "abandoned";
+    /// `outcome` value: the flush task ended before it resolved its rows.
+    pub const OUTCOME_ABORTED: &str = "aborted";
+    /// `outcome` value (drain): every flush completed within the deadline.
+    pub const OUTCOME_DRAINED: &str = "drained";
+    /// `outcome` value (drain): in-flight flushes were aborted at the deadline.
+    pub const OUTCOME_DEADLINE: &str = "deadline";
+
+    /// Label key for the admission-rejection reason dimension.
+    pub const REASON: &str = "reason";
+    /// `reason` value: the outstanding-call bound.
+    pub const REASON_CALLS: &str = "calls";
+    /// `reason` value: the outstanding-row bound.
+    pub const REASON_ROWS: &str = "rows";
+    /// `reason` value: the outstanding-byte bound.
+    pub const REASON_BYTES: &str = "bytes";
+    /// `reason` value: the call alone exceeds an outstanding bound.
+    pub const REASON_OVERSIZE: &str = "oversize";
+    /// `reason` value: admission is closed (shutting down).
+    pub const REASON_CLOSED: &str = "closed";
 
     /// Label key for the query-kind dimension.
     pub const QUERY_KIND: &str = "query_kind";
@@ -68,10 +134,14 @@ pub mod label {
 /// pass an arbitrary string into the bounded label set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertMode {
-    /// A single-row ingest (`mode = "single"`).
+    /// A single-record create as the caller observes it (`mode = "single"`):
+    /// pre-checks, queue wait and flush included when group commit is on.
     Single,
-    /// A batch (multi-row) ingest (`mode = "batch"`).
+    /// A batch create as the caller observes it (`mode = "batch"`).
     Batch,
+    /// One group-commit flush `INSERT` (`mode = "flush"`): the statement
+    /// alone, which may carry several calls' rows.
+    Flush,
 }
 
 impl InsertMode {
@@ -80,7 +150,240 @@ impl InsertMode {
         match self {
             Self::Single => label::MODE_SINGLE,
             Self::Batch => label::MODE_BATCH,
+            Self::Flush => label::MODE_FLUSH,
         }
+    }
+}
+
+/// Outstanding-work state behind the `state` label of the
+/// `uc_clickhouse_ingest_outstanding_*` gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutstandingState {
+    /// Admitted, not yet cut into a flush.
+    Queued,
+    /// Cut into a flush whose `INSERT` has not resolved.
+    InFlight,
+}
+
+impl OutstandingState {
+    pub(crate) const fn as_label(self) -> &'static str {
+        match self {
+            Self::Queued => label::STATE_QUEUED,
+            Self::InFlight => label::STATE_IN_FLIGHT,
+        }
+    }
+}
+
+/// Flush outcome behind the `outcome` label of `uc_clickhouse_flushes_total`
+/// and `uc_clickhouse_flush_duration_seconds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// The `INSERT` succeeded; every row is committed.
+    Ok,
+    /// A transient failure survived the bounded retries.
+    Transient,
+    /// A non-retryable failure, fanned out to every waiter.
+    Internal,
+    /// A row-attributable failure; each call was retried once on its own.
+    Isolated,
+    /// A transient failure with no waiter left; not retried.
+    Abandoned,
+    /// The flush task was aborted (or panicked) before it resolved its rows.
+    Aborted,
+}
+
+impl FlushOutcome {
+    pub(crate) const fn as_label(self) -> &'static str {
+        match self {
+            Self::Ok => label::OUTCOME_OK,
+            Self::Transient => label::OUTCOME_TRANSIENT,
+            Self::Internal => label::OUTCOME_INTERNAL,
+            Self::Isolated => label::OUTCOME_ISOLATED,
+            Self::Abandoned => label::OUTCOME_ABANDONED,
+            Self::Aborted => label::OUTCOME_ABORTED,
+        }
+    }
+}
+
+/// Shutdown-drain outcome behind the `outcome` label of
+/// `uc_clickhouse_shutdown_drain_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// Every queued call was flushed and every flush completed.
+    Drained,
+    /// In-flight flushes were aborted at the drain deadline; their waiters
+    /// received `Transient`.
+    Deadline,
+    /// The batcher stopped without draining (hard abort or panic); every
+    /// unresolved waiter received `Transient`.
+    Aborted,
+}
+
+impl DrainOutcome {
+    pub(crate) const fn as_label(self) -> &'static str {
+        match self {
+            Self::Drained => label::OUTCOME_DRAINED,
+            Self::Deadline => label::OUTCOME_DEADLINE,
+            Self::Aborted => label::OUTCOME_ABORTED,
+        }
+    }
+}
+
+/// Admission-rejection reason behind the `reason` label of
+/// `uc_clickhouse_admission_rejected_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionReason {
+    /// `insert_batch.queue_capacity` outstanding calls reached.
+    Calls,
+    /// The outstanding-row bound would be exceeded.
+    Rows,
+    /// The outstanding-byte bound would be exceeded.
+    Bytes,
+    /// The call alone exceeds an outstanding bound (permanent).
+    Oversize,
+    /// Admission is closed: the plugin is shutting down.
+    Closed,
+}
+
+impl AdmissionReason {
+    pub(crate) const fn as_label(self) -> &'static str {
+        match self {
+            Self::Calls => label::REASON_CALLS,
+            Self::Rows => label::REASON_ROWS,
+            Self::Bytes => label::REASON_BYTES,
+            Self::Oversize => label::REASON_OVERSIZE,
+            Self::Closed => label::REASON_CLOSED,
+        }
+    }
+}
+
+/// The ingest queue's instruments (`storage::ingest`), kept apart from the
+/// request-path inventory so each builder stays readable.
+#[derive(Debug)]
+struct IngestInstruments {
+    /// `uc_clickhouse_ingest_outstanding_calls` — labelled by `state`.
+    outstanding_calls: Gauge<u64>,
+    /// `uc_clickhouse_ingest_outstanding_rows` — labelled by `state`.
+    outstanding_rows: Gauge<u64>,
+    /// `uc_clickhouse_ingest_outstanding_bytes` — labelled by `state`
+    /// (estimated row bytes, the unit the byte bounds are measured in).
+    outstanding_bytes: Gauge<u64>,
+    /// `uc_clickhouse_ingest_queue_wait_seconds` — per call, from admission
+    /// to its cut.
+    queue_wait: Histogram<f64>,
+    /// `uc_clickhouse_ingest_queue_age_seconds` — per flush, the age of its
+    /// oldest call at the cut (what `max_wait_ms` bounds).
+    queue_age: Histogram<f64>,
+    /// `uc_clickhouse_flush_rows` — rows per flush.
+    flush_rows: Histogram<f64>,
+    /// `uc_clickhouse_flush_bytes` — estimated bytes per flush.
+    flush_bytes: Histogram<f64>,
+    /// `uc_clickhouse_flush_duration_seconds` — labelled by `outcome`;
+    /// retries and isolation attempts included.
+    flush_duration: Histogram<f64>,
+    /// `uc_clickhouse_flushes_total` — labelled by `outcome`.
+    flushes: Counter<u64>,
+    /// `uc_clickhouse_admission_rejected_total` — labelled by `reason`.
+    admission_rejected: Counter<u64>,
+    /// `uc_clickhouse_coalesced_rows_total` — rows that joined an identical
+    /// row already queued or in flight **in this instance**. Not a measure of
+    /// cross-instance duplicates: another instance's identical write is never
+    /// seen here and is resolved at read time instead.
+    coalesced_rows: Counter<u64>,
+    /// `uc_clickhouse_coalesce_conflicts_total` — rows refused as
+    /// `IdempotencyConflict` against a differing pending row in this instance.
+    coalesce_conflicts: Counter<u64>,
+    /// `uc_clickhouse_flush_retries_total` — whole-flush retries after a
+    /// transient failure.
+    flush_retries: Counter<u64>,
+    /// `uc_clickhouse_isolation_attempts_total` — per-call isolated `INSERT`s
+    /// after a row-attributable failure of a combined flush.
+    isolation_attempts: Counter<u64>,
+    /// `uc_clickhouse_ingest_wait_timeouts_total` — calls whose request budget
+    /// ran out while waiting on their flush.
+    wait_timeouts: Counter<u64>,
+    /// `uc_clickhouse_shutdown_drain_total` — labelled by `outcome`; one per
+    /// batcher stop.
+    shutdown_drain: Counter<u64>,
+}
+
+/// Build the ingest-queue instruments against `meter`.
+fn ingest_instruments(meter: &Meter) -> IngestInstruments {
+    IngestInstruments {
+        outstanding_calls: meter
+            .u64_gauge("uc_clickhouse_ingest_outstanding_calls")
+            .with_description("Ingest calls admitted to the group-commit queue, by state")
+            .build(),
+        outstanding_rows: meter
+            .u64_gauge("uc_clickhouse_ingest_outstanding_rows")
+            .with_description("Rows admitted to the group-commit queue, by state")
+            .build(),
+        outstanding_bytes: meter
+            .u64_gauge("uc_clickhouse_ingest_outstanding_bytes")
+            .with_description("Estimated row bytes admitted to the group-commit queue, by state")
+            .build(),
+        queue_wait: meter
+            .f64_histogram("uc_clickhouse_ingest_queue_wait_seconds")
+            .with_description("Time an ingest call waited in the queue before its flush was cut")
+            .with_boundaries(QUEUE_WAIT_BOUNDARIES_SECS.to_vec())
+            .build(),
+        queue_age: meter
+            .f64_histogram("uc_clickhouse_ingest_queue_age_seconds")
+            .with_description("Age of the oldest queued call when a flush was cut")
+            .with_boundaries(QUEUE_WAIT_BOUNDARIES_SECS.to_vec())
+            .build(),
+        flush_rows: meter
+            .f64_histogram("uc_clickhouse_flush_rows")
+            .with_description("Rows per group-commit flush INSERT")
+            .with_boundaries(FLUSH_ROW_BOUNDARIES.to_vec())
+            .build(),
+        flush_bytes: meter
+            .f64_histogram("uc_clickhouse_flush_bytes")
+            .with_description("Estimated row bytes per group-commit flush INSERT")
+            .with_boundaries(FLUSH_BYTE_BOUNDARIES.to_vec())
+            .build(),
+        flush_duration: meter
+            .f64_histogram("uc_clickhouse_flush_duration_seconds")
+            .with_description("Duration of a group-commit flush, retries included, by outcome")
+            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
+            .build(),
+        flushes: meter
+            .u64_counter("uc_clickhouse_flushes_total")
+            .with_description("Group-commit flushes, by outcome")
+            .build(),
+        admission_rejected: meter
+            .u64_counter("uc_clickhouse_admission_rejected_total")
+            .with_description("Ingest calls refused at admission, by reason")
+            .build(),
+        coalesced_rows: meter
+            .u64_counter("uc_clickhouse_coalesced_rows_total")
+            .with_description(
+                "Rows coalesced onto an identical row pending in this instance's queue \
+                 (instance-local; not a cross-instance duplicate count)",
+            )
+            .build(),
+        coalesce_conflicts: meter
+            .u64_counter("uc_clickhouse_coalesce_conflicts_total")
+            .with_description(
+                "Rows refused as an idempotency conflict against a differing pending row",
+            )
+            .build(),
+        flush_retries: meter
+            .u64_counter("uc_clickhouse_flush_retries_total")
+            .with_description("Whole-flush retries after a transient `ClickHouse` failure")
+            .build(),
+        isolation_attempts: meter
+            .u64_counter("uc_clickhouse_isolation_attempts_total")
+            .with_description("Per-call isolated INSERTs after a row-attributable flush failure")
+            .build(),
+        wait_timeouts: meter
+            .u64_counter("uc_clickhouse_ingest_wait_timeouts_total")
+            .with_description("Ingest calls whose request budget expired while waiting on a flush")
+            .build(),
+        shutdown_drain: meter
+            .u64_counter("uc_clickhouse_shutdown_drain_total")
+            .with_description("Group-commit batcher stops, by drain outcome")
+            .build(),
     }
 }
 
@@ -196,6 +499,8 @@ pub struct Metrics {
     /// fresh token that never fires; production wiring swaps in the gear's
     /// token via [`Metrics::with_shutdown`].
     shutdown: CancellationToken,
+    /// The group-commit ingest queue's instruments.
+    ingest: IngestInstruments,
     // Intentionally omitted instruments (each has a reason):
     //
     // - No `uc_clickhouse_dedup_stale_total`: `ClickHouse` has no server-side
@@ -204,8 +509,9 @@ pub struct Metrics {
     //   `TimescaleDB` plugin's MVCC-window race.
     //
     // - No `uc_clickhouse_batch_retries_total`: `ClickHouse` has no deadlock
-    //   victim / row-level locking; bounded in-process retries after a transient
-    //   backend error are not implemented for the batch insert path.
+    //   victim / row-level locking. The one bounded in-process retry — a
+    //   group-commit flush after a transient failure — is counted by
+    //   `uc_clickhouse_flush_retries_total`.
     //
     // - No `uc_clickhouse_tls_handshake_failures_total`: the `ClickHouse` HTTP
     //   client surfaces TLS errors as generic `Network` errors; there is no
@@ -336,6 +642,7 @@ impl Metrics {
             usage_type_catalog_size,
             ready,
             shutdown: CancellationToken::new(),
+            ingest: ingest_instruments(meter),
         }
     }
 
@@ -425,6 +732,80 @@ impl Metrics {
     /// that landed inside the probe→delete window.
     pub(crate) fn inc_orphaned_reference_detected(&self) {
         self.orphaned_reference_detected.add(1, &[]);
+    }
+
+    // --- Ingest queue (group commit) ---
+
+    /// Set the three outstanding-work gauges for one `state`.
+    pub(crate) fn set_ingest_outstanding(
+        &self,
+        state: OutstandingState,
+        calls: u64,
+        rows: u64,
+        bytes: u64,
+    ) {
+        let attrs = [KeyValue::new(label::STATE, state.as_label())];
+        self.ingest.outstanding_calls.record(calls, &attrs);
+        self.ingest.outstanding_rows.record(rows, &attrs);
+        self.ingest.outstanding_bytes.record(bytes, &attrs);
+    }
+
+    /// Record one call's queue wait (seconds), admission to cut.
+    pub(crate) fn record_queue_wait(&self, secs: f64) {
+        self.ingest.queue_wait.record(secs, &[]);
+    }
+
+    /// Record the oldest call's age (seconds) at a flush cut.
+    pub(crate) fn record_queue_age(&self, secs: f64) {
+        self.ingest.queue_age.record(secs, &[]);
+    }
+
+    /// Record one completed flush: its outcome, duration, rows and bytes.
+    pub(crate) fn record_flush(&self, outcome: FlushOutcome, secs: f64, rows: f64, bytes: f64) {
+        let attrs = [KeyValue::new(label::OUTCOME, outcome.as_label())];
+        self.ingest.flush_duration.record(secs, &attrs);
+        self.ingest.flushes.add(1, &attrs);
+        self.ingest.flush_rows.record(rows, &[]);
+        self.ingest.flush_bytes.record(bytes, &[]);
+    }
+
+    /// Count one admission rejection under its reason.
+    pub(crate) fn inc_admission_rejected(&self, reason: AdmissionReason) {
+        self.ingest
+            .admission_rejected
+            .add(1, &[KeyValue::new(label::REASON, reason.as_label())]);
+    }
+
+    /// Count rows coalesced onto a pending identical row (instance-local).
+    pub(crate) fn inc_coalesced_rows(&self, n: u64) {
+        self.ingest.coalesced_rows.add(n, &[]);
+    }
+
+    /// Count rows refused as a conflict against a differing pending row.
+    pub(crate) fn inc_coalesce_conflicts(&self, n: u64) {
+        self.ingest.coalesce_conflicts.add(n, &[]);
+    }
+
+    /// Count one whole-flush retry.
+    pub(crate) fn inc_flush_retry(&self) {
+        self.ingest.flush_retries.add(1, &[]);
+    }
+
+    /// Count one per-call isolation attempt.
+    pub(crate) fn inc_isolation_attempt(&self) {
+        self.ingest.isolation_attempts.add(1, &[]);
+    }
+
+    /// Count one call whose request budget expired while waiting.
+    pub(crate) fn inc_wait_timeout(&self) {
+        self.ingest.wait_timeouts.add(1, &[]);
+    }
+
+    /// Count one batcher stop under its drain outcome.
+    pub(crate) fn inc_shutdown_drain(&self, outcome: DrainOutcome) {
+        self.ingest
+            .shutdown_drain
+            .add(1, &[KeyValue::new(label::OUTCOME, outcome.as_label())]);
     }
 
     // --- Synchronous gauge setters ---

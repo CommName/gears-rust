@@ -9,11 +9,13 @@
 //! - GROUP BY metadata key combined with `$filter` (SELECT/WHERE bind order),
 //! - full `Decimal128(9)` precision through the `JSONEachRow` result decode.
 //!
-//! `list` and `aggregate` do not resolve `ReplacingMergeTree` versions: they
-//! scan raw rows and anti-join the ids that carry a deactivation marker (see
-//! `query/dedup.rs`), so the deactivation tests below hold before any merge
-//! runs. Tests insert with distinct `created_at` values so the
-//! `(created_at, id)` order is fully observable.
+//! `list` and `aggregate` read `FROM usage_records FINAL` (see
+//! `query/dedup.rs`): every logical row is visible once, at its highest
+//! version, before any merge runs — a deactivation marker wins over the row it
+//! supersedes and a duplicate create collapses to one row. The deactivation
+//! and duplicate tests below stop merges so that is what they test. Tests
+//! insert with distinct `created_at` values so the `(created_at, id)` order is
+//! fully observable.
 //! Requires Docker.
 
 mod common;
@@ -571,14 +573,13 @@ async fn ch_list_and_aggregate_reject_a_non_allowlisted_filter_field() {
 // physical rows of one logical record, and it is reachable from caller input
 // as both a `$filter` field and a keyset sort key.
 //
-// `list` and `aggregate` no longer resolve versions; they scan raw rows and
-// exclude every id that carries a marker (`dedup::resolved_survivors` /
-// `dedup::active_survivors`). If that anti-join were missing, or a `status`
-// predicate were applied to the raw scan without it, a superseded active row
-// would survive next to (or instead of) its marker. These tests pin the
-// observable consequence: a deactivated record is never reported as active,
-// and never twice. The two "pre-merge" tests stop merges outright so the
-// guarantee is tested, not the merge scheduler's timing.
+// `list` and `aggregate` read `FINAL`, so the marker — the highest version of
+// its key — is the one row the `WHERE` sees. If the reads scanned raw rows, or
+// applied a `status` predicate below the version resolution, a superseded
+// active row would survive next to (or instead of) its marker. These tests pin
+// the observable consequence: a deactivated record is never reported as
+// active, and never twice. The two "pre-merge" tests stop merges outright so
+// the guarantee is tested, not the merge scheduler's timing.
 // ---------------------------------------------------------------------------
 
 /// `$filter=status eq 'active'` must not return a deactivated record.
@@ -880,17 +881,15 @@ async fn ch_list_combines_metadata_filter_dollar_filter_and_cursor() {
 }
 
 // ---------------------------------------------------------------------------
-// The aggregate's survivor predicate
+// The aggregate's `status = 'active'` on the `FINAL` read
 //
-// `aggregate` applies `status = 'active' AND id NOT IN (<marker ids>)` to the
-// raw scan (`dedup::active_survivors`) instead of resolving versions. The
-// tests below are the correctness guard for that predicate: `status =
-// 'active'` alone would keep a superseded active row next to its own inactive
-// marker, and the anti-join alone would sum the markers.
+// `aggregate` reads `FINAL` and applies `status = 'active'` to the resolved
+// rows. The tests below are the correctness guard for that: `status =
+// 'active'` on a raw scan would keep a superseded active row next to its own
+// inactive marker, and dropping it would sum the markers.
 //
 // `ch_aggregate_group_by_metadata_with_filter` above is the pre-existing
-// bind-order guard and must keep passing unchanged — the survivor predicate
-// binds nothing of its own; it repeats the scan binds.
+// bind-order guard and must keep passing unchanged — every clause binds once.
 // ---------------------------------------------------------------------------
 
 /// Every aggregation op must exclude a deactivated record.
@@ -1325,7 +1324,7 @@ async fn explain_pipeline_of_last(
     h: &common::ChHarness,
     must_contain: &str,
     must_not_contain: &str,
-) -> Vec<String> {
+) -> (String, Vec<String>) {
     // Narrowed to this test's database: the server is shared, so the log
     // carries every sibling test's statements too.
     let sql = "SELECT query FROM system.query_log \
@@ -1357,41 +1356,48 @@ async fn explain_pipeline_of_last(
     let logged = logged.expect("the store's SELECT must appear in system.query_log");
     let body = logged
         .rfind(" FORMAT ")
-        .map_or(logged.as_str(), |i| &logged[..i]);
-    h.client
+        .map_or(logged.as_str(), |i| &logged[..i])
+        .to_owned();
+    let pipeline = h
+        .client
         .query(&format!("EXPLAIN PIPELINE {body}"))
         .fetch_all::<String>()
         .await
-        .unwrap_or_else(|e| panic!("EXPLAIN PIPELINE failed for {body}: {e:?}"))
+        .unwrap_or_else(|e| panic!("EXPLAIN PIPELINE failed for {body}: {e:?}"));
+    (body, pipeline)
 }
 
-/// The whole point of the rewrite, pinned at the plan level: neither read
-/// carries a version-resolution step any more. No `LimitBy`, no sort on
-/// `version`; the aggregate has at most the caller's own `Aggregating` step and
-/// the list exactly one `Sorting` step (the caller's `ORDER BY … LIMIT`).
+/// Both range reads are one `FINAL` read with one `WHERE`, pinned at the plan
+/// level: no set is built for a subquery, no `LimitBy`, no version sort; the
+/// aggregate has at most the caller's own `Aggregating` step and the list
+/// exactly one `Sorting` step (the caller's `ORDER BY … LIMIT`). Merges are
+/// stopped and one id is twinned so the `FINAL` collapse actually runs over
+/// overlapping parts rather than being skipped for a single-part partition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
-async fn ch_read_pipelines_carry_no_resolution_step() {
+async fn ch_read_pipelines_resolve_versions_with_final() {
     let Some((h, store)) = setup_with_type(VCPU_GTS, &[]).await else {
         return;
     };
+    common::stop_merges(&h).await;
     let tenant = Uuid::from_u128(0x3106);
+    let mut first_id = None;
     for i in 0..3 {
         let seq = 0x3106_0000 + u128::try_from(i).unwrap();
-        store
-            .create(record_at(VCPU_GTS, tenant, seq, i))
-            .await
-            .expect("create record");
+        let rec = record_at(VCPU_GTS, tenant, seq, i);
+        first_id.get_or_insert(rec.id);
+        store.create(rec).await.expect("create record");
     }
+    common::seed_duplicate_version(&h, first_id.expect("three records"), 7).await;
     // A tenant filter makes the logged text unique to this test and exercises
-    // the pushed-down key-prefix predicate in both copies of the scan.
+    // the pushed-down key-prefix predicate.
     let tenant_filter = Expr::Compare(
         Box::new(Expr::Identifier("tenant_id".to_owned())),
         CompareOperator::Eq,
         Box::new(Expr::Value(Value::Uuid(tenant))),
     );
 
-    store
+    let result = store
         .aggregate(
             common::fixture_gts_id(VCPU_GTS),
             &ODataQuery::new().with_filter(tenant_filter.clone()),
@@ -1403,23 +1409,34 @@ async fn ch_read_pipelines_carry_no_resolution_step() {
         )
         .await
         .expect("aggregate");
-    let agg = explain_pipeline_of_last(&h, &tenant.to_string(), "ORDER BY").await;
+    assert_eq!(
+        result.buckets.len(),
+        1,
+        "one resource, one bucket: the twin is collapsed"
+    );
+    let (agg_sql, agg) = explain_pipeline_of_last(&h, &tenant.to_string(), "ORDER BY").await;
     let agg_text = agg.join("\n");
+    assert!(agg_sql.contains("usage_records FINAL"), "{agg_sql}");
+    assert!(!agg_sql.contains("NOT IN"), "{agg_sql}");
+    assert!(
+        !agg_text.contains("CreatingSets"),
+        "no subquery set is built:\n{agg_text}"
+    );
     assert!(
         !agg_text.contains("LimitBy"),
         "aggregate must not carry a LIMIT BY resolution step:\n{agg_text}"
     );
-    assert!(
-        !agg_text.contains("Sorting"),
+    assert_eq!(
+        agg.iter().filter(|l| l.trim() == "(Sorting)").count(),
+        0,
         "aggregate must not sort (no version sort, no order):\n{agg_text}"
     );
     assert!(
         agg.iter().filter(|l| l.trim() == "(Aggregating)").count() <= 1,
-        "only the caller's own GROUP BY may aggregate; a second Aggregating step is \
-         the removed version-resolution GROUP BY:\n{agg_text}"
+        "only the caller's own GROUP BY may aggregate:\n{agg_text}"
     );
 
-    store
+    let page = store
         .list(
             common::fixture_gts_id(VCPU_GTS),
             &ODataQuery::new()
@@ -1429,8 +1446,14 @@ async fn ch_read_pipelines_carry_no_resolution_step() {
         )
         .await
         .expect("list");
-    let list = explain_pipeline_of_last(&h, "ORDER BY", "AS agg").await;
+    assert_eq!(page.items.len(), 3, "the twin is listed once");
+    let (list_sql, list) = explain_pipeline_of_last(&h, "ORDER BY", "AS agg").await;
     let list_text = list.join("\n");
+    assert!(list_sql.contains("usage_records FINAL"), "{list_sql}");
+    assert!(
+        !list_text.contains("CreatingSets"),
+        "no subquery set is built:\n{list_text}"
+    );
     assert!(
         !list_text.contains("LimitBy"),
         "list must not carry a LIMIT BY resolution step:\n{list_text}"
@@ -1442,20 +1465,208 @@ async fn ch_read_pipelines_carry_no_resolution_step() {
     assert_eq!(
         list.iter().filter(|l| l.trim() == "(Sorting)").count(),
         1,
-        "exactly one sort — the caller's ORDER BY; a second one is the removed \
-         version sort:\n{list_text}"
+        "exactly one sort — the caller's ORDER BY:\n{list_text}"
     );
     // With `gts_id` and `tenant_id` pinned by equalities and the order on the
-    // remaining key prefix `(created_at, id)`, ClickHouse reads in key order
-    // and merges sorted streams straight into the LIMIT instead of sorting the
+    // remaining key prefix `(created_at, id)`, ClickHouse 25.6 reads in key
+    // order under FINAL too: the replacing merge runs over sorted streams
+    // (`ReplacingSorted`) that feed the LIMIT, with no full sort of the
     // tenant. A one-element `tenant_id IN (?)` would defeat this, which is why
-    // the translator renders it as an equality.
+    // the translator renders it as an equality. The descending direction is
+    // not pinned here (see the README's measurement procedure).
     assert!(
         list_text.contains("algorithm: InOrder"),
-        "the list must read in sorting-key order:\n{list_text}"
+        "the ascending list must read in sorting-key order:\n{list_text}"
     );
     assert!(
         !list_text.contains("MergeSortingTransform"),
         "no full sort of the scanned rows may remain:\n{list_text}"
     );
+    assert!(
+        list_text.contains("ReplacingSorted"),
+        "the FINAL collapse must run over the twinned parts:\n{list_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate creates before any merge
+//
+// Two collector instances can store the same logical row twice: each flushes
+// under its own `insert_deduplication_token`, so the engine window never
+// matches, and the twin lands as a second physical row with another
+// `version`. `FINAL` is what keeps the range reads exact until the merge.
+// ---------------------------------------------------------------------------
+
+/// A duplicate active twin is listed once and counted once by every op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_list_and_aggregate_count_a_duplicate_create_once_before_merge() {
+    let Some((h, _async_store)) = setup_with_type(VCPU_GTS, &[]).await else {
+        return;
+    };
+    common::stop_merges(&h).await;
+    let store = common::record_store_batched(&h);
+    let tenant = Uuid::from_u128(0x3201);
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        let seq = 0x3201_0000 + u128::try_from(i).unwrap();
+        let rec = record_at(VCPU_GTS, tenant, seq, i); // values 1, 2, 3
+        ids.push(rec.id);
+        store.create(rec).await.expect("create record");
+    }
+    common::seed_duplicate_version(&h, ids[1], 7).await;
+    assert_eq!(
+        common::raw_rows_for_id(&h, ids[1]).await,
+        2,
+        "precondition: the twin is a second physical row"
+    );
+
+    let page = store
+        .list(
+            common::fixture_gts_id(VCPU_GTS),
+            &ODataQuery::new().with_order(created_at_id_asc()),
+            &[],
+        )
+        .await
+        .expect("list");
+    let listed: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    assert_eq!(
+        listed, ids,
+        "each logical row once, in order; a 4-row list means the twin survived"
+    );
+
+    let expected = [
+        (AggregationOp::Sum, 6_i64),
+        (AggregationOp::Count, 3),
+        (AggregationOp::Min, 1),
+        (AggregationOp::Max, 3),
+        (AggregationOp::Avg, 2),
+    ];
+    for (op, want) in expected {
+        let result = store
+            .aggregate(
+                common::fixture_gts_id(VCPU_GTS),
+                &ODataQuery::new(),
+                &[],
+                AggregationSpec {
+                    op,
+                    group_by: Vec::new(),
+                },
+            )
+            .await
+            .expect("aggregate");
+        let got = result.buckets[0].value.clone().expect("a value");
+        assert_eq!(
+            got,
+            BigDecimal::from(want),
+            "{op:?} must see the twin once (SUM 8 / COUNT 4 mean it was counted twice)"
+        );
+    }
+    let grouped = store
+        .aggregate(
+            common::fixture_gts_id(VCPU_GTS),
+            &ODataQuery::new(),
+            &[],
+            AggregationSpec {
+                op: AggregationOp::Count,
+                group_by: vec![AggregationDimension::ResourceId],
+            },
+        )
+        .await
+        .expect("grouped aggregate");
+    assert_eq!(grouped.buckets.len(), 1);
+    assert_eq!(
+        grouped.buckets[0].value,
+        Some(BigDecimal::from(3_i64)),
+        "grouped COUNT sees the twin once"
+    );
+}
+
+/// Status filtering and keyset pagination stay exact across a page boundary
+/// when active twins and a deactivation marker (plus a twin of the row it
+/// supersedes) are all present as physical rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_list_status_filter_and_cursor_cross_a_page_boundary_over_duplicates_and_a_marker() {
+    let Some((h, _async_store)) = setup_with_type(VCPU_GTS, &[]).await else {
+        return;
+    };
+    common::stop_merges(&h).await;
+    let store = common::record_store_batched(&h);
+    let tenant = Uuid::from_u128(0x3202);
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let seq = 0x3202_0000 + u128::try_from(i).unwrap();
+        let rec = record_at(VCPU_GTS, tenant, seq, i);
+        ids.push(rec.id);
+        store.create(rec).await.expect("create record");
+    }
+    common::seed_duplicate_version(&h, ids[1], 5).await;
+    common::seed_duplicate_version(&h, ids[3], 5).await;
+    store.deactivate(ids[2]).await.expect("deactivate");
+    // A twin of the superseded active row, still below the marker's version.
+    common::seed_duplicate_of(&h, ids[2], 1, Some("active")).await;
+    assert_eq!(common::raw_rows_for_id(&h, ids[2]).await, 3);
+    assert_eq!(
+        store.get(ids[2]).await.expect("get").status,
+        usage_collector_sdk::UsageRecordStatus::Inactive
+    );
+
+    let status_eq = |value: &str| {
+        Expr::Compare(
+            Box::new(Expr::Identifier("status".to_owned())),
+            CompareOperator::Eq,
+            Box::new(Expr::Value(Value::String(value.to_owned()))),
+        )
+    };
+    let walk = |filter: Option<Expr>, limit: u64| {
+        let store = store.clone();
+        async move {
+            let mut seen: Vec<(Uuid, usage_collector_sdk::UsageRecordStatus)> = Vec::new();
+            let mut cursor: Option<CursorV1> = None;
+            let mut pages = 0;
+            loop {
+                let mut query = ODataQuery::new()
+                    .with_limit(limit)
+                    .with_order(created_at_id_asc());
+                if let Some(f) = filter.clone() {
+                    query = query.with_filter(f);
+                }
+                if let Some(c) = cursor.take() {
+                    query = query.with_cursor(c);
+                }
+                let page = store
+                    .list(common::fixture_gts_id(VCPU_GTS), &query, &[])
+                    .await
+                    .expect("list page");
+                pages += 1;
+                for item in &page.items {
+                    assert!(!seen.iter().any(|(id, _)| *id == item.id), "no repeats");
+                    seen.push((item.id, item.status));
+                }
+                match page.page_info.next_cursor {
+                    Some(token) => cursor = Some(CursorV1::decode(&token).expect("cursor")),
+                    None => break,
+                }
+            }
+            (seen, pages)
+        }
+    };
+
+    let (active, _) = walk(Some(status_eq("active")), 2).await;
+    assert_eq!(
+        active.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![ids[0], ids[1], ids[3], ids[4]],
+        "active-only pages: twins once, the deactivated row absent"
+    );
+    let (inactive, _) = walk(Some(status_eq("inactive")), 2).await;
+    assert_eq!(
+        inactive.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![ids[2]]
+    );
+    let (all, pages) = walk(None, 2).await;
+    assert_eq!(all.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ids);
+    assert_eq!(pages, 3, "five rows, two per page");
+    let (_, status) = all[2];
+    assert_eq!(status, usage_collector_sdk::UsageRecordStatus::Inactive);
 }

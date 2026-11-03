@@ -55,7 +55,7 @@ async fn init_rejects_empty_database_url() {
         CancellationToken::new(),
     );
 
-    let err = ClickHouseUsageCollectorPlugin
+    let err = ClickHouseUsageCollectorPlugin::default()
         .init(&ctx)
         .await
         .expect_err("empty database_url must be rejected before any ClickHouse I/O");
@@ -82,7 +82,7 @@ async fn init_rejects_plaintext_http_database_url_without_override() {
         CancellationToken::new(),
     );
 
-    let err = ClickHouseUsageCollectorPlugin
+    let err = ClickHouseUsageCollectorPlugin::default()
         .init(&ctx)
         .await
         .expect_err("plaintext http:// database_url must be rejected without an explicit override");
@@ -119,7 +119,7 @@ async fn init_aborts_before_startup_io_when_already_cancelled() {
         cancel,
     );
 
-    let err = ClickHouseUsageCollectorPlugin
+    let err = ClickHouseUsageCollectorPlugin::default()
         .init(&ctx)
         .await
         .expect_err("a cancelled token must abort init before any startup I/O");
@@ -162,7 +162,7 @@ async fn init_fails_at_the_migration_step_when_the_backend_is_unreachable() {
     // and never reaches the migration this test is about.
     install_test_crypto_provider();
 
-    let err = ClickHouseUsageCollectorPlugin
+    let err = ClickHouseUsageCollectorPlugin::default()
         .init(&ctx)
         .await
         .expect_err("init must not report success when the schema migration cannot run");
@@ -373,7 +373,7 @@ mod mocked {
         let hub = hub(Some(RegistryStub { reject: false }));
         let cancel = CancellationToken::new();
 
-        ClickHouseUsageCollectorPlugin
+        ClickHouseUsageCollectorPlugin::default()
             .init(&ctx(
                 mock.url(),
                 &json!({}),
@@ -393,13 +393,153 @@ mod mocked {
         tokio::task::yield_now().await;
     }
 
+    /// The queue is wired by `init` and run by `serve`: a write through the
+    /// published adapter is flushed by the batcher, and cancellation drains
+    /// and returns.
+    #[tokio::test]
+    async fn init_wires_the_queue_and_serve_flushes_then_drains_on_cancel() {
+        use toolkit::lifecycle::ReadySignal;
+        use usage_collector_sdk::UsageRecord;
+
+        use crate::infra::storage::entity::UsageRecordRow;
+        use crate::infra::storage::ingest::test_rows::{VCPU_GTS, row};
+        use crate::infra::storage::test_mock::ok;
+
+        install_test_crypto_provider();
+        let mock = Mock::new();
+        up_to_date_single_node(&mock);
+        let hub = hub(Some(RegistryStub { reject: false }));
+        let cancel = CancellationToken::new();
+        let gear = Arc::new(ClickHouseUsageCollectorPlugin::default());
+        assert_eq!(
+            gear.drain_stop_timeout(),
+            Duration::from_secs(1),
+            "before init there is nothing to drain"
+        );
+
+        gear.init(&ctx(
+            mock.url(),
+            &json!({}),
+            Arc::clone(&hub),
+            cancel.clone(),
+        ))
+        .await
+        .expect("init succeeds on an up-to-date schema");
+        assert_eq!(
+            gear.drain_stop_timeout(),
+            Duration::from_secs(30),
+            "drain deadline capped at 29 s plus one second"
+        );
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let serve_cancel = CancellationToken::new();
+        let serve = tokio::spawn(
+            Arc::clone(&gear).serve(serve_cancel.clone(), ReadySignal::from_sender(ready_tx)),
+        );
+        ready_rx.await.expect("serve signals readiness");
+
+        // One create through the adapter: catalog hit, empty dedup pre-read,
+        // then the batcher's flush INSERT against the mock.
+        rows(&mock, [VCPU_GTS.to_owned()]);
+        rows(&mock, Vec::<UsageRecordRow>::new());
+        ok(&mock);
+        let adapter = hub
+            .try_get_scoped::<dyn UsageCollectorPluginV1>(&adapter_scope())
+            .expect("adapter registered");
+        let record = UsageRecord::try_from(row(1)).expect("fixture record");
+        let stored = adapter
+            .create_usage_record(record.clone())
+            .await
+            .expect("the write is flushed by the running batcher");
+        assert_eq!(stored.id, record.id);
+
+        serve_cancel.cancel();
+        serve
+            .await
+            .expect("serve task joins")
+            .expect("serve drains and returns Ok");
+        cancel.cancel();
+    }
+
+    /// With group commit disabled the entry only waits for cancellation and
+    /// the stop budget is the uninitialised one.
+    #[tokio::test]
+    async fn init_with_batching_disabled_serves_without_a_queue() {
+        use toolkit::lifecycle::ReadySignal;
+
+        install_test_crypto_provider();
+        let mock = Mock::new();
+        up_to_date_single_node(&mock);
+        let hub = hub(Some(RegistryStub { reject: false }));
+        let cancel = CancellationToken::new();
+        let gear = Arc::new(ClickHouseUsageCollectorPlugin::default());
+        gear.init(&ctx(
+            mock.url(),
+            &json!({ "insert_batch": { "enabled": false } }),
+            hub,
+            cancel.clone(),
+        ))
+        .await
+        .expect("init succeeds");
+        assert_eq!(gear.drain_stop_timeout(), Duration::from_secs(1));
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let serve_cancel = CancellationToken::new();
+        let serve = tokio::spawn(
+            Arc::clone(&gear).serve(serve_cancel.clone(), ReadySignal::from_sender(ready_tx)),
+        );
+        ready_rx.await.expect("ready");
+        serve_cancel.cancel();
+        serve.await.expect("join").expect("serve returns Ok");
+        cancel.cancel();
+    }
+
+    /// `serve` before `init` is an error, not a hang.
+    #[tokio::test]
+    async fn serve_before_init_is_an_error() {
+        use toolkit::lifecycle::ReadySignal;
+
+        let gear = Arc::new(ClickHouseUsageCollectorPlugin::default());
+        let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+        let err = gear
+            .serve(CancellationToken::new(), ReadySignal::from_sender(ready_tx))
+            .await
+            .expect_err("serve before init fails");
+        assert!(err.to_string().contains("serve before init"), "{err}");
+    }
+
+    /// A cluster without group commit is refused at config validation.
+    #[tokio::test]
+    async fn init_rejects_a_cluster_with_batching_disabled() {
+        install_test_crypto_provider();
+        let mock = Mock::new();
+        let hub = hub(Some(RegistryStub { reject: false }));
+        let err = ClickHouseUsageCollectorPlugin::default()
+            .init(&ctx(
+                mock.url(),
+                &json!({
+                    "async_insert": false,
+                    "insert_batch": { "enabled": false },
+                    "cluster": { "name": "uc" },
+                }),
+                hub,
+                CancellationToken::new(),
+            ))
+            .await
+            .expect_err("a cluster requires group commit");
+        assert!(
+            err.to_string().contains("insert_batch.enabled = true"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn init_on_an_operator_provisioned_cluster_only_validates_it() {
         install_test_crypto_provider();
         let mock = Mock::new();
         valid_cluster_probes(&mock, 2, RETENTION);
 
-        ClickHouseUsageCollectorPlugin
+        ClickHouseUsageCollectorPlugin::default()
             .init(&ctx(
                 mock.url(),
                 &cluster(false),
@@ -421,7 +561,7 @@ mod mocked {
         rows(&mock, [create_sql(&ttl(RETENTION), None)]);
         valid_cluster_probes(&mock, 2, RETENTION);
 
-        ClickHouseUsageCollectorPlugin
+        ClickHouseUsageCollectorPlugin::default()
             .init(&ctx(
                 mock.url(),
                 &cluster(true),
@@ -440,7 +580,7 @@ mod mocked {
         rows(&mock, migration_names().into_iter().map(str::to_owned));
         fail(&mock);
 
-        let err = ClickHouseUsageCollectorPlugin
+        let err = ClickHouseUsageCollectorPlugin::default()
             .init(&ctx(
                 mock.url(),
                 &json!({}),
@@ -460,7 +600,7 @@ mod mocked {
         rows(&mock, ["db".to_owned()]);
         rows(&mock, [(0_u64, 0_u64)]);
 
-        let err = ClickHouseUsageCollectorPlugin
+        let err = ClickHouseUsageCollectorPlugin::default()
             .init(&ctx(
                 mock.url(),
                 &cluster(false),
@@ -485,7 +625,7 @@ mod mocked {
         up_to_date_single_node(&mock);
         let hub = hub(None);
 
-        ClickHouseUsageCollectorPlugin
+        ClickHouseUsageCollectorPlugin::default()
             .init(&ctx(
                 mock.url(),
                 &json!({}),
@@ -509,7 +649,7 @@ mod mocked {
         up_to_date_single_node(&mock);
         let hub = hub(Some(RegistryStub { reject: true }));
 
-        ClickHouseUsageCollectorPlugin
+        ClickHouseUsageCollectorPlugin::default()
             .init(&ctx(
                 mock.url(),
                 &json!({}),
@@ -551,7 +691,7 @@ mod mocked {
 
         let err = tokio::time::timeout(
             Duration::from_secs(10),
-            ClickHouseUsageCollectorPlugin.init(&ctx(
+            ClickHouseUsageCollectorPlugin::default().init(&ctx(
                 &format!("http://{addr}"),
                 &json!({}),
                 hub(Some(RegistryStub { reject: false })),

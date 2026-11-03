@@ -4,6 +4,7 @@
 //! - `ddl`: the `CREATE TABLE` builder the migrator renders tables with.
 //! - `migrator`: versioned schema migrations; one step list for every topology.
 //! - `entity`, `mapper`, `error`, `query`, `record_store`: record persistence.
+//! - `ingest`: the bounded group-commit queue every record write goes through.
 //! - `catalog_store`: usage-type catalog CRUD.
 //! - `topology`: single-node vs sharded-cluster table layout.
 
@@ -11,6 +12,7 @@ pub mod catalog_store;
 pub mod ddl;
 pub mod entity;
 pub mod error;
+pub mod ingest;
 pub mod mapper;
 pub mod migrator;
 pub mod pool;

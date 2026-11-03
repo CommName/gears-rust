@@ -329,9 +329,8 @@ fn err_for_slot_preserves_internal_message() {
 /// to an `Internal` carrying the original text rather than being dropped.
 #[test]
 fn err_for_slot_falls_back_to_internal_for_other_variants() {
-    let src = UsageCollectorPluginError::IdempotencyConflict {
-        idempotency_key: "idem-1".to_owned(),
-        existing_id: Uuid::from_u128(7),
+    let src = UsageCollectorPluginError::UsageRecordNotFound {
+        id: Uuid::from_u128(7),
     };
     let rendered = src.to_string();
     match err_for_slot(&src) {
@@ -340,6 +339,27 @@ fn err_for_slot_falls_back_to_internal_for_other_variants() {
             "the fallback arm must carry the original error text"
         ),
         other => panic!("expected Internal fallback, got {other:?}"),
+    }
+}
+
+/// An `IdempotencyConflict` — what the ingest queue reports for a row refused
+/// against a differing pending row — keeps its variant and its payload, so
+/// the gateway still maps it to the conflict response.
+#[test]
+fn err_for_slot_preserves_idempotency_conflict() {
+    let src = UsageCollectorPluginError::IdempotencyConflict {
+        idempotency_key: "idem-1".to_owned(),
+        existing_id: Uuid::from_u128(7),
+    };
+    match err_for_slot(&src) {
+        UsageCollectorPluginError::IdempotencyConflict {
+            idempotency_key,
+            existing_id,
+        } => {
+            assert_eq!(idempotency_key, "idem-1");
+            assert_eq!(existing_id, Uuid::from_u128(7));
+        }
+        other => panic!("expected the conflict to be preserved, got {other:?}"),
     }
 }
 
@@ -368,16 +388,12 @@ fn metadata_filter_binds_key_and_every_value() {
     assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "region"));
 }
 
-/// The version-invariant half of a caller `$filter` is translated into the
-/// inner scan and the `status` half above the resolution step, with the binds
-/// landing in that same order.
-///
-/// Bind order is the sharp edge: `ClickHouse` `?` is positional, and the inner
-/// `WHERE` precedes the outer one in the emitted text. Translating the outer
-/// half first would still produce valid SQL — with the tenant UUID bound to the
-/// status placeholder.
+/// The gateway's `$filter` shape — tenant, `[from, …)` window, status — lands
+/// in the one `WHERE` as separate conjuncts, in text order, with the binds in
+/// the same order. Translating any conjunct out of order would still produce
+/// valid SQL — with the tenant UUID bound to the status placeholder.
 #[test]
-fn push_split_filter_pushes_the_time_window_into_the_inner_scan() {
+fn push_filter_translates_every_conjunct_into_the_one_where() {
     use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, ODataValue};
     use usage_collector_sdk::UsageRecordFilterField;
 
@@ -389,7 +405,6 @@ fn push_split_filter_pushes_the_time_window_into_the_inner_scan() {
     let from =
         chrono::DateTime::from_timestamp_micros(1_767_225_600_000_000).expect("timestamp in range");
 
-    // The shape the gateway sends: tenant + `[from, …)` window + status.
     let node = FilterNode::and(vec![
         FilterNode::binary(field("tenant_id"), FilterOp::Eq, ODataValue::Uuid(tenant)),
         FilterNode::binary(
@@ -404,45 +419,29 @@ fn push_split_filter_pushes_the_time_window_into_the_inner_scan() {
         ),
     ]);
 
-    // The metadata side-channel already occupies the inner context, exactly as
-    // it does at the call sites.
-    let mut inner_ctx = SqlCtx::new();
-    let mut inner_clauses = vec!["gts_id = ?".to_owned()];
-    let mut outer_ctx = SqlCtx::new();
-    let mut outer_clauses = vec!["status = 'active'".to_owned()];
+    // `gts_id` already occupies the clause list, exactly as at the call sites.
+    let mut ctx = SqlCtx::new();
+    let mut clauses = vec!["gts_id = ?".to_owned()];
 
-    ChRecordStore::push_split_filter(
-        &node,
-        &mut inner_ctx,
-        &mut inner_clauses,
-        &mut outer_ctx,
-        &mut outer_clauses,
-    )
-    .expect("filter translates");
+    ChRecordStore::push_filter(&node, &mut ctx, &mut clauses).expect("filter translates");
 
     assert_eq!(
-        inner_clauses,
+        clauses,
         vec![
             "gts_id = ?".to_owned(),
             "tenant_id = ?".to_owned(),
             "created_at >= fromUnixTimestamp64Micro(?)".to_owned(),
+            "status = ?".to_owned(),
         ],
-        "tenant_id and created_at are key-prefix columns and must prune the scan"
+        "every conjunct joins the one WHERE in text order"
     );
-    assert_eq!(
-        outer_clauses,
-        vec!["status = 'active'".to_owned(), "status = ?".to_owned()],
-        "status must stay above the version-resolution step"
-    );
-
-    assert!(matches!(&inner_ctx.binds[0], SqlBind::Uuid(u) if *u == tenant));
+    assert_eq!(ctx.binds.len(), 3);
+    assert!(matches!(&ctx.binds[0], SqlBind::Uuid(u) if *u == tenant));
     assert!(matches!(
-        &inner_ctx.binds[1],
+        &ctx.binds[1],
         SqlBind::DateTime64Micros(1_767_225_600_000_000)
     ));
-    assert_eq!(inner_ctx.binds.len(), 2);
-    assert_eq!(outer_ctx.binds.len(), 1);
-    assert!(matches!(&outer_ctx.binds[0], SqlBind::Str(s) if s == "active"));
+    assert!(matches!(&ctx.binds[2], SqlBind::Str(s) if s == "active"));
 }
 
 // ── Offline store ─────────────────────────────────────────────────────────────
@@ -461,9 +460,10 @@ fn offline_store() -> ChRecordStore {
         // fails fast on connection refused, so the deadline is never what a
         // test observes.
         std::time::Duration::from_secs(30),
-        // Matches the production default, so the offline tier exercises the
-        // shipped configuration.
+        // The direct path: the offline tier exercises every statement a store
+        // issues itself, which group commit would hand to the queue instead.
         true,
+        None,
     )
 }
 
@@ -1061,31 +1061,27 @@ fn aggregate_response_stream_parses_across_chunk_boundaries() {
 
 // ── build_aggregate_sql / build_list_sql ──────────────────────────────────────
 
-/// The realistic scan clause set: `gts_id` is always pinned, and non-`SUM` ops
-/// add the `corrects_id` partition.
-fn inner() -> Vec<String> {
-    vec!["gts_id = ?".to_owned(), "corrects_id IS NULL".to_owned()]
+/// The realistic clause set: `gts_id` is always pinned, `status = 'active'`
+/// always follows it, and non-`SUM` ops add the `corrects_id` partition.
+fn clauses() -> Vec<String> {
+    vec![
+        "gts_id = ?".to_owned(),
+        "status = 'active'".to_owned(),
+        "corrects_id IS NULL".to_owned(),
+    ]
 }
 
-/// The exact survivor predicate the aggregate must emit for [`inner`]: raw
-/// active rows whose id carries no marker, with the scan text repeated inside
-/// the marker subquery so it prunes on the same key range.
-const AGG_SURVIVORS: &str = "status = 'active' AND id NOT IN \
-     (SELECT id FROM usage_records WHERE gts_id = ? AND corrects_id IS NULL \
-     AND status = 'inactive')";
-
-/// The aggregate has no version-resolving level: no `GROUP BY` on the sort key,
-/// no `HAVING`, no `LIMIT 1 BY`, no `argMax`, and no nested `SELECT` other than
-/// the marker subquery. Deactivation is handled by the survivor predicate.
+/// The aggregate is one `FINAL` read with one `WHERE`: no `GROUP BY` on the
+/// sort key, no `HAVING`, no `LIMIT 1 BY`, no `argMax`, no subquery.
+/// Deactivation and duplicate creates are both collapsed by `FINAL` before
+/// the `status = 'active'` clause applies.
 #[test]
-fn aggregate_sql_is_a_single_level_scan_with_the_marker_anti_join() {
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &inner(), &[], "", "");
+fn aggregate_sql_reads_final_with_one_where() {
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &clauses(), "", "");
     assert_eq!(
         sql,
-        format!(
-            "SELECT SUM(value) AS agg FROM usage_records \
-             WHERE gts_id = ? AND corrects_id IS NULL AND {AGG_SURVIVORS}"
-        )
+        "SELECT SUM(value) AS agg FROM usage_records FINAL \
+         WHERE gts_id = ? AND status = 'active' AND corrects_id IS NULL"
     );
     for forbidden in [
         "HAVING",
@@ -1093,63 +1089,47 @@ fn aggregate_sql_is_a_single_level_scan_with_the_marker_anti_join() {
         "argMax",
         "GROUP BY gts_id",
         "version",
+        "NOT IN",
     ] {
         assert!(
             !sql.contains(forbidden),
             "no resolution construct may remain (`{forbidden}`): {sql}"
         );
     }
-    assert_eq!(
-        sql.matches("SELECT").count(),
-        2,
-        "the marker subquery is the only nested SELECT: {sql}"
+    assert_eq!(sql.matches("SELECT").count(), 1, "one level: {sql}");
+    assert_eq!(sql.matches("WHERE").count(), 1, "one WHERE: {sql}");
+    assert!(
+        sql.contains(" FINAL WHERE "),
+        "FINAL qualifies the table: {sql}"
     );
 }
 
-/// Every scan predicate is repeated verbatim inside the marker subquery, so the
-/// caller binds the scan values twice — the placeholder count pins that
-/// contract, and a scan clause with its own `?` must be doubled too.
+/// Every placeholder in the text is one bind: clauses appear exactly once, so
+/// the caller applies each clause bind exactly once.
 #[test]
-fn aggregate_sql_repeats_every_scan_predicate_inside_the_marker_subquery() {
-    let mut scan = inner();
+fn aggregate_sql_binds_each_placeholder_once() {
+    let mut scan = clauses();
     scan.push("created_at >= fromUnixTimestamp64Micro(?)".to_owned());
     scan.push("metadata[?] IN (?, ?)".to_owned());
-    let scan_placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, &[], "", "");
-    assert_eq!(
-        sql.matches('?').count(),
-        2 * scan_placeholders,
-        "scan binds are applied twice, once per copy of the scan text: {sql}"
-    );
-    let scan_text = scan.join(" AND ");
-    assert_eq!(
-        sql.matches(scan_text.as_str()).count(),
-        2,
-        "the scan text must appear as the scan predicate and inside the subquery: {sql}"
-    );
+    let placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, "", "");
+    assert_eq!(sql.matches('?').count(), placeholders, "{sql}");
+    let text = scan.join(" AND ");
+    assert_eq!(sql.matches(text.as_str()).count(), 1, "{sql}");
 }
 
-/// The `status`-naming half of `$filter` trails the survivor predicate in the
-/// same `WHERE`, so its binds come after both copies of the scan binds.
+/// Grouping and the bucket cap trail the `WHERE`.
 #[test]
-fn aggregate_sql_appends_version_dependent_filters_after_the_survivor_predicate() {
+fn aggregate_sql_appends_grouping_and_limit_after_the_where() {
     let sql = ChRecordStore::build_aggregate_sql(
         "SUM(value) AS agg",
-        &inner(),
-        &["status = ?".to_owned()],
+        &clauses(),
         " GROUP BY 1",
         " LIMIT 100001",
     );
     assert!(
-        sql.contains(&format!(
-            "{AGG_SURVIVORS} AND status = ? GROUP BY 1 LIMIT 100001"
-        )),
-        "the trailing conjunct must follow the survivor predicate: {sql}"
-    );
-    assert_eq!(
-        sql.matches("WHERE").count(),
-        2,
-        "one WHERE for the query, one inside the marker subquery: {sql}"
+        sql.ends_with("AND corrects_id IS NULL GROUP BY 1 LIMIT 100001"),
+        "{sql}"
     );
 }
 
@@ -1157,19 +1137,20 @@ fn aggregate_sql_appends_version_dependent_filters_after_the_survivor_predicate(
 /// across every combination of the branches that vary.
 #[test]
 fn aggregate_sql_never_emits_an_empty_clause_or_a_double_space() {
-    let outer_variants: [Vec<String>; 2] = [vec![], vec!["status = ?".to_owned()]];
+    let extra_variants: [Vec<String>; 2] = [vec![], vec!["status = ?".to_owned()]];
     let grouping_variants = [("", ""), (" GROUP BY 1", " LIMIT 100001")];
 
-    for outer in &outer_variants {
+    for extra in &extra_variants {
         for (group_by, limit_clause) in grouping_variants {
+            let mut all = clauses();
+            all.extend(extra.iter().cloned());
             let sql = ChRecordStore::build_aggregate_sql(
                 "SUM(value) AS agg",
-                &inner(),
-                outer,
+                &all,
                 group_by,
                 limit_clause,
             );
-            let ctx = format!("outer={outer:?} group_by={group_by:?} sql={sql}");
+            let ctx = format!("extra={extra:?} group_by={group_by:?} sql={sql}");
             assert!(!sql.contains("  "), "double space: {ctx}");
             assert!(!sql.contains("WHERE )"), "empty WHERE before close: {ctx}");
             assert!(!sql.contains("WHERE GROUP BY"), "empty WHERE: {ctx}");
@@ -1182,94 +1163,84 @@ fn aggregate_sql_never_emits_an_empty_clause_or_a_double_space() {
     }
 }
 
-/// The ungrouped shape (`dim_count == 0`) appends nothing after the survivor
-/// predicate. The gateway depends on this call producing exactly one bucket, so
+/// The ungrouped shape (`dim_count == 0`) appends nothing after the last
+/// clause. The gateway depends on this call producing exactly one bucket, so
 /// the text must not gain a stray clause that could filter it away.
 #[test]
-fn aggregate_sql_ungrouped_ends_at_the_survivor_predicate() {
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &inner(), &[], "", "");
-    assert!(
-        sql.ends_with("AND status = 'inactive')"),
-        "no grouping and no trailing filter means nothing follows: {sql}"
-    );
+fn aggregate_sql_ungrouped_ends_at_its_last_clause() {
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &clauses(), "", "");
+    assert!(sql.ends_with("AND corrects_id IS NULL"), "{sql}");
 }
 
-/// The scan keeps every version-invariant predicate, where it prunes.
-/// `tenant_id` and `created_at` reach `aggregate` only through `$filter`, and
-/// with `gts_id` they are the whole sort-key prefix.
+/// The key-prefix predicates — `tenant_id` and `created_at` reach `aggregate`
+/// only through `$filter`, and with `gts_id` they are the whole sort-key
+/// prefix — are conjuncts of the one `WHERE`, where they prune the read.
 #[test]
-fn aggregate_sql_keeps_invariant_predicates_in_the_scan() {
-    let mut scan = inner();
+fn aggregate_sql_keeps_key_prefix_predicates_in_the_where() {
+    let mut scan = clauses();
+    scan.push("tenant_id = ?".to_owned());
     scan.push("created_at >= fromUnixTimestamp64Micro(?)".to_owned());
-    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, &[], "", "");
-    assert!(
-        sql.starts_with(
-            "SELECT SUM(value) AS agg FROM usage_records WHERE gts_id = ? AND corrects_id IS NULL \
-             AND created_at >= fromUnixTimestamp64Micro(?) AND status = 'active'"
-        ),
-        "invariant conjuncts belong on the scan, ahead of the survivor predicate: {sql}"
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, "", "");
+    assert_eq!(
+        sql,
+        "SELECT SUM(value) AS agg FROM usage_records FINAL WHERE gts_id = ? AND \
+         status = 'active' AND corrects_id IS NULL AND tenant_id = ? AND \
+         created_at >= fromUnixTimestamp64Micro(?)"
     );
 }
 
-/// `list` is likewise single-level: no version sort, no `LIMIT 1 BY`, the
-/// caller's `ORDER BY` and look-ahead `LIMIT` applied once, after every
-/// predicate. Its survivor predicate keeps markers (they *are* the resolved
-/// inactive rows) and drops only the active rows a marker supersedes.
+/// `list` is likewise one `FINAL` read: no version sort, no `LIMIT 1 BY`, no
+/// subquery, the caller's `ORDER BY` and look-ahead `LIMIT` applied once after
+/// every predicate. There is no `status` clause of its own — `list` returns
+/// inactive rows at their resolved status.
 #[test]
-fn list_sql_is_a_single_level_scan_with_the_resolved_survivors() {
+fn list_sql_reads_final_then_orders_and_limits() {
     let scan = vec!["gts_id = ?".to_owned()];
-    let sql = ChRecordStore::build_list_sql(&scan, &[], "created_at ASC, id ASC", 101);
+    let sql = ChRecordStore::build_list_sql(&scan, "created_at ASC, id ASC", 101);
     assert_eq!(
         sql,
         format!(
-            "SELECT {} FROM usage_records WHERE gts_id = ? AND (status = 'inactive' OR id NOT IN \
-             (SELECT id FROM usage_records WHERE gts_id = ? AND status = 'inactive')) \
+            "SELECT {} FROM usage_records FINAL WHERE gts_id = ? \
              ORDER BY created_at ASC, id ASC LIMIT 101",
             super::RECORD_COLUMNS
         )
     );
-    for forbidden in ["LIMIT 1 BY", "version DESC", "argMax", "GROUP BY"] {
+    for forbidden in ["LIMIT 1 BY", "version DESC", "argMax", "GROUP BY", "NOT IN"] {
         assert!(
             !sql.contains(forbidden),
             "no resolution construct may remain (`{forbidden}`): {sql}"
         );
     }
+    assert!(
+        !sql.contains("status ="),
+        "list carries no status predicate of its own: {sql}"
+    );
 }
 
-/// Bind contract for `list`: scan binds twice, then the trailing binds (the
-/// `status` half of `$filter`, then the keyset tuple) in that order.
+/// Bind contract for `list`: every clause once, in text order, the keyset
+/// tuple last before `ORDER BY`.
 #[test]
-fn list_sql_places_trailing_predicates_after_the_survivors_and_before_order_by() {
+fn list_sql_places_the_keyset_predicate_last_before_order_by() {
     let scan = vec![
         "gts_id = ?".to_owned(),
         "tenant_id = ?".to_owned(),
         "metadata[?] IN (?)".to_owned(),
-    ];
-    let outer = vec![
         "status = ?".to_owned(),
         "(created_at, id) > (fromUnixTimestamp64Micro(?), ?)".to_owned(),
     ];
-    let sql = ChRecordStore::build_list_sql(&scan, &outer, "created_at ASC, id ASC", 51);
-    let scan_placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
-    let outer_placeholders: usize = outer.iter().map(|c| c.matches('?').count()).sum();
+    let sql = ChRecordStore::build_list_sql(&scan, "created_at ASC, id ASC", 51);
+    let placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
     assert_eq!(
         sql.matches('?').count(),
-        2 * scan_placeholders + outer_placeholders,
-        "scan binds twice, trailing binds once: {sql}"
+        placeholders,
+        "each bind once: {sql}"
     );
     assert!(
-        sql.contains(
-            "AND status = 'inactive')) AND status = ? \
-             AND (created_at, id) > (fromUnixTimestamp64Micro(?), ?) \
+        sql.ends_with(
+            "AND status = ? AND (created_at, id) > (fromUnixTimestamp64Micro(?), ?) \
              ORDER BY created_at ASC, id ASC LIMIT 51"
         ),
-        "status half, then keyset, then ORDER BY / LIMIT: {sql}"
-    );
-    let subquery_start = sql.find("(SELECT id").expect("marker subquery present");
-    let keyset_start = sql.find("(created_at, id) >").expect("keyset present");
-    assert!(
-        keyset_start > subquery_start,
-        "the keyset predicate must follow the survivor predicate: {sql}"
+        "status, then keyset, then ORDER BY / LIMIT: {sql}"
     );
 }
 
@@ -1470,6 +1441,7 @@ fn offline_store_without_insert_validation() -> ChRecordStore {
         Arc::new(Metrics::new()),
         std::time::Duration::from_secs(30),
         true,
+        None,
     )
 }
 
@@ -1888,6 +1860,7 @@ async fn get_against_an_unreachable_backend_clears_readiness() {
         Arc::clone(&metrics),
         std::time::Duration::from_secs(5),
         true,
+        None,
     );
 
     let err = store
@@ -2100,4 +2073,220 @@ async fn create_batch_of_only_unrepresentable_values_issues_no_statement() {
         .as_ref()
         .expect_err("the only record is refused");
     assert_decimal_rejection(err, "the only slot");
+}
+
+// ── group commit through the store ───────────────────────────────────────────
+//
+// The pre-checks (catalog, dedup) run against the in-process mock server; the
+// write goes through a real `IngestQueue` whose batcher flushes into a scripted
+// fake sink, so what reaches the "INSERT" and how each slot is decided are both
+// observable without Docker. Real time (not the paused clock): the mock server
+// is real I/O, which a paused clock would race against the client deadline.
+
+mod group_commit {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use clickhouse::test::Mock;
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+    use usage_collector_sdk::{UsageCollectorPluginError, UsageRecord};
+
+    use super::{ChRecordStore, InsertKind, VCPU_GTS, insert_dedup_token};
+    use crate::domain::ports::RecordStore;
+    use crate::infra::metrics::Metrics;
+    use crate::infra::storage::entity::UsageRecordRow;
+    use crate::infra::storage::ingest::sink::FlushSink;
+    use crate::infra::storage::ingest::sink::test_support::{FakeSink, Step};
+    use crate::infra::storage::ingest::test_rows::{row, row_with_value};
+    use crate::infra::storage::ingest::{IngestLimits, IngestQueue, PendingCall};
+    use crate::infra::storage::test_mock::{client, ok, rows};
+
+    fn limits() -> IngestLimits {
+        IngestLimits {
+            max_rows: 100,
+            max_bytes: 1 << 20,
+            max_wait: Duration::from_millis(10),
+            queue_capacity: 8,
+            max_concurrent_flushes: 2,
+            max_outstanding_rows: 300,
+            max_outstanding_bytes: 3 << 20,
+            drain_deadline: Duration::from_secs(5),
+        }
+    }
+
+    /// A store over the mock server with (or without) a running queue.
+    struct Rig {
+        /// Kept alive: the client points at it.
+        _mock: Mock,
+        store: ChRecordStore,
+        queue: Arc<IngestQueue>,
+        sink: Arc<FakeSink>,
+        _cancel: CancellationToken,
+    }
+
+    fn rig(mock: Mock, batching: bool, queue_capacity: usize) -> Rig {
+        let mut l = limits();
+        l.queue_capacity = queue_capacity;
+        let queue = IngestQueue::new(l, Arc::new(Metrics::new()));
+        let sink = FakeSink::new();
+        let cancel = CancellationToken::new();
+        let dyn_sink: Arc<dyn FlushSink> = Arc::clone(&sink) as Arc<dyn FlushSink>;
+        drop(tokio::spawn(
+            Arc::clone(&queue).run(dyn_sink, cancel.clone()),
+        ));
+        let store = ChRecordStore::new(
+            client(&mock),
+            Arc::new(Metrics::new()),
+            Duration::from_secs(5),
+            false,
+            batching.then(|| Arc::clone(&queue)),
+        );
+        Rig {
+            _mock: mock,
+            store,
+            queue,
+            sink,
+            _cancel: cancel,
+        }
+    }
+
+    fn record(n: u128) -> UsageRecord {
+        UsageRecord::try_from(row(n)).expect("fixture row maps to a record")
+    }
+
+    /// Queue the catalog hit and an empty dedup pre-read for one `create`.
+    fn prechecks_for_new_record(mock: &Mock) {
+        rows(mock, [VCPU_GTS.to_owned()]);
+        rows(mock, Vec::<UsageRecordRow>::new());
+    }
+
+    #[tokio::test]
+    async fn create_through_the_queue_returns_the_record_after_its_flush() {
+        let mock = Mock::new();
+        prechecks_for_new_record(&mock);
+        let r = rig(mock, true, 8);
+        let rec = record(1);
+
+        let stored = r.store.create(rec.clone()).await.expect("create");
+        assert_eq!(stored.id, rec.id);
+        let calls = r.sink.calls();
+        assert_eq!(calls.len(), 1, "one flush carried the row");
+        assert_eq!(calls[0].rows.len(), 1);
+        assert_eq!(calls[0].rows[0].id, rec.id);
+        assert_eq!(
+            calls[0].token,
+            insert_dedup_token(&calls[0].rows, InsertKind::Record)
+        );
+        assert_eq!(r.queue.snapshot().coalesce_entries, 0);
+    }
+
+    /// Per-row outcomes map back onto the slots each composed row backs: a
+    /// row refused against a differing pending twin is that slot's
+    /// `IdempotencyConflict`, the rest succeed, and a locally rejected slot is
+    /// untouched by the write.
+    #[tokio::test]
+    async fn create_batch_through_the_queue_maps_row_outcomes_onto_slots() {
+        let mock = Mock::new();
+        rows(&mock, [VCPU_GTS.to_owned()]);
+        rows(&mock, Vec::<UsageRecordRow>::new());
+        let r = rig(mock, true, 8);
+
+        // A differing payload for record 2's key is pending in flight.
+        let gate = Arc::new(Notify::new());
+        r.sink.script([Step::Gate(Arc::clone(&gate))]);
+        let pending = r
+            .queue
+            .submit(PendingCall {
+                rows: vec![row_with_value(2, 999)],
+            })
+            .expect("admitted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(r.sink.call_count(), 1, "the twin is in flight");
+
+        let mut unrepresentable = record(3);
+        unrepresentable.value = rust_decimal::Decimal::new(1, 12);
+        let batch = vec![record(1), record(2), unrepresentable];
+        let outcomes = r.store.create_batch(batch).await.expect("batch");
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
+        match &outcomes[1] {
+            Err(UsageCollectorPluginError::IdempotencyConflict { existing_id, .. }) => {
+                assert_eq!(*existing_id, record(2).id);
+            }
+            other => panic!("expected a conflict against the pending twin, got {other:?}"),
+        }
+        assert!(
+            matches!(outcomes[2], Err(UsageCollectorPluginError::Internal(_))),
+            "the value check decided slot 2 before any statement"
+        );
+        gate.notify_one();
+        assert!(pending.wait(Duration::from_secs(5)).await.is_ok());
+        let calls = r.sink.calls();
+        assert_eq!(calls.len(), 2, "the twin's flush and the batch's flush");
+        assert_eq!(
+            calls[1].rows.len(),
+            1,
+            "only record 1 was written by the batch"
+        );
+    }
+
+    /// An admission rejection reaches only the slots backed by a composed row;
+    /// a slot absorbed from storage keeps the outcome the pre-read decided.
+    #[tokio::test]
+    async fn create_batch_admission_rejection_fans_out_only_to_backed_slots() {
+        let mock = Mock::new();
+        rows(&mock, [VCPU_GTS.to_owned()]);
+        // Record 1 is already stored (identical payload) → absorbed.
+        rows(&mock, vec![row(1)]);
+        let r = rig(mock, true, 1);
+
+        // Fill the one admission slot with a gated call.
+        let gate = Arc::new(Notify::new());
+        r.sink.script([Step::Gate(Arc::clone(&gate))]);
+        let filler = r
+            .queue
+            .submit(PendingCall { rows: vec![row(9)] })
+            .expect("admitted");
+
+        let outcomes = r
+            .store
+            .create_batch(vec![record(1), record(2)])
+            .await
+            .expect("batch");
+        assert!(outcomes[0].is_ok(), "absorbed slot keeps its outcome");
+        assert!(
+            matches!(
+                outcomes[1],
+                Err(UsageCollectorPluginError::Transient { .. })
+            ),
+            "the composed slot carries the admission rejection: {:?}",
+            outcomes[1]
+        );
+        gate.notify_one();
+        assert!(filler.wait(Duration::from_secs(5)).await.is_ok());
+    }
+
+    /// Deactivation markers are written synchronously by the store itself,
+    /// never through the queue.
+    #[tokio::test]
+    async fn deactivate_bypasses_the_queue() {
+        let mock = Mock::new();
+        rows(&mock, vec![row(4)]);
+        ok(&mock); // the marker INSERT, straight to the client
+        let r = rig(mock, true, 8);
+        r.store.deactivate(row(4).id).await.expect("deactivate");
+        assert_eq!(r.sink.call_count(), 0, "no flush carried the marker");
+    }
+
+    /// With group commit disabled the store issues its own INSERT.
+    #[tokio::test]
+    async fn batching_disabled_uses_the_direct_insert() {
+        let mock = Mock::new();
+        prechecks_for_new_record(&mock);
+        ok(&mock); // the direct INSERT
+        let r = rig(mock, false, 8);
+        r.store.create(record(5)).await.expect("create");
+        assert_eq!(r.sink.call_count(), 0);
+    }
 }

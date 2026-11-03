@@ -56,6 +56,40 @@ use crate::infra::metrics::{ErrorClass, Metrics};
 /// can make.
 const RETRYABLE_CH_CODES: [u32; 9] = [159, 202, 203, 209, 210, 252, 279, 285, 999];
 
+/// Server-reported `ClickHouse` error codes that describe the *content* of an
+/// inserted row rather than the server, the schema, or the statement as a
+/// whole — the only failures for which retrying each call of a combined
+/// group-commit flush on its own can change the outcome.
+///
+/// A closed allowlist like [`RETRYABLE_CH_CODES`]: an unrecognised code fans
+/// out to every waiter instead of triggering one extra `INSERT` per call.
+///
+/// - `6` `CANNOT_PARSE_TEXT`, `27` `CANNOT_PARSE_INPUT_ASSERTION_FAILED`,
+///   `38` `CANNOT_PARSE_DATE`, `41` `CANNOT_PARSE_DATETIME`,
+///   `72` `CANNOT_PARSE_NUMBER`, `117` `INCORRECT_DATA` — malformed input.
+///   The plugin sends `RowBinary`, so these are unlikely, but they are the
+///   canonical row-content codes and cost nothing to recognise.
+/// - `69` `ARGUMENT_OUT_OF_BOUND`, `321` `VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`,
+///   `407` `DECIMAL_OVERFLOW` — a value one column cannot hold.
+///
+/// Deliberately excluded: `36` `BAD_ARGUMENTS` and `53` `TYPE_MISMATCH`
+/// (statement/schema level), `241` `MEMORY_LIMIT_EXCEEDED` and `252`
+/// `TOO_MANY_PARTS` (server-wide), and every permission or unknown-table code.
+pub(crate) const ROW_ATTRIBUTABLE_CH_CODES: [u32; 9] = [6, 27, 38, 41, 69, 72, 117, 321, 407];
+
+/// How a failed group-commit flush is handled by the ingest queue
+/// (`storage::ingest`): retried as a whole, isolated per call, or fanned out
+/// to every waiter as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Retryable with the identical flush ([`is_retryable`]).
+    Transient,
+    /// Attributable to the content of some row ([`ROW_ATTRIBUTABLE_CH_CODES`]).
+    RowAttributable,
+    /// Everything else: schema, permission, protocol, unknown.
+    Internal,
+}
+
 /// HTTP statuses worth retrying when `ClickHouse` returned no readable body.
 ///
 /// The `clickhouse` crate falls back to a `"<status> <reason>"` string when the
@@ -104,6 +138,47 @@ fn retryable_server_code(err: &ChError) -> bool {
         return leading_u32(after_code).is_some_and(|code| RETRYABLE_CH_CODES.contains(&code));
     }
     leading_u32(text).is_some_and(|status| RETRYABLE_HTTP_STATUSES.contains(&status))
+}
+
+/// The leading `Code: <n>` of a [`ChError::BadResponse`] body, by the same
+/// start-of-string rule as [`retryable_server_code`]; `None` for any other
+/// variant or shape.
+#[must_use]
+fn server_code(err: &ChError) -> Option<u32> {
+    let ChError::BadResponse(text) = err else {
+        return None;
+    };
+    text.trim_start()
+        .strip_prefix("Code:")
+        .and_then(leading_u32)
+}
+
+/// Classify a `ClickHouse` error for the ingest queue's flush policy.
+///
+/// Retryable errors ([`is_retryable`]) are `Transient`; a leading server code
+/// on [`ROW_ATTRIBUTABLE_CH_CODES`] is `RowAttributable`; everything else is
+/// `Internal`. The transient check comes first so a retryable code can never
+/// be mistaken for a row problem.
+#[must_use]
+pub(crate) fn classify(err: &ChError) -> FailureKind {
+    if is_retryable(err) {
+        FailureKind::Transient
+    } else if server_code(err).is_some_and(|code| ROW_ATTRIBUTABLE_CH_CODES.contains(&code)) {
+        FailureKind::RowAttributable
+    } else {
+        FailureKind::Internal
+    }
+}
+
+/// Classify an already-mapped plugin error (for failures that never had a
+/// `ClickHouse` error, such as an expired client-side deadline): `Transient`
+/// stays `Transient`, everything else is `Internal`.
+#[must_use]
+pub(crate) fn kind_of(err: &UsageCollectorPluginError) -> FailureKind {
+    match err {
+        UsageCollectorPluginError::Transient { .. } => FailureKind::Transient,
+        _ => FailureKind::Internal,
+    }
 }
 
 /// Parse the leading run of ASCII digits (after any leading whitespace).

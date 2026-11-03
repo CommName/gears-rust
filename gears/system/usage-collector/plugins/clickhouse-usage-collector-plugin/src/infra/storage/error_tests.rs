@@ -6,7 +6,10 @@ use usage_collector_sdk::UsageCollectorPluginError;
 use opentelemetry::metrics::MeterProvider as _;
 use tokio_util::sync::CancellationToken;
 
-use super::{error_clears_readiness, map_ch_err, tracked_ch_err, with_deadline};
+use super::{
+    FailureKind, classify, error_clears_readiness, kind_of, map_ch_err, tracked_ch_err,
+    with_deadline,
+};
 use crate::infra::metrics::metrics_tests::{gauge_last_u64, local_provider};
 use crate::infra::metrics::{Metrics, SCOPE_NAME};
 
@@ -344,5 +347,68 @@ async fn with_deadline_clears_readiness_when_the_deadline_expires() {
         ready_gauge(&provider, &exporter),
         Some(0),
         "an expired client-side deadline must clear the readiness gauge"
+    );
+}
+
+// ── classify (group-commit flush policy) ─────────────────────────────────────
+
+/// Retryable first, then the row-content allowlist, then everything else.
+#[test]
+fn classify_splits_transient_row_attributable_and_internal() {
+    assert_eq!(classify(&ChError::TimedOut), FailureKind::Transient);
+    assert_eq!(
+        classify(&ChError::BadResponse(
+            "Code: 252. DB::Exception: Too many parts".to_owned()
+        )),
+        FailureKind::Transient
+    );
+    assert_eq!(
+        classify(&ChError::BadResponse(
+            "Code: 407. DB::Exception: Decimal math overflow".to_owned()
+        )),
+        FailureKind::RowAttributable
+    );
+    assert_eq!(
+        classify(&ChError::BadResponse(
+            "Code: 60. DB::Exception: Unknown table".to_owned()
+        )),
+        FailureKind::Internal
+    );
+    assert_eq!(
+        classify(&ChError::BadResponse(
+            "Code: 497. DB::Exception: Access denied".to_owned()
+        )),
+        FailureKind::Internal
+    );
+    assert_eq!(classify(&ChError::RowNotFound), FailureKind::Internal);
+}
+
+/// Only the leading code counts, as for the retryable classification: a
+/// permanent outer error quoting a row-content code from another node stays
+/// internal.
+#[test]
+fn row_attributable_code_is_read_from_the_leading_code_only() {
+    let nested = "Code: 60. DB::Exception: Received from shard: Code: 407. Decimal overflow";
+    assert_eq!(
+        classify(&ChError::BadResponse(nested.to_owned())),
+        FailureKind::Internal
+    );
+    let bare = "407 Decimal overflow";
+    assert_eq!(
+        classify(&ChError::BadResponse(bare.to_owned())),
+        FailureKind::Internal
+    );
+}
+
+/// An already-mapped plugin error keeps its transient/internal split.
+#[test]
+fn kind_of_mapped_errors_keeps_the_transient_split() {
+    assert_eq!(
+        kind_of(&UsageCollectorPluginError::transient("x")),
+        FailureKind::Transient
+    );
+    assert_eq!(
+        kind_of(&UsageCollectorPluginError::internal("x")),
+        FailureKind::Internal
     );
 }

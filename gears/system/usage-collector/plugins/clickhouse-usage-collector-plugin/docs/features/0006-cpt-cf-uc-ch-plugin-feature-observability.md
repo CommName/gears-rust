@@ -108,15 +108,36 @@ All instruments live under the `uc_clickhouse_` prefix, registered on the `uc.cl
 
 | Instrument | Kind | Labels | Description |
 | --- | --- | --- | --- |
-| `uc_clickhouse_insert_duration_seconds` | Histogram | `mode: single \| batch` | Duration of the record `INSERT` for a single-row vs. multi-row write. |
-| `uc_clickhouse_batch_rows` | Histogram | — | Row count per batch write (bucket boundaries `1, 5, 10, 50, 100, 500, 1000`). |
+| `uc_clickhouse_insert_duration_seconds` | Histogram | `mode: single \| batch \| flush` | `single` / `batch`: a `create_usage_record` / `create_usage_records` as the caller observes it (pre-checks, queue wait and flush included with group commit on; the direct `INSERT` otherwise). `flush`: one group-commit flush `INSERT` alone. |
+| `uc_clickhouse_batch_rows` | Histogram | — | Row count per `create_usage_records` call's composed rows (bucket boundaries `1, 5, 10, 50, 100, 500, 1000`). |
 | `uc_clickhouse_dedup_absorbed_total` | Counter | — | Exact-equality retries silently absorbed on the dedup key (single and batch paths). |
 | `uc_clickhouse_idempotency_conflicts_total` | Counter | — | Canonical-field-mismatch idempotency conflicts on the dedup key. |
 | `uc_clickhouse_compensations_total` | Counter | — | Inserts carrying a `corrects_id` (compensating records). |
 | `uc_clickhouse_deactivate_duration_seconds` | Histogram | — | `deactivate_usage_record` cascade duration. |
 | `uc_clickhouse_pool_acquire_duration_seconds` | Histogram | — | Time to acquire an HTTP connection from the `ClickHouse` client pool (recorded on both write and catalog paths). |
 
-There is **no** `uc_clickhouse_dedup_outcomes_total` and no `outcome` label: the three dedup outcomes are separate counters as listed above, and a plain fresh insert increments none of them (it is observable as `uc_clickhouse_insert_duration_seconds` recordings minus the absorb/conflict counters).
+There is **no** `uc_clickhouse_dedup_outcomes_total`: the three dedup outcomes are separate counters as listed above, and a plain fresh insert increments none of them (it is observable as `uc_clickhouse_insert_duration_seconds` recordings minus the absorb/conflict counters).
+
+**Group commit** (`infra/storage/ingest`; every label value is a closed Rust enum):
+
+| Instrument | Kind | Labels | Description |
+| --- | --- | --- | --- |
+| `uc_clickhouse_ingest_outstanding_calls` | Gauge | `state: queued \| in_flight` | Calls admitted to the queue: not yet cut into a flush / cut into a flush whose `INSERT` has not resolved. |
+| `uc_clickhouse_ingest_outstanding_rows` | Gauge | `state: queued \| in_flight` | Rows admitted, by state. |
+| `uc_clickhouse_ingest_outstanding_bytes` | Gauge | `state: queued \| in_flight` | Estimated row bytes admitted, by state — the unit `insert_batch.max_bytes` and the byte bound are measured in. |
+| `uc_clickhouse_ingest_queue_wait_seconds` | Histogram | — | Per call: admission to its cut (bucket boundaries `0.001 … 5.0`). |
+| `uc_clickhouse_ingest_queue_age_seconds` | Histogram | — | Per flush: the age of its oldest call at the cut — what `max_wait_ms` bounds. |
+| `uc_clickhouse_flush_rows` | Histogram | — | Rows per flush `INSERT` (`1 … 50000`). |
+| `uc_clickhouse_flush_bytes` | Histogram | — | Estimated bytes per flush `INSERT` (`1 KiB … 64 MiB`). |
+| `uc_clickhouse_flush_duration_seconds` | Histogram | `outcome: ok \| transient \| internal \| isolated \| abandoned \| aborted` | Duration of a flush, retries and isolation attempts included, by outcome. |
+| `uc_clickhouse_flushes_total` | Counter | `outcome` (as above) | Flushes by outcome: `ok`; `transient` (failed after the bounded retries); `internal` (a non-retryable failure fanned out); `isolated` (a row-attributable failure retried per call); `abandoned` (a transient failure with no waiter left); `aborted` (the flush task ended before resolving its rows: panic, drain deadline, hard abort). |
+| `uc_clickhouse_admission_rejected_total` | Counter | `reason: calls \| rows \| bytes \| oversize \| closed` | Calls refused at admission: the outstanding call / row / byte bound, a call that alone exceeds a bound, or admission closed for shutdown. |
+| `uc_clickhouse_coalesced_rows_total` | Counter | — | Rows that joined an identical row already queued or in flight **in this instance**. An instance-local count: another instance's identical write is never seen here and is resolved at read time, so this is **not** a cross-instance duplicate count. |
+| `uc_clickhouse_coalesce_conflicts_total` | Counter | — | Rows refused as `IdempotencyConflict` against a differing pending row in this instance. |
+| `uc_clickhouse_flush_retries_total` | Counter | — | Whole-flush retries after a transient failure. |
+| `uc_clickhouse_isolation_attempts_total` | Counter | — | Per-call isolated `INSERT`s after a row-attributable failure of a combined flush. |
+| `uc_clickhouse_ingest_wait_timeouts_total` | Counter | — | Calls whose request budget expired while waiting on their flush (a caller dropped by the gateway's own timeout is not counted here). |
+| `uc_clickhouse_shutdown_drain_total` | Counter | `outcome: drained \| deadline \| aborted` | Batcher stops: every flush completed; in-flight flushes aborted at the drain deadline; the batcher stopped without draining (hard abort or panic). |
 
 **Read path**:
 
@@ -152,9 +173,9 @@ There is **no** `uc_clickhouse_dedup_outcomes_total` and no `outcome` label: the
 - [ ] `p3` - **ID**: `cpt-cf-uc-ch-plugin-algo-observability-conventions`
 
 1. **No unbounded identifier labels**: `tenant_id`, `gts_id`, record `id`, or any other unbounded caller-supplied string is never a metric label key or value.
-2. **Explicit histogram bucket boundaries**: every histogram **MUST** declare explicit bucket boundaries (not the OpenTelemetry SDK default). Every duration histogram shares one seconds-valued layout — `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0` — chosen to bracket the §1.2 p95 budgets with finer low-end resolution (pool acquire, single insert) while still covering the 500ms aggregation budget; `uc_clickhouse_batch_rows` uses the row-count layout `1, 5, 10, 50, 100, 500, 1000`.
+2. **Explicit histogram bucket boundaries**: every histogram **MUST** declare explicit bucket boundaries (not the OpenTelemetry SDK default). Every duration histogram shares one seconds-valued layout — `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0` — chosen to bracket the §1.2 p95 budgets with finer low-end resolution (pool acquire, single insert) while still covering the 500ms aggregation budget, except the two queue-wait histograms, which start at `0.001` because `max_wait_ms` defaults to tens of milliseconds; `uc_clickhouse_batch_rows` uses the row-count layout `1, 5, 10, 50, 100, 500, 1000`, `uc_clickhouse_flush_rows` `1 … 50000` and `uc_clickhouse_flush_bytes` `1 KiB … 64 MiB`.
 3. **`error_category` label values** for `uc_clickhouse_backend_errors_total` are exactly the two SPI classifications: `transient` and `internal`. Typed domain outcomes (`IdempotencyConflict`, `UsageTypeReferenced`, `UsageRecordNotFound`, `UsageTypeAlreadyExists`, …) are **not** `error_category` values — they are ordinary SPI results, and the ones worth counting have their own dedicated counters (`uc_clickhouse_idempotency_conflicts_total`). Each label value is backed by a closed Rust enum (`ErrorClass`), so an out-of-set value is unrepresentable at a call site.
-4. **`mode` label values**: `single` / `batch` on `uc_clickhouse_insert_duration_seconds` (write shape) — the only `mode`-labelled instrument. `single`/`batch` and `raw`/`aggregated` are each backed by a closed Rust enum (`InsertMode`, `QueryKind`).
+4. **`mode` label values**: `single` / `batch` / `flush` on `uc_clickhouse_insert_duration_seconds` (write shape) — the only `mode`-labelled instrument. `single`/`batch`/`flush`, `raw`/`aggregated`, the queue's `state`, `outcome` and `reason` values are each backed by a closed Rust enum (`InsertMode`, `QueryKind`, `OutstandingState`, `FlushOutcome` / `DrainOutcome`, `AdmissionReason`).
 5. All instruments are registered through the `opentelemetry` crate's SDK-agnostic API (meter obtained from the global `MeterProvider`); the plugin does not depend on a specific OTLP exporter.
 
 ### Orphaned Reference Reconciliation (Defense-in-Depth)
@@ -188,7 +209,7 @@ Why the worker is still safe to defer: the two ways an orphan can arise are both
 
 - [x] `p3` - **ID**: `cpt-cf-uc-ch-plugin-dod-observability-write-path`
 
-The system **MUST** implement `uc_clickhouse_insert_duration_seconds` (Histogram, label `mode: single|batch`), `uc_clickhouse_batch_rows` (Histogram), the three dedup-outcome counters `uc_clickhouse_dedup_absorbed_total` / `uc_clickhouse_idempotency_conflicts_total` / `uc_clickhouse_compensations_total`, `uc_clickhouse_deactivate_duration_seconds` (Histogram), and `uc_clickhouse_pool_acquire_duration_seconds` (Histogram). Each instrument **MUST** be recorded at the appropriate call site in `ChRecordStore`, **except** `uc_clickhouse_pool_acquire_duration_seconds`, which is not write-path-exclusive: the pool is shared, so it **MUST** additionally be recorded on the catalog path in `ChCatalogStore`, matching its inventory row in [§3](#3-processes--business-logic-cdsl) ("recorded on both write and catalog paths"). All histograms **MUST** declare explicit bucket boundaries.
+The system **MUST** implement `uc_clickhouse_insert_duration_seconds` (Histogram, label `mode: single|batch|flush`), `uc_clickhouse_batch_rows` (Histogram), the three dedup-outcome counters `uc_clickhouse_dedup_absorbed_total` / `uc_clickhouse_idempotency_conflicts_total` / `uc_clickhouse_compensations_total`, `uc_clickhouse_deactivate_duration_seconds` (Histogram), `uc_clickhouse_pool_acquire_duration_seconds` (Histogram), and the group-commit instruments of the §3 inventory (outstanding gauges by `state`, queue wait and age histograms, flush rows / bytes / duration and `uc_clickhouse_flushes_total` by `outcome`, `uc_clickhouse_admission_rejected_total` by `reason`, the instance-local coalescing counters, retry and isolation counters, wait timeouts, and `uc_clickhouse_shutdown_drain_total` by `outcome`), recorded by the ingest queue. Each instrument **MUST** be recorded at the appropriate call site in `ChRecordStore`, **except** `uc_clickhouse_pool_acquire_duration_seconds`, which is not write-path-exclusive: the pool is shared, so it **MUST** additionally be recorded on the catalog path in `ChCatalogStore`, matching its inventory row in [§3](#3-processes--business-logic-cdsl) ("recorded on both write and catalog paths"). All histograms **MUST** declare explicit bucket boundaries.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-observability-inventory` (write-path instruments), `cpt-cf-uc-ch-plugin-flow-observability-request-path`
 

@@ -24,6 +24,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bigdecimal::BigDecimal;
@@ -40,6 +41,7 @@ use usage_collector_sdk::{AggregationOp, AggregationSpec, UsageCollectorPluginEr
 use clickhouse_usage_collector_plugin::config::ClickHousePluginConfig;
 use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
 use clickhouse_usage_collector_plugin::infra::storage::catalog_store::ChCatalogStore;
+use clickhouse_usage_collector_plugin::infra::storage::ingest::IngestQueue;
 use clickhouse_usage_collector_plugin::infra::storage::migrator::{
     MIGRATIONS_TRACKER, MigrationOptions, migration_client, render_ddl, run_migrations,
 };
@@ -265,12 +267,22 @@ fn plugin_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
 /// wired exactly as `Gear::init` wires them.
 fn stores(cfg: &ClickHousePluginConfig) -> (clickhouse::Client, ChRecordStore, ChCatalogStore) {
     let client = plugin_client(cfg);
+    // Group commit as `Gear::init` wires it; the batcher runs for the test's
+    // lifetime on a token nothing cancels.
+    let queue = IngestQueue::new(
+        cfg.insert_batch.limits(common::TEST_REQUEST_TIMEOUT),
+        common::metrics(),
+    );
     let records = ChRecordStore::new(
         client.clone(),
         common::metrics(),
         common::TEST_REQUEST_TIMEOUT,
         cfg.async_insert,
+        Some(Arc::clone(&queue)),
     );
+    drop(tokio::spawn(
+        queue.run(records.flush_sink(), CancellationToken::new()),
+    ));
     let catalog = ChCatalogStore::new(
         client.clone(),
         CancellationToken::new(),
@@ -382,8 +394,8 @@ async fn ch_cluster_records_round_trip_across_shards() {
         assert_eq!(records.get(r.id).await.expect("get").id, r.id);
     }
 
-    // Deactivate four rows spread over the tenants. Each marker must land on
-    // its row's shard for the shard-local anti-join to exclude the row.
+    // Deactivate four rows spread over the tenants. Each marker lands on its
+    // row's shard, where the per-shard FINAL resolves it over the row.
     for r in recs.iter().step_by(4) {
         records.deactivate(r.id).await.expect("deactivate");
     }
@@ -684,6 +696,254 @@ async fn ch_cluster_starts_with_a_node_down() {
     );
 }
 
+/// Wait until every node of the cluster answers again.
+async fn wait_for_all_replicas(client: &clickhouse::Client, want: u64) {
+    for _ in 0..120 {
+        if let Ok(n) = client
+            .query(&format!(
+                "SELECT count() FROM clusterAllReplicas('{CLUSTER}', system.one)"
+            ))
+            .fetch_one::<u64>()
+            .await
+            && n == want
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("the cluster did not recover to {want} replicas");
+}
+
+/// A group-committed insert through the `Distributed` table is committed on
+/// the owning shard before the call returns: the local tables hold the row
+/// and nothing is deferred in the distribution queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_cluster_insert_is_committed_on_the_owning_shard_before_ack() {
+    let Some(cluster) = boot_or_skip().await else {
+        return;
+    };
+    let cfg = cluster_config(&cluster);
+    let (client, records, catalog) = stores(&cfg);
+    catalog
+        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
+        .await
+        .expect("register usage type");
+    let rec = common::fixture_usage_record(
+        VCPU_GTS,
+        Uuid::from_u128(0xC200),
+        "idem-ack",
+        Decimal::from(5),
+    );
+    records.create(rec.clone()).await.expect("create");
+
+    let local: u64 = client
+        .query(&format!(
+            "SELECT count() FROM clusterAllReplicas('{CLUSTER}', {DATABASE}.usage_records_local) \
+             WHERE id = ?"
+        ))
+        .bind(rec.id.to_string())
+        .fetch_one::<u64>()
+        .await
+        .expect("count local rows");
+    assert_eq!(
+        local, 1,
+        "the row is on a shard-local table when create returns"
+    );
+    let queued: u64 = client
+        .query(&format!(
+            "SELECT count() FROM clusterAllReplicas('{CLUSTER}', system.distribution_queue) \
+             WHERE database = '{DATABASE}' AND table = 'usage_records' AND data_files > 0"
+        ))
+        .fetch_one::<u64>()
+        .await
+        .expect("distribution queue");
+    assert_eq!(
+        queued, 0,
+        "nothing is deferred: distributed_foreground_insert = 1"
+    );
+}
+
+/// Range reads resolve a duplicate written by another instance (another token,
+/// another version) per shard, before any merge, and a marker still wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_cluster_range_reads_resolve_a_cross_instance_duplicate_per_shard() {
+    let Some(cluster) = boot_or_skip().await else {
+        return;
+    };
+    let cfg = cluster_config(&cluster);
+    let (client, records, catalog) = stores(&cfg);
+    client
+        .query(&format!(
+            "SYSTEM STOP MERGES ON CLUSTER {CLUSTER} {DATABASE}.usage_records_local"
+        ))
+        .execute()
+        .await
+        .expect("stop merges on every node");
+    catalog
+        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
+        .await
+        .expect("register usage type");
+    let recs = ingest_sixteen_tenants(&records).await;
+
+    // Twins of two rows, written through the Distributed table so each lands
+    // on its row's shard, under a version no instance would have minted.
+    for r in [&recs[0], &recs[15]] {
+        client
+            .query(
+                "INSERT INTO usage_records SELECT * REPLACE (toUInt64(toInt64(version) + 9) AS version) \
+                 FROM usage_records WHERE id = ?",
+            )
+            .bind(r.id.to_string())
+            .execute()
+            .await
+            .expect("seed twin");
+        assert_eq!(common_raw_rows(&client, r.id).await, 2, "twin stored");
+    }
+    records.deactivate(recs[0].id).await.expect("deactivate");
+
+    let page = records
+        .list(
+            common::fixture_gts_id(VCPU_GTS),
+            &ODataQuery::new()
+                .with_limit(100)
+                .with_order(ODataOrderBy(vec![
+                    OrderKey {
+                        field: "created_at".to_owned(),
+                        dir: SortDir::Asc,
+                    },
+                    OrderKey {
+                        field: "id".to_owned(),
+                        dir: SortDir::Asc,
+                    },
+                ])),
+            &[],
+        )
+        .await
+        .expect("list");
+    assert_eq!(
+        page.items.len(),
+        16,
+        "each logical row once across both shards"
+    );
+    // Total 136 minus the deactivated value 1.
+    let (sum, count) = sum_and_count(&records).await;
+    assert_eq!(sum, Some(BigDecimal::from(135_i64)));
+    assert_eq!(count, Some(BigDecimal::from(15_i64)));
+}
+
+/// With the owning shard down a write fails as `Transient`; once it is back
+/// a retry lands exactly once, and a second retry is absorbed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_cluster_insert_fails_transient_while_the_owning_shard_is_down_and_a_retry_recovers() {
+    let Some(cluster) = boot_or_skip().await else {
+        return;
+    };
+    let cfg = cluster_config(&cluster);
+    let (client, records, catalog) = stores(&cfg);
+    catalog
+        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
+        .await
+        .expect("register usage type");
+    let recs = ingest_sixteen_tenants(&records).await;
+
+    // Which tenants live on node 2.
+    let placement: Vec<(String, String)> = client
+        .query(&format!(
+            "SELECT hostName(), toString(tenant_id) FROM clusterAllReplicas('{CLUSTER}', \
+             {DATABASE}.usage_records_local)"
+        ))
+        .fetch_all::<(String, String)>()
+        .await
+        .expect("placement");
+    let on_node2: Vec<Uuid> = placement
+        .iter()
+        .filter(|(host, _)| host.starts_with("uc-ch2-"))
+        .map(|(_, t)| Uuid::parse_str(t).expect("uuid"))
+        .collect();
+    let on_node1: Vec<Uuid> = placement
+        .iter()
+        .filter(|(host, _)| host.starts_with("uc-ch1-"))
+        .map(|(_, t)| Uuid::parse_str(t).expect("uuid"))
+        .collect();
+    assert!(
+        !on_node2.is_empty() && !on_node1.is_empty(),
+        "{placement:?}"
+    );
+    drop(recs);
+
+    cluster.nodes[1].stop().await.expect("stop node 2");
+    let shard2_rec = common::fixture_usage_record_at(
+        VCPU_GTS,
+        on_node2[0],
+        "idem-down",
+        Decimal::from(7),
+        common::fixture_created_at_offset(100),
+    );
+    let shard1_rec = common::fixture_usage_record_at(
+        VCPU_GTS,
+        on_node1[0],
+        "idem-down-other",
+        Decimal::from(8),
+        common::fixture_created_at_offset(101),
+    );
+    let err = records
+        .create(shard2_rec.clone())
+        .await
+        .expect_err("the owning shard is down");
+    assert!(
+        matches!(err, UsageCollectorPluginError::Transient { .. }),
+        "a down shard is retryable, got {err:?}"
+    );
+    // A batch spanning both shards: every slot is reported, and the pre-retry
+    // state of the shard-1 row is deliberately not pinned — a Distributed
+    // INSERT may have committed it before the shard-2 part failed.
+    let outcomes = records
+        .create_batch(vec![shard1_rec.clone(), shard2_rec.clone()])
+        .await
+        .expect("batch outcomes are per slot");
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| matches!(o, Err(UsageCollectorPluginError::Transient { .. }))),
+        "{outcomes:?}"
+    );
+    // Node 1's local table only: the Distributed table cannot be read while
+    // shard 2 is down.
+    let on_shard1: u64 = client
+        .query(&format!(
+            "SELECT count() FROM {DATABASE}.usage_records_local WHERE id = ?"
+        ))
+        .bind(shard1_rec.id.to_string())
+        .fetch_one::<u64>()
+        .await
+        .expect("shard-1 local count");
+    assert!(on_shard1 <= 1, "at most one copy, whether or not it landed");
+
+    cluster.nodes[1].start().await.expect("start node 2");
+    wait_for_all_replicas(&client, 2).await;
+
+    let outcomes = records
+        .create_batch(vec![shard1_rec.clone(), shard2_rec.clone()])
+        .await
+        .expect("retry");
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    for r in [&shard1_rec, &shard2_rec] {
+        assert_eq!(
+            common_raw_rows(&client, r.id).await,
+            1,
+            "exactly once after recovery"
+        );
+    }
+    records
+        .create(shard2_rec.clone())
+        .await
+        .expect("absorbed retry");
+    assert_eq!(common_raw_rows(&client, shard2_rec.id).await, 1);
+}
+
 // ── `Gear::init` on a real cluster ───────────────────────────────────────────
 
 mod gear_init {
@@ -825,7 +1085,7 @@ mod gear_init {
             CancellationToken::new(),
         );
         drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
-        ClickHouseUsageCollectorPlugin.init(&ctx).await?;
+        ClickHouseUsageCollectorPlugin::default().init(&ctx).await?;
         Ok(hub)
     }
 

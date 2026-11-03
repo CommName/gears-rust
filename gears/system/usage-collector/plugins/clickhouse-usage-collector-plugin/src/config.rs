@@ -4,6 +4,7 @@ use percent_encoding::percent_decode_str;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
+use crate::infra::storage::ingest::{DRAIN_DEADLINE_CAP, IngestLimits};
 use crate::infra::storage::migrator::MIGRATIONS_TRACKER;
 use crate::infra::storage::topology::{CATALOG_TABLE, RECORDS_TABLE};
 
@@ -96,34 +97,40 @@ pub struct ClickHousePluginConfig {
     /// the server-side async-insert buffer flush, which is why [`Self::validate`]
     /// enforces a floor of `MIN_ASYNC_INSERT_TIMEOUT_SECS` in that case.
     pub request_timeout_secs: u64,
-    /// Send **single-row** `usage_records` `INSERT`s with the `ClickHouse`
-    /// settings `async_insert = 1` and `wait_for_async_insert = 1`, applied
+    /// Server-side alternative to the plugin's own group commit for a
+    /// deployment that keeps [`Self::insert_batch`] disabled: send
+    /// **single-row** `usage_records` `INSERT`s with the `ClickHouse` settings
+    /// `async_insert = 1` and `wait_for_async_insert = 1`, applied
     /// per-statement via `clickhouse::insert::Insert::with_setting` rather than
     /// on the shared `Client`, so no `SELECT` is affected — not even the
     /// table-metadata read the `clickhouse` crate performs inside
     /// `Client::insert` itself, which runs before this setting is applied.
     ///
+    /// Off by default: with group commit on, the plugin already coalesces
+    /// every call's rows into shared `INSERT`s, and every flush carries an
+    /// explicit `async_insert = 0` so a server or profile default cannot add
+    /// a second buffering layer underneath it. [`Self::validate`] refuses this
+    /// together with `insert_batch.enabled` for that reason.
+    ///
     /// `async_insert = 1` moves part formation from the request into a
     /// server-side buffer that coalesces concurrent inserts sharing one
-    /// (query, settings, format) triple into shared parts. That is the whole
-    /// point here: `create_usage_record` issues one `INSERT` per record, so a
+    /// (query, settings, format) triple into shared parts. Without group
+    /// commit, `create_usage_record` issues one `INSERT` per record, so a
     /// request-shaped ingest stream otherwise writes one small part per request
     /// and drives `ReplacingMergeTree` part count and merge pressure up. Every
     /// such `INSERT` this plugin emits is identical in SQL text, settings, and
     /// format, so the whole ingest stream lands in one queue.
     ///
-    /// **Scope.** This setting governs the single-row path only. Multi-row
-    /// `usage_records` `INSERT`s — `create_usage_records` and the deactivation
-    /// cascade — stay synchronous whatever this says, because the async buffer
-    /// does not guarantee that one statement's rows become visible in a single
-    /// commit and both depend on that (the cascade's marker rows must flip
-    /// together). `usage_type_catalog` writes are likewise always synchronous:
-    /// that table is control-plane (written only by `create_usage_type`, never
-    /// deleted, unpartitioned, tens of rows), so there is no concurrent insert
-    /// stream for the buffer to coalesce and no part count to reduce. Nothing
-    /// is given up by either exclusion — a multi-row statement already carries
-    /// its rows in one part, and the part explosion this setting exists to fix
-    /// is specific to one-row-per-request writes.
+    /// **Scope.** This setting governs the direct single-row path only.
+    /// Multi-row `usage_records` `INSERT`s — `create_usage_records` and the
+    /// deactivation cascade — stay synchronous whatever this says, because the
+    /// async buffer does not guarantee that one statement's rows become visible
+    /// in a single commit and both depend on that (the cascade's marker rows
+    /// must flip together). `usage_type_catalog` writes are likewise always
+    /// synchronous: that table is control-plane (written only by
+    /// `create_usage_type`, unpartitioned, tens of rows), so there is no
+    /// concurrent insert stream for the buffer to coalesce and no part count to
+    /// reduce.
     ///
     /// `wait_for_async_insert = 1` is pinned, not separately configurable.
     /// Two properties depend on it:
@@ -168,11 +175,12 @@ pub struct ClickHousePluginConfig {
     /// then, while `get` resolves it immediately. Batches and deactivation
     /// markers are always synchronous and always engine-deduplicated.
     ///
-    /// Set to `false` for the pre-async behaviour (one synchronous part write
-    /// per request) on a deployment whose `ClickHouse` version or settings
-    /// profile makes async inserts unavailable — or to make the engine-side
-    /// dedup of single-record creates deterministic.
+    /// Enabling it requires `insert_batch.enabled = false`.
     pub async_insert: bool,
+    /// The in-process group commit every `usage_records` write goes through
+    /// (`infra::storage::ingest`). See [`InsertBatchConfig`] for the knobs;
+    /// enabled by default, and required on a cluster.
+    pub insert_batch: InsertBatchConfig,
     /// `usage_records` retention window in seconds; rows older are deleted via
     /// `ClickHouse` TTL. Must be in `(0, MAX_RETENTION_SECS]`.
     pub retention_period_secs: u64,
@@ -190,6 +198,113 @@ pub struct ClickHousePluginConfig {
     /// [`ClickHouseClusterConfig::manage_schema`] the plugin runs the cluster
     /// migrations itself.
     pub cluster: Option<ClickHouseClusterConfig>,
+}
+
+/// Group-commit settings for [`ClickHousePluginConfig::insert_batch`].
+///
+/// Every `create_usage_record` / `create_usage_records` call runs its own
+/// checks and dedup pre-read, then hands its new rows to one in-process queue;
+/// a background flusher writes queued calls as shared synchronous `INSERT`s,
+/// so the `INSERT` size is decoupled from the API call size. A flush is cut
+/// when it reaches `max_rows` or `max_bytes`, or when the *oldest* queued call
+/// has waited `max_wait_ms` — continuous arrivals cannot postpone it. Calls
+/// are never split across flushes; a call larger than a flush target is
+/// flushed alone.
+///
+/// Bounds: at most `queue_capacity` calls are outstanding (queued or in
+/// flight), and at most `max_rows × (max_concurrent_flushes + 1)` rows /
+/// `max_bytes × (max_concurrent_flushes + 1)` estimated bytes. A call over a
+/// bound is refused with a retryable `Transient` error; a call that alone
+/// exceeds the row or byte bound is refused as `Internal`, since a retry could
+/// never admit it. Up to `max_concurrent_flushes` `INSERT`s are in flight at
+/// once.
+///
+/// Durations are milliseconds here (the one sub-second knob in this config);
+/// `max_bytes` counts an estimate of the `RowBinary` row size, not the encoded
+/// statement.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InsertBatchConfig {
+    /// Route record writes through the group-commit queue. `false` keeps the
+    /// direct path: one synchronous `INSERT` per call (per record for single
+    /// creates, per batch for `create_usage_records`), optionally with
+    /// server-side [`ClickHousePluginConfig::async_insert`]. Must be `true`
+    /// on a cluster.
+    pub enabled: bool,
+    /// Rows per flush; a flush is cut once the queue holds at least this many.
+    pub max_rows: u64,
+    /// Estimated row bytes per flush; same trigger semantics as `max_rows`.
+    pub max_bytes: u64,
+    /// Longest the oldest queued call waits before a flush is cut, in
+    /// milliseconds. Charged against `request_timeout_secs`, so
+    /// [`ClickHousePluginConfig::validate`] requires it to leave at least half
+    /// of that budget for the `INSERT` itself.
+    pub max_wait_ms: u64,
+    /// Outstanding calls (queued + in flight) admitted at once.
+    pub queue_capacity: u64,
+    /// Flush `INSERT`s in flight at once.
+    pub max_concurrent_flushes: u64,
+}
+
+impl Default for InsertBatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_rows: 10_000,
+            max_bytes: 16 * 1024 * 1024,
+            max_wait_ms: 50,
+            queue_capacity: 1024,
+            max_concurrent_flushes: 4,
+        }
+    }
+}
+
+impl InsertBatchConfig {
+    /// Every field must be at least 1.
+    fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("insert_batch.max_rows", self.max_rows),
+            ("insert_batch.max_bytes", self.max_bytes),
+            ("insert_batch.max_wait_ms", self.max_wait_ms),
+            ("insert_batch.queue_capacity", self.queue_capacity),
+            (
+                "insert_batch.max_concurrent_flushes",
+                self.max_concurrent_flushes,
+            ),
+        ] {
+            if value == 0 {
+                return Err(format!("{name} must be greater than 0"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The queue limits for these settings and the client-side deadline.
+    ///
+    /// The drain deadline — how long the shutdown drain may await in-flight
+    /// flushes — is `max_wait + client_deadline`, capped at
+    /// `DRAIN_DEADLINE_CAP` so the lifecycle stop budget stays under the
+    /// host's per-gear shutdown deadline.
+    #[must_use]
+    pub fn limits(&self, client_deadline: std::time::Duration) -> IngestLimits {
+        let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
+        let max_rows = to_usize(self.max_rows);
+        let max_bytes = to_usize(self.max_bytes);
+        let flushes = to_usize(self.max_concurrent_flushes);
+        let max_wait = std::time::Duration::from_millis(self.max_wait_ms);
+        IngestLimits {
+            max_rows,
+            max_bytes,
+            max_wait,
+            queue_capacity: to_usize(self.queue_capacity),
+            max_concurrent_flushes: flushes,
+            max_outstanding_rows: max_rows.saturating_mul(flushes.saturating_add(1)),
+            max_outstanding_bytes: max_bytes.saturating_mul(flushes.saturating_add(1)),
+            drain_deadline: max_wait
+                .saturating_add(client_deadline)
+                .min(DRAIN_DEADLINE_CAP),
+        }
+    }
 }
 
 /// Sharded-cluster topology for [`ClickHousePluginConfig::cluster`].
@@ -326,10 +441,11 @@ impl Default for ClickHousePluginConfig {
             database_url: SecretString::default(),
             allow_insecure_http: false,
             request_timeout_secs: 30,
-            // On by default: the write path is one INSERT per request, so
-            // without server-side coalescing a request-shaped ingest stream
-            // writes one small part per record.
-            async_insert: true,
+            // Off by default: the plugin's own group commit (`insert_batch`,
+            // on by default) is what coalesces a request-shaped ingest stream
+            // into shared parts, and the two must not stack.
+            async_insert: false,
+            insert_batch: InsertBatchConfig::default(),
             // Same window the migration DDL bakes in, so a config-less start
             // needs no `MODIFY TTL` reconciliation at startup.
             retention_period_secs: crate::infra::storage::pool::DEFAULT_RETENTION_SECS,
@@ -394,6 +510,17 @@ impl ClickHousePluginConfig {
                 .saturating_add(CLIENT_DEADLINE_GRACE_SECS),
         )
     }
+    /// The lifecycle stop budget: the drain deadline plus a second for the
+    /// batcher to complete its waiters and return. Evaluated at stop by the
+    /// gear's `stop_timeout_fn`.
+    #[must_use]
+    pub(crate) fn drain_stop_timeout(&self) -> std::time::Duration {
+        self.insert_batch
+            .limits(self.client_deadline())
+            .drain_deadline
+            .saturating_add(std::time::Duration::from_secs(1))
+    }
+
     /// Validate invariants not expressible in the type system.
     ///
     /// # Errors
@@ -405,7 +532,11 @@ impl ClickHousePluginConfig {
     /// [`Self::allow_insecure_http`], a zero timeout, a
     /// `request_timeout_secs` below `MIN_ASYNC_INSERT_TIMEOUT_SECS` while
     /// [`Self::async_insert`] is enabled, a retention window outside
-    /// `(0, MAX_RETENTION_SECS]`, or a blank `vendor`.
+    /// `(0, MAX_RETENTION_SECS]`, a blank `vendor`, a cluster without
+    /// `insert_batch.enabled`, `async_insert` together with
+    /// `insert_batch.enabled` (two buffering layers), a zero `insert_batch`
+    /// field, or an `insert_batch.max_wait_ms` above half of
+    /// `request_timeout_secs`.
     pub fn validate(&self) -> Result<(), String> {
         if self.database_url.expose_secret().trim().is_empty() {
             return Err("database_url must not be empty".to_owned());
@@ -506,6 +637,42 @@ impl ClickHousePluginConfig {
                         .to_owned(),
                 );
             }
+            // Through a `Distributed` table every INSERT is synchronous to the
+            // owning shard, so the plugin's group commit is the only layer
+            // that can turn a request-shaped stream into shared parts.
+            if !self.insert_batch.enabled {
+                return Err(
+                    "a cluster topology requires insert_batch.enabled = true: inserts through \
+                     Distributed tables are synchronous per shard and group commit is the only \
+                     part-coalescing layer available"
+                        .to_owned(),
+                );
+            }
+        }
+        // Server-side async inserts under the plugin's own group commit would
+        // buffer twice; the flush path pins `async_insert = 0` and the
+        // configuration must not disagree with it.
+        if self.async_insert && self.insert_batch.enabled {
+            return Err(
+                "async_insert = true and insert_batch.enabled = true would stack two buffering \
+                 layers; set insert_batch.enabled = false to keep server-side async inserts, or \
+                 async_insert = false (the default) to use group commit"
+                    .to_owned(),
+            );
+        }
+        self.insert_batch.validate()?;
+        // The queue wait is charged against the request budget; at least half
+        // of it must stay for the flush INSERT itself.
+        if self.insert_batch.max_wait_ms.saturating_mul(2)
+            > self.request_timeout_secs.saturating_mul(1000)
+        {
+            return Err(format!(
+                "insert_batch.max_wait_ms = {} must be at most half of request_timeout_secs = {} \
+                 ({} ms): the queue wait and the flush INSERT share one request budget",
+                self.insert_batch.max_wait_ms,
+                self.request_timeout_secs,
+                self.request_timeout_secs.saturating_mul(1000)
+            ));
         }
         Ok(())
     }

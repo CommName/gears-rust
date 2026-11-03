@@ -148,6 +148,49 @@ pub fn translate_usage_type_filter<F: FilterField>(
     translate_filter(node, ctx, usage_type_column)
 }
 
+/// Translate a record `$filter` into its top-level conjuncts, one fragment
+/// per conjunct, binding each in text order into `ctx`.
+///
+/// The spine of nested `AND`s is flattened; any other node (a comparison, an
+/// `IN`, an `OR`, a `NOT`) is translated whole by [`translate_record_filter`].
+/// An empty `AND` yields no conjunct at all — rendering it as `()` would be a
+/// syntax error — so a caller pushes no clause for it. Keeping each conjunct
+/// separate lets the read paths `AND` them onto their own clauses in one
+/// `WHERE`, with no parenthesised composite between the key-prefix
+/// predicates and the primary-key analysis.
+///
+/// # Errors
+///
+/// Returns the [`translate_record_filter`] error of the first conjunct that
+/// does not translate.
+pub fn translate_record_conjuncts<F: FilterField>(
+    node: &FilterNode<F>,
+    ctx: &mut SqlCtx,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    collect_record_conjuncts(node, ctx, &mut out)?;
+    Ok(out)
+}
+
+fn collect_record_conjuncts<F: FilterField>(
+    node: &FilterNode<F>,
+    ctx: &mut SqlCtx,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    if let FilterNode::Composite {
+        op: FilterOp::And,
+        children,
+    } = node
+    {
+        for child in children {
+            collect_record_conjuncts(child, ctx, out)?;
+        }
+        return Ok(());
+    }
+    out.push(translate_record_filter(node, ctx)?);
+    Ok(())
+}
+
 /// Shared recursive walker parameterised over the column allowlist.
 fn translate_filter<F: FilterField>(
     node: &FilterNode<F>,

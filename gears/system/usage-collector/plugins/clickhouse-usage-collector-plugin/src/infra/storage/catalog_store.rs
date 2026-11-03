@@ -718,9 +718,10 @@ impl CatalogStore for ChCatalogStore {
     ///
     /// - An insert whose own catalog check passed before step 3 can commit
     ///   after step 4 and orphan a row.
-    /// - With `async_insert` on (the plugin default) a record can sit in a
-    ///   server-side buffer past the sweep, widening that window from
-    ///   microseconds to the flush interval.
+    /// - A record admitted to the group-commit queue (or, with group commit
+    ///   off and `async_insert` on, to the server-side buffer) can be written
+    ///   after the sweep, widening that window from microseconds to the
+    ///   flush interval.
     /// - Two concurrent deletes for one `gts_id` both pass step 1 and both
     ///   return `Ok(())`; neither sees `UsageTypeNotFound`.
     /// - On a single node `mutations_sync = 1` waits only for the receiving

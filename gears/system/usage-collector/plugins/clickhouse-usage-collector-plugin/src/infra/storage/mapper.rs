@@ -69,6 +69,26 @@ pub fn canonical_equal(
         && stored_metadata == incoming.metadata)
 }
 
+/// [`canonical_equal`] between two composed rows: whether `incoming` would be
+/// absorbed by `stored` under the idempotency rules.
+///
+/// Used by the ingest queue to coalesce a row onto one already queued or in
+/// flight for the same dedup tuple. Goes through the SPI record so the
+/// comparison is the one predicate the dedup pre-read applies, not a second
+/// field list that could drift from it.
+///
+/// # Errors
+///
+/// Returns `Internal` when either row's stored metadata is not a valid
+/// metadata map (the same failure [`canonical_equal`] reports).
+pub fn canonical_equal_rows(
+    stored: &UsageRecordRow,
+    incoming: &UsageRecordRow,
+) -> Result<bool, UsageCollectorPluginError> {
+    let incoming = UsageRecord::try_from(incoming.clone())?;
+    canonical_equal(stored, &incoming)
+}
+
 /// Mint a `ReplacingMergeTree` merge-resolution version (epoch microseconds as `u64`).
 #[must_use]
 #[allow(

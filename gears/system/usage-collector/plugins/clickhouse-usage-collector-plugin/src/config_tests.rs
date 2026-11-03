@@ -10,10 +10,112 @@ fn config_defaults_are_applied() {
     assert!(cfg.database_url.expose_secret().is_empty());
     assert!(!cfg.allow_insecure_http);
     assert!(
-        cfg.async_insert,
-        "async inserts are on by default: the write path is one INSERT per \
-         request, so without server-side coalescing a request-shaped ingest \
-         stream writes one small part per record"
+        !cfg.async_insert,
+        "server-side async inserts are off by default: the plugin's own group \
+         commit coalesces the ingest stream, and the two must not stack"
+    );
+    assert!(cfg.insert_batch.enabled, "group commit is on by default");
+    assert_eq!(cfg.insert_batch.max_rows, 10_000);
+    assert_eq!(cfg.insert_batch.max_bytes, 16 * 1024 * 1024);
+    assert_eq!(cfg.insert_batch.max_wait_ms, 50);
+    assert_eq!(cfg.insert_batch.queue_capacity, 1024);
+    assert_eq!(cfg.insert_batch.max_concurrent_flushes, 4);
+}
+
+/// The server-side alternative is still reachable: `async_insert = true`
+/// with group commit off.
+const ASYNC_INSERT_ON: &str = r#""async_insert": true, "insert_batch": { "enabled": false }"#;
+
+/// A config written before `insert_batch` existed deserialises with group
+/// commit on and the default limits.
+#[test]
+fn config_without_insert_batch_gets_group_commit_defaults() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "retention_period_secs": 86400 }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    assert!(cfg.insert_batch.enabled);
+    assert_eq!(cfg.insert_batch.max_wait_ms, 50);
+    cfg.validate().expect("valid");
+}
+
+/// Server-side async inserts under the plugin's group commit would buffer
+/// twice; the combination is refused with both fixes named.
+#[test]
+fn validate_rejects_async_insert_together_with_group_commit() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "async_insert": true }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.contains("insert_batch.enabled = false"), "{err}");
+    assert!(err.contains("async_insert = false"), "{err}");
+}
+
+/// Every `insert_batch` field is a count or a duration that must be positive.
+#[test]
+fn validate_rejects_zero_insert_batch_fields() {
+    for field in [
+        "max_rows",
+        "max_bytes",
+        "max_wait_ms",
+        "queue_capacity",
+        "max_concurrent_flushes",
+    ] {
+        let json = format!(
+            r#"{{ "database_url": "https://u:p@h/db", "insert_batch": {{ "{field}": 0 }} }}"#
+        );
+        let cfg: ClickHousePluginConfig = serde_json::from_str(&json).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains(&format!("insert_batch.{field}")), "{err}");
+    }
+}
+
+/// The queue wait is charged against the request budget, so it may take at
+/// most half of it; the boundary is inclusive.
+#[test]
+fn validate_bounds_max_wait_to_half_the_request_budget() {
+    let at_half = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 2,
+                      "insert_batch": { "max_wait_ms": 1000 } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(at_half).unwrap();
+    cfg.validate().expect("exactly half is accepted");
+
+    let over = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 2,
+                   "insert_batch": { "max_wait_ms": 1001 } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(over).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.contains("insert_batch.max_wait_ms = 1001"), "{err}");
+    assert!(err.contains("request_timeout_secs = 2"), "{err}");
+}
+
+/// The derived outstanding bounds leave room for every in-flight flush plus
+/// one queued flush, and the drain deadline is capped under the host's
+/// per-gear shutdown deadline.
+#[test]
+fn insert_batch_limits_derive_outstanding_bounds_and_cap_the_drain_deadline() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "insert_batch": {
+        "max_rows": 100, "max_bytes": 1000, "max_wait_ms": 20,
+        "queue_capacity": 7, "max_concurrent_flushes": 3 } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    let limits = cfg.insert_batch.limits(cfg.client_deadline());
+    assert_eq!(limits.max_rows, 100);
+    assert_eq!(limits.max_bytes, 1000);
+    assert_eq!(limits.max_wait, std::time::Duration::from_millis(20));
+    assert_eq!(limits.queue_capacity, 7);
+    assert_eq!(limits.max_concurrent_flushes, 3);
+    assert_eq!(limits.max_outstanding_rows, 400);
+    assert_eq!(limits.max_outstanding_bytes, 4000);
+    // 20 ms + 35 s client deadline > the 29 s cap.
+    assert_eq!(limits.drain_deadline, DRAIN_DEADLINE_CAP);
+    assert_eq!(
+        cfg.drain_stop_timeout(),
+        DRAIN_DEADLINE_CAP + std::time::Duration::from_secs(1)
+    );
+
+    let short = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 4,
+                    "insert_batch": { "max_wait_ms": 500 } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(short).unwrap();
+    let limits = cfg.insert_batch.limits(cfg.client_deadline());
+    // 500 ms + (4 + 5) s, under the cap.
+    assert_eq!(
+        limits.drain_deadline,
+        std::time::Duration::from_millis(9500)
     );
 }
 
@@ -35,11 +137,13 @@ fn async_insert_can_be_disabled_from_config() {
 /// with both values named is strictly better.
 #[test]
 fn validate_rejects_a_request_timeout_too_small_for_async_insert() {
-    let json = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 1 }"#;
-    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    let json = format!(
+        r#"{{ "database_url": "https://u:p@h/db", "request_timeout_secs": 1, {ASYNC_INSERT_ON} }}"#
+    );
+    let cfg: ClickHousePluginConfig = serde_json::from_str(&json).unwrap();
     assert!(
         cfg.async_insert,
-        "the default must be what is under test here"
+        "the floor applies to the async-insert path"
     );
     let err = cfg
         .validate()
@@ -73,7 +177,7 @@ fn validate_accepts_a_small_request_timeout_when_async_insert_is_disabled() {
 #[test]
 fn validate_accepts_the_async_insert_timeout_floor() {
     let json = format!(
-        r#"{{ "database_url": "https://u:p@h/db", "request_timeout_secs": {MIN_ASYNC_INSERT_TIMEOUT_SECS} }}"#
+        r#"{{ "database_url": "https://u:p@h/db", "request_timeout_secs": {MIN_ASYNC_INSERT_TIMEOUT_SECS}, {ASYNC_INSERT_ON} }}"#
     );
     let cfg: ClickHousePluginConfig = serde_json::from_str(&json).unwrap();
     assert!(cfg.async_insert);
@@ -519,11 +623,12 @@ fn cluster_insert_quorum_accepts_auto_or_a_positive_count() {
 }
 
 /// Async inserts into a `Distributed` table bypass the shard's dedup token and
-/// durability ack, so the default `async_insert = true` must be turned off
+/// durability ack, so `async_insert = true` must be turned off
 /// explicitly rather than silently ignored.
 #[test]
 fn cluster_rejects_async_insert() {
-    let json = r#"{ "database_url": "https://u:p@h/db", "cluster": { "name": "uc" } }"#;
+    let json = r#"{ "database_url": "https://u:p@h/db", "async_insert": true,
+                    "insert_batch": { "enabled": false }, "cluster": { "name": "uc" } }"#;
     let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
     let err = cfg.validate().unwrap_err();
     assert!(err.contains("async_insert = false"), "{err}");
@@ -534,4 +639,15 @@ fn cluster_block_rejects_unknown_keys() {
     let json = r#"{ "database_url": "https://u:p@h/db", "async_insert": false,
                     "cluster": { "name": "uc", "shards": 2 } }"#;
     assert!(serde_json::from_str::<ClickHousePluginConfig>(json).is_err());
+}
+
+/// Through a `Distributed` table every INSERT is synchronous per shard, so a
+/// cluster without group commit would write one part per request; refused.
+#[test]
+fn cluster_requires_group_commit() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "insert_batch": { "enabled": false },
+                    "cluster": { "name": "uc" } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.contains("insert_batch.enabled = true"), "{err}");
 }

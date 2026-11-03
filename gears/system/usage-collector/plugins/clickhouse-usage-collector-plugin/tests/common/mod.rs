@@ -26,8 +26,10 @@ use usage_collector_sdk::{
     UsageTypeGtsId, derive_usage_record_id,
 };
 
+use clickhouse_usage_collector_plugin::config::InsertBatchConfig;
 use clickhouse_usage_collector_plugin::infra::metrics::Metrics;
 use clickhouse_usage_collector_plugin::infra::storage::catalog_store::ChCatalogStore;
+use clickhouse_usage_collector_plugin::infra::storage::ingest::IngestQueue;
 use clickhouse_usage_collector_plugin::infra::storage::migrator::{
     MigrationOptions, run_migrations,
 };
@@ -208,12 +210,35 @@ pub fn record_store(h: &ChHarness) -> ChRecordStore {
 /// Same as [`record_store`], but over a caller-supplied `ClickHouse` client
 /// (e.g. [`unreachable_client`]).
 ///
-/// `async_insert` is `true` — the production default — so this tier exercises
-/// the shipped write path, including its read-your-writes dependency on
-/// `wait_for_async_insert = 1`.
+/// The direct write path with `async_insert = true`: the server-side
+/// alternative to group commit, which this tier keeps exercising — including
+/// its read-your-writes dependency on `wait_for_async_insert = 1`.
 #[must_use]
 pub fn record_store_over(_h: &ChHarness, client: clickhouse::Client) -> ChRecordStore {
-    ChRecordStore::new(client, metrics(), TEST_REQUEST_TIMEOUT, true)
+    ChRecordStore::new(client, metrics(), TEST_REQUEST_TIMEOUT, true, None)
+}
+
+/// The production write path: a store whose writes go through a group-commit
+/// queue with the default limits, whose batcher runs on this harness's
+/// cancellation token (so it drains when the harness is dropped).
+///
+/// Every `create` / `create_batch` of this store is a synchronous flush
+/// `INSERT` under `async_insert = 0` and an `insert_deduplication_token`
+/// computed over the flush.
+#[must_use]
+pub fn record_store_batched(h: &ChHarness) -> ChRecordStore {
+    let limits = InsertBatchConfig::default().limits(TEST_REQUEST_TIMEOUT);
+    let queue = IngestQueue::new(limits, metrics());
+    let store = ChRecordStore::new(
+        h.client.clone(),
+        metrics(),
+        TEST_REQUEST_TIMEOUT,
+        false,
+        Some(Arc::clone(&queue)),
+    );
+    let sink = store.flush_sink();
+    drop(tokio::spawn(queue.run(sink, h.cancel.clone())));
+    store
 }
 
 /// Same as [`record_store_over`], but sharing a caller-supplied metric
@@ -224,19 +249,26 @@ pub fn record_store_with_metrics(
     client: clickhouse::Client,
     metrics: Arc<Metrics>,
 ) -> ChRecordStore {
-    ChRecordStore::new(client, metrics, TEST_REQUEST_TIMEOUT, true)
+    ChRecordStore::new(client, metrics, TEST_REQUEST_TIMEOUT, true, None)
 }
 
-/// Same as [`record_store`], but with `async_insert = false`.
+/// Same as [`record_store`], but with `async_insert = false`: the direct
+/// path, one synchronous `INSERT` per call.
 ///
 /// On the shipped non-replicated `ReplacingMergeTree`, `ClickHouse` enforces
 /// `insert_deduplication_token` on synchronous inserts only, so this is the
-/// tier that proves the engine-side dedup of racing single-record creates
-/// deterministically. The async tier relies on `optimize_on_insert` coalescing
-/// within one flush and on merges otherwise (see `config.rs`).
+/// tier that proves the engine-side dedup of racing identical statements
+/// deterministically, with the token of each call visible one statement at a
+/// time.
 #[must_use]
 pub fn record_store_sync(h: &ChHarness) -> ChRecordStore {
-    ChRecordStore::new(h.client.clone(), metrics(), TEST_REQUEST_TIMEOUT, false)
+    ChRecordStore::new(
+        h.client.clone(),
+        metrics(),
+        TEST_REQUEST_TIMEOUT,
+        false,
+        None,
+    )
 }
 
 /// Stop background merges on this test's `usage_records` table, so a test
@@ -260,6 +292,32 @@ pub async fn raw_rows_for_id(h: &ChHarness, id: Uuid) -> u64 {
         .fetch_one::<u64>()
         .await
         .expect("raw count must be readable")
+}
+
+/// Store a byte-identical twin of `id`'s newest physical row under
+/// `version + bump` and no `insert_deduplication_token` — what another
+/// collector instance's flush produces for the same logical row. Call after
+/// [`stop_merges`] so the twin stays a separate physical row.
+pub async fn seed_duplicate_version(h: &ChHarness, id: Uuid, bump: i64) {
+    seed_duplicate_of(h, id, bump, None).await;
+}
+
+/// [`seed_duplicate_version`] restricted to the newest row of `status`, so a
+/// test can twin the superseded *active* row of a deactivated record at a
+/// version below its marker.
+pub async fn seed_duplicate_of(h: &ChHarness, id: Uuid, bump: i64, status: Option<&str>) {
+    let status_clause = status.map_or(String::new(), |s| format!(" AND status = '{s}'"));
+    let sql = format!(
+        "INSERT INTO usage_records SELECT * REPLACE (toUInt64(toInt64(version) + ?) AS version) \
+         FROM usage_records WHERE id = ?{status_clause} ORDER BY version DESC LIMIT 1"
+    );
+    h.client
+        .query(&sql)
+        .bind(bump)
+        .bind(id.to_string())
+        .execute()
+        .await
+        .expect("seeding a duplicate version must succeed");
 }
 
 /// Build a [`ChCatalogStore`] with its own metric handle.

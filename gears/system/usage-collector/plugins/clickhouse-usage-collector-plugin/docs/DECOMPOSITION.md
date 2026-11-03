@@ -96,18 +96,19 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-feature-record-persistence`
 
-- **Purpose**: Provide the backend write plane over `usage_records`, using the `ReplacingMergeTree(version)`-keyed-by-`id` mechanism as the dedup convergence backstop and the deactivation vehicle (DESIGN.md §3.6). Single/batch insert resolve via a read-before-insert check against the deterministic `id`; on a found row, canonical-field comparison yields silent absorb or `IdempotencyConflict`, best-effort, with racing identical writes dropped by the engine through a per-`INSERT` `insert_deduplication_token` and the residual concurrent-race deviation documented in DESIGN.md §3.6 and PRD.md §5/§11. Deactivation composes one multi-row `INSERT` of versioned marker rows for the target and its depth-1 active compensations, atomic as a single part write.
+- **Purpose**: Provide the backend write plane over `usage_records`, using the `ReplacingMergeTree(version)`-keyed-by-`id` mechanism as the dedup convergence backstop and the deactivation vehicle (DESIGN.md §3.6). Single/batch insert resolve via a read-before-insert check against the canonical dedup tuple; on a found row, canonical-field comparison yields silent absorb or `IdempotencyConflict`, best-effort. The write itself goes through the plugin's in-process group-commit queue (DESIGN.md §3.6 Group Commit Flush): calls are coalesced into shared synchronous `INSERT`s, racing identical writes inside one instance join one pending row, a retry of an identical flush is dropped by the engine's `insert_deduplication_token` window, and twins written by other instances are resolved to the highest version at read time (§2.3) and at merge — the residual concurrent-race deviation documented in DESIGN.md §3.6 and PRD.md §5/§12. Deactivation composes one multi-row `INSERT` of versioned marker rows for the target and its depth-1 active compensations, outside the queue, atomic as a single part write per partition.
 
 - **Depends On**: `cpt-cf-uc-ch-plugin-feature-foundation`
 
 - **Scope**:
   - Plugin-owned pre-insert referential-integrity check against the catalog (DESIGN.md §3.6 Ingest sequence steps 2-3), rejecting a reference to an absent (including previously deleted) usage type with `UsageTypeNotFound`. This is this feature's half of `cpt-cf-uc-ch-plugin-fr-referential-integrity`; the delete-side half — reference probe, catalog-row removal, orphan sweep — is owned by [§2.4](#24-usage-type-catalog--referential-integrity). Neither side is ordered against the other (DESIGN.md §3.8), so this check is not ordered against a concurrent delete, and the residual window that leaves is bounded by this same check once the catalog row is gone.
   - Single insert with read-before-insert dedup check and `ReplacingMergeTree` convergence backstop; `metadata` persisted verbatim into `Map(String, String)`; `status = 'active'` on first accept.
-  - Batch insert as exactly three statements regardless of how many usage types the batch spans — one catalog existence query over the distinct `gts_id`s, one dedup pre-read, one multi-row `INSERT` — with per-record results in input order.
+  - Batch insert as two read statements regardless of how many usage types the batch spans — one catalog existence query over the distinct `gts_id`s, one dedup pre-read — plus one submission to the group-commit queue, with per-record results in input order.
+  - The group-commit queue (`infra/storage/ingest`): admission bounds on calls, rows and bytes; whole-call flushes cut at `insert_batch.max_rows` / `max_bytes` / `max_wait_ms` of the oldest call; instance-local coalescing; bounded identical retries and per-call isolation; drain on the gear's cancellation, driven by the gear's lifecycle entry.
   - Compensation persistence: signed `value` + optional `corrects_id` on the ordinary insert path; no netting computed.
   - Depth-1 versioned-marker deactivation cascade: `UsageRecordNotFound` / `UsageRecordAlreadyInactive` / flip-via-single-INSERT, per DESIGN.md §3.6.
   - `get_usage_record` by `id`, version-resolved.
-  - Batch-write-path throughput allocation (one multi-row `INSERT` for the whole batch, no per-row round-trip).
+  - Write-path throughput allocation (shared flush `INSERT`s across calls; no per-row round-trip).
 
 - **Out of scope**:
   - Reading records back for aggregation/keyset list — [§2.3](#23-query--aggregation).
@@ -130,6 +131,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - **Design Components**:
   - [x] `p2` - `cpt-cf-uc-ch-plugin-component-record-store`
+  - [x] `p2` - `cpt-cf-uc-ch-plugin-component-ingest-queue`
 
 - **API**:
   - `create_usage_record`, `create_usage_records`, `get_usage_record`, `deactivate_usage_record`.
@@ -137,6 +139,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 - **Sequences**:
   - `p1` - `cpt-cf-uc-ch-plugin-seq-ingest-dedup`
   - `p1` - `cpt-cf-uc-ch-plugin-seq-ingest-batch`
+  - `p1` - `cpt-cf-uc-ch-plugin-seq-group-commit-flush`
   - `p1` - `cpt-cf-uc-ch-plugin-seq-deactivate-cascade`
 
 - **Data**:
@@ -146,15 +149,15 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-feature-query-aggregation`
 
-- **Purpose**: Provide the backend read plane, pushing aggregation into ClickHouse's vectorized execution and paginating raw reads via keyset seeking — both single-level scans that anti-join the deactivation-marker id set instead of resolving `ReplacingMergeTree` versions (DESIGN.md §3.8). This is the allocation target for the aggregation query-latency NFR and the workload-isolation NFR.
+- **Purpose**: Provide the backend read plane, pushing aggregation into ClickHouse's vectorized execution and paginating raw reads via keyset seeking — both single-level `FINAL` reads that resolve every `ReplacingMergeTree` sort key to its highest version, so a deactivation marker and a duplicate row written by another instance are both exact before any merge (DESIGN.md §3.8). This is the allocation target for the aggregation query-latency NFR and the workload-isolation NFR.
 
 - **Depends On**: `cpt-cf-uc-ch-plugin-feature-foundation`, `cpt-cf-uc-ch-plugin-feature-record-persistence`
 
 - **Scope**:
-  - Pushed-down aggregation (SUM/COUNT/MIN/MAX/AVG with grouping) as a single-level scan over the marker-anti-joined active-row set, honoring the compensation-partition rule (SUM nets compensations; other ops exclude them), capped server-side to `MAX_AGGREGATION_BUCKETS + 1` (100,001) grouped rows via `LIMIT` (DESIGN.md §3.6).
-  - Marker-anti-joined keyset-paginated raw list honoring the supplied order and cursor, one-row look-ahead, next-cursor encoding.
+  - Pushed-down aggregation (SUM/COUNT/MIN/MAX/AVG with grouping) as a single-level `FINAL` read over the resolved active rows, honoring the compensation-partition rule (SUM nets compensations; other ops exclude them), capped server-side to `MAX_AGGREGATION_BUCKETS + 1` (100,001) grouped rows via `LIMIT` (DESIGN.md §3.6).
+  - `FINAL`-resolved keyset-paginated raw list honoring the supplied order and cursor, one-row look-ahead, next-cursor encoding.
   - Injection-safe translation: bound parameters for values, allowlisted identifiers, adapted to the `clickhouse` crate's parameter API.
-  - Aggregation query-latency NFR allocation through ClickHouse's columnar execution, explicitly measured **with** the marker anti-join included in the budget, not around it (DESIGN.md §3.8).
+  - Aggregation query-latency NFR allocation through ClickHouse's columnar execution, explicitly measured **with** `FINAL` included in the budget, not around it (DESIGN.md §3.8).
   - Workload-isolation NFR allocation: the documented, accepted shared-client contention point between ingestion and aggregation (DESIGN.md §3.5). There is deliberately **no** pool-size config field — the `clickhouse` crate exposes no pool bound one could drive (DESIGN.md §3.5) — so this feature owns the burst-query-vs-ingestion contention analysis and its README-documented **operational** mitigation guidance (server-side quotas, separate instances), not merely a DESIGN-only aside.
 
 - **Out of scope**:

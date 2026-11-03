@@ -186,6 +186,16 @@ gears:
       database_url: "http://default:ch_test_pw@127.0.0.1:__E2E_CH_PORT__/default"
       allow_insecure_http: true
       request_timeout_secs: 30
+      # Group commit (the defaults, spelled out): every record write is
+      # queued and flushed as a shared synchronous INSERT, cut at max_rows /
+      # max_bytes or once the oldest queued call is max_wait_ms old.
+      insert_batch:
+        enabled: true
+        max_rows: 10000
+        max_bytes: 16777216
+        max_wait_ms: 50
+        queue_capacity: 1024
+        max_concurrent_flushes: 4
       # 10 years. Long enough that the usage_records TTL can never drop test
       # rows mid-run. A convenience, not a DateTime ceiling: the clause is
       # `created_at + INTERVAL <n> SECOND` on DateTime64(6), so a 100-year

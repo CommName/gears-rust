@@ -1,7 +1,10 @@
 // Test modules using bare `panic!` opt in explicitly.
 #![allow(clippy::panic)]
 
-use super::{ErrorClass, InsertMode, Metrics, QueryKind, label};
+use super::{
+    AdmissionReason, DrainOutcome, ErrorClass, FlushOutcome, InsertMode, Metrics, OutstandingState,
+    QueryKind, label,
+};
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -20,7 +23,7 @@ pub fn local_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
 }
 
 /// Total of all `u64` Sum (counter) data points named `name`.
-fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+pub fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
     let metrics = exporter.get_finished_metrics().unwrap();
     for resource_metrics in &metrics {
         for scope_metrics in resource_metrics.scope_metrics() {
@@ -41,7 +44,7 @@ fn counter_sum(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
 
 /// Total of the `u64` Sum (counter) data points named `name` carrying
 /// `label_key == label_value`.
-fn counter_sum_with_label(
+pub fn counter_sum_with_label(
     exporter: &InMemoryMetricExporter,
     name: &str,
     label_key: &str,
@@ -91,7 +94,7 @@ pub fn gauge_last_u64(exporter: &InMemoryMetricExporter, name: &str) -> Option<u
 }
 
 /// Total observation count across the `f64` Histogram data points named `name`.
-fn histogram_count(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+pub fn histogram_count(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
     let metrics = exporter.get_finished_metrics().unwrap();
     for resource_metrics in &metrics {
         for scope_metrics in resource_metrics.scope_metrics() {
@@ -276,4 +279,106 @@ async fn clear_ready_records_zero() {
     metrics.clear_ready();
     provider.force_flush().unwrap();
     assert_eq!(gauge_last_u64(&exporter, "uc_clickhouse_ready"), Some(0));
+}
+
+/// The ingest-queue helpers emit every `uc_clickhouse_ingest_*` / flush series
+/// under their closed labels.
+#[tokio::test]
+async fn ingest_helpers_emit_expected_series() {
+    let (provider, exporter) = local_provider();
+    let metrics = Metrics::with_meter(&provider.meter(super::SCOPE_NAME));
+
+    metrics.set_ingest_outstanding(OutstandingState::Queued, 3, 30, 300);
+    metrics.set_ingest_outstanding(OutstandingState::InFlight, 1, 10, 100);
+    metrics.record_queue_wait(0.004);
+    metrics.record_queue_age(0.05);
+    metrics.record_flush(FlushOutcome::Ok, 0.02, 40.0, 4000.0);
+    metrics.record_flush(FlushOutcome::Transient, 0.3, 2.0, 200.0);
+    metrics.inc_admission_rejected(AdmissionReason::Rows);
+    metrics.inc_admission_rejected(AdmissionReason::Closed);
+    metrics.inc_coalesced_rows(2);
+    metrics.inc_coalesce_conflicts(1);
+    metrics.inc_flush_retry();
+    metrics.inc_isolation_attempt();
+    metrics.inc_isolation_attempt();
+    metrics.inc_wait_timeout();
+    metrics.inc_shutdown_drain(DrainOutcome::Drained);
+    metrics.record_insert(InsertMode::Flush, 0.01);
+
+    provider.force_flush().unwrap();
+
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_clickhouse_flushes_total",
+            label::OUTCOME,
+            label::OUTCOME_OK
+        ),
+        1
+    );
+    assert_eq!(counter_sum(&exporter, "uc_clickhouse_flushes_total"), 2);
+    assert_eq!(
+        histogram_count(&exporter, "uc_clickhouse_flush_duration_seconds"),
+        2
+    );
+    assert_eq!(histogram_count(&exporter, "uc_clickhouse_flush_rows"), 2);
+    assert_eq!(histogram_count(&exporter, "uc_clickhouse_flush_bytes"), 2);
+    assert_eq!(
+        histogram_count(&exporter, "uc_clickhouse_ingest_queue_wait_seconds"),
+        1
+    );
+    assert_eq!(
+        histogram_count(&exporter, "uc_clickhouse_ingest_queue_age_seconds"),
+        1
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_clickhouse_admission_rejected_total",
+            label::REASON,
+            label::REASON_ROWS
+        ),
+        1
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_clickhouse_admission_rejected_total"),
+        2
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_clickhouse_coalesced_rows_total"),
+        2
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_clickhouse_coalesce_conflicts_total"),
+        1
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_clickhouse_flush_retries_total"),
+        1
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_clickhouse_isolation_attempts_total"),
+        2
+    );
+    assert_eq!(
+        counter_sum(&exporter, "uc_clickhouse_ingest_wait_timeouts_total"),
+        1
+    );
+    assert_eq!(
+        counter_sum_with_label(
+            &exporter,
+            "uc_clickhouse_shutdown_drain_total",
+            label::OUTCOME,
+            label::OUTCOME_DRAINED
+        ),
+        1
+    );
+    assert!(
+        gauge_last_u64(&exporter, "uc_clickhouse_ingest_outstanding_rows").is_some(),
+        "the outstanding gauges are recorded"
+    );
+    assert_eq!(
+        histogram_count(&exporter, "uc_clickhouse_insert_duration_seconds"),
+        1
+    );
 }

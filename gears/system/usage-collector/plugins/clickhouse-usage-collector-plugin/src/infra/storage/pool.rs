@@ -323,16 +323,48 @@ pub(crate) fn configure_insert<T>(
     dedup_token: Option<&str>,
 ) -> clickhouse::insert::Insert<T> {
     let mut insert = insert.with_timeouts(Some(request_timeout), Some(request_timeout));
-    if async_insert {
-        insert = insert
-            .with_setting("async_insert", "1")
-            .with_setting("wait_for_async_insert", "1")
-            .with_setting("async_insert_deduplicate", "1");
-    }
-    if let Some(token) = dedup_token {
-        insert = insert.with_setting("insert_deduplication_token", token);
+    for (name, value) in insert_settings(async_insert, dedup_token) {
+        insert = insert.with_setting(name, value);
     }
     insert
+}
+
+/// The `ClickHouse` settings [`configure_insert`] attaches to one `INSERT`,
+/// in order.
+///
+/// `async_insert` is sent **explicitly in both modes**. A synchronous insert
+/// carries `async_insert = 0` rather than relying on the server default: a
+/// user or profile default of `1` would otherwise add a second, server-side
+/// buffering layer under the plugin's own group commit, and would turn the
+/// durability ack of a statement the plugin treats as synchronous into a
+/// buffer handoff. With `async_insert` on, `wait_for_async_insert = 1` and
+/// `async_insert_deduplicate = 1` are pinned (see
+/// [`crate::config::ClickHousePluginConfig::async_insert`]).
+///
+/// The token, when given, is `insert_deduplication_token`: the engine drops the
+/// block if one with the same token landed within the table's dedup window.
+///
+/// Pure, so the unit tests can pin the exact settings: the `clickhouse`
+/// crate sends settings as URL parameters, which its in-process mock server
+/// does not expose.
+#[must_use]
+pub(crate) fn insert_settings(
+    async_insert: bool,
+    dedup_token: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut settings = if async_insert {
+        vec![
+            ("async_insert", "1".to_owned()),
+            ("wait_for_async_insert", "1".to_owned()),
+            ("async_insert_deduplicate", "1".to_owned()),
+        ]
+    } else {
+        vec![("async_insert", "0".to_owned())]
+    };
+    if let Some(token) = dedup_token {
+        settings.push(("insert_deduplication_token", token.to_owned()));
+    }
+    settings
 }
 
 /// Execute one migration DDL statement, bounded by `deadline`.

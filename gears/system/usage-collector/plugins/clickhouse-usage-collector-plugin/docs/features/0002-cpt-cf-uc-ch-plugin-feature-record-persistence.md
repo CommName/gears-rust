@@ -39,7 +39,7 @@
 
 ### 1.1 Overview
 
-Provide the backend write plane over `usage_records`. Inserts (single and batch) are an unsynchronised read-before-insert dedup check followed by an `INSERT`; racing duplicates are caught by the engine's `insert_deduplication_token` window, with `ReplacingMergeTree(version)` convergence as the backstop. Deactivation composes a single multi-row `INSERT` of versioned marker rows, atomically flipping the target and its depth-1 active compensations.
+Provide the backend write plane over `usage_records`. Inserts (single and batch) are an unsynchronised read-before-insert dedup check followed by a submission to the plugin's in-process group-commit queue, which writes queued calls as shared synchronous `INSERT`s and acknowledges each call only once its flush committed; racing duplicates inside one instance are coalesced in the queue, a retry of an identical flush is dropped by the engine's `insert_deduplication_token` window, and twins written by other instances are resolved at read time with `ReplacingMergeTree(version)` convergence at merge. Deactivation composes a single multi-row `INSERT` of versioned marker rows, outside the queue, flipping the target and its depth-1 active compensations together.
 
 ### 1.2 Purpose
 
@@ -61,9 +61,9 @@ Record Persistence owns the full lifecycle write path: referential-integrity che
 - **Design**: [DESIGN.md](../DESIGN.md) — §3.5 (External Dependencies), §3.6 (Ingest/Batch/Deactivation sequences), §3.7 (usage_records table), §3.8 (Consistency & Concurrency)
 - **Decomposition**: `cpt-cf-uc-ch-plugin-feature-record-persistence`
 - **Depends on**: `cpt-cf-uc-ch-plugin-feature-foundation`
-- **Sequences**: `cpt-cf-uc-ch-plugin-seq-ingest-dedup`, `cpt-cf-uc-ch-plugin-seq-ingest-batch`, `cpt-cf-uc-ch-plugin-seq-deactivate-cascade`
+- **Sequences**: `cpt-cf-uc-ch-plugin-seq-ingest-dedup`, `cpt-cf-uc-ch-plugin-seq-ingest-batch`, `cpt-cf-uc-ch-plugin-seq-group-commit-flush`, `cpt-cf-uc-ch-plugin-seq-deactivate-cascade`
 - **DB Table**: `cpt-cf-uc-ch-plugin-dbtable-usage-records`
-- **Component**: `cpt-cf-uc-ch-plugin-component-record-store`
+- **Component**: `cpt-cf-uc-ch-plugin-component-record-store`, `cpt-cf-uc-ch-plugin-component-ingest-queue`
 
 ### 1.5 Out of Scope
 
@@ -96,9 +96,9 @@ Record Persistence owns the full lifecycle write path: referential-integrity che
 1. [ ] - `p1` - Compute the deterministic record `id` (`derive_usage_record_id`, `../../../../usage-collector-sdk/src/id.rs`, 4-tuple: `tenant_id`, `gts_id`, `idempotency_key`, `created_at`) - `inst-ch-rec-create-1`
 2. [ ] - `p1` - Plugin-owned referential-integrity check: `SELECT gts_id FROM usage_type_catalog WHERE gts_id = ? LIMIT 1` (existence is version-invariant, so no resolution is needed) — absent → **RETURN** `UsageTypeNotFound` - `inst-ch-rec-create-3`
 3. [ ] - `p1` - Dedup point-lookup: `SELECT ... FROM usage_records WHERE tenant_id=? AND gts_id=? AND created_at=? AND idempotency_key=? ORDER BY id ASC, version DESC LIMIT 1 BY id` - `inst-ch-rec-create-4`
-4. [ ] - `p1` - **IF** not found — proceed to insert - `inst-ch-rec-create-5`
-   1. [ ] - `p1` - `INSERT` one row with `status='active'`, `version=<monotonic epoch_μs>`, carrying `insert_deduplication_token = UUIDv5(record namespace, id)` so a racing identical insert is dropped by the engine on a synchronous insert (`non_replicated_deduplication_window`; async inserts are deduplicated only on `Replicated*` engines) - `inst-ch-rec-create-5b`
-   2. [ ] - `p1` - **RETURN** the new record - `inst-ch-rec-create-5c`
+4. [ ] - `p1` - **IF** not found — proceed to write - `inst-ch-rec-create-5`
+   1. [ ] - `p1` - Compose one row with `status='active'`, `version=<monotonic epoch_μs>` and submit it to the group-commit queue (`cpt-cf-uc-ch-plugin-seq-group-commit-flush`): an identical row already pending in this instance absorbs it, a differing one refuses it as `IdempotencyConflict`; otherwise it travels in the next flush, one synchronous `INSERT` under `async_insert = 0` and an `insert_deduplication_token = UUIDv5(record namespace, sorted ids of the flush)`, so a retry of that same flush is dropped by the engine within the table's finite dedup window. With `insert_batch.enabled = false`, `INSERT` it directly with the token of its own id - `inst-ch-rec-create-5b`
+   2. [ ] - `p1` - Await the flush within what is left of the client-side deadline; a budget that runs out, a refused admission or a failed flush is `Transient` (or the flush's own error). **RETURN** the new record only after the `INSERT` succeeded - `inst-ch-rec-create-5c`
 5. [ ] - `p1` - **IF** found, canonical fields equal — silent absorb: **RETURN** the stored record - `inst-ch-rec-create-6`
 6. [ ] - `p1` - **IF** found, canonical fields differ — **RETURN** `IdempotencyConflict` - `inst-ch-rec-create-7`
 
@@ -110,11 +110,11 @@ Record Persistence owns the full lifecycle write path: referential-integrity che
 
 **Success Scenarios**:
 
-- All records inserted/absorbed through exactly three statements, however many usage types the batch spans: one catalog existence query, one dedup pre-read, one multi-row `INSERT`; per-record outcomes returned in input order.
+- All records inserted/absorbed through two read statements, however many usage types the batch spans — one catalog existence query, one dedup pre-read — and one submission of the composed rows to the group-commit queue (one multi-row `INSERT` of the store's own when group commit is off); per-record outcomes returned in input order.
 
 **Error Scenarios**:
 
-- A failed catalog read decides nothing for anyone, so every slot carries it. A failed dedup read fails only the slots that passed the catalog check. A failed `INSERT` fails only the slots backed by a composed row, so outcomes already decided from storage are kept.
+- A failed catalog read decides nothing for anyone, so every slot carries it. A failed dedup read fails only the slots that passed the catalog check. A failed flush, a refused admission or a conflict against a row pending in this instance fails only the slots backed by the affected composed row, so outcomes already decided from storage are kept.
 
 **Steps**:
 
@@ -122,8 +122,8 @@ Record Persistence owns the full lifecycle write path: referential-integrity che
 2. [ ] - `p1` - One catalog existence query over that set: `SELECT gts_id FROM usage_type_catalog WHERE gts_id IN (?, …)`. Every record whose `gts_id` is absent from the result gets `UsageTypeNotFound` in its own slot; a failure of the read itself is written to every slot - `inst-ch-rec-batch-2`
 3. [ ] - `p1` - One batched dedup pre-read over every record that passed step 2: `SELECT ... WHERE (gts_id, tenant_id, created_at, idempotency_key) IN (...) ORDER BY version DESC LIMIT 1 BY gts_id, tenant_id, created_at, id` - `inst-ch-rec-batch-3`
 4. [ ] - `p1` - Compute each passed record's dedup outcome (new / absorb / conflict) in input order, versioning each composed row `current_merge_version() + <rows composed so far>` so the batch's versions are distinct and increasing. Within-batch dedup is global to the batch: the canonical dedup tuple keys the composition map, so two records sharing a tuple collide here and the second is a conflict - `inst-ch-rec-batch-4`
-5. [ ] - `p1` - One multi-row `INSERT` of the composed rows — a no-op when nothing was composed — carrying `insert_deduplication_token = UUIDv5(record namespace, sorted row ids)` so an identical racing batch is dropped by the engine. Always synchronous, whatever `async_insert` says, because the statement's rows must become visible together - `inst-ch-rec-batch-5`
-6. [ ] - `p1` - On `INSERT` failure, write the error into exactly the slots backed by a composed row; slots absorbed from storage keep the outcome step 4 decided - `inst-ch-rec-batch-6`
+5. [ ] - `p1` - One submission of the composed rows to the group-commit queue — a no-op when nothing was composed — awaited within what is left of the client-side deadline. The rows travel together, in input order, in one synchronous flush `INSERT` (`async_insert = 0`) under the flush's `insert_deduplication_token = UUIDv5(record namespace, sorted row ids of the flush)`, possibly alongside other calls' rows; a row whose dedup tuple is already pending in this instance follows it (identical) or is refused as `IdempotencyConflict` (differing). With group commit off, one multi-row `INSERT` of the store's own, always synchronous - `inst-ch-rec-batch-5`
+6. [ ] - `p1` - On a failed flush or refused admission, write the error into exactly the slots backed by a composed row — each row carries its own outcome — while slots absorbed from storage keep the outcome step 4 decided - `inst-ch-rec-batch-6`
 7. [ ] - `p1` - **RETURN** per-record outcome vector aligned to input order (an insert failure is reported per affected slot, not as a top-level error) - `inst-ch-rec-batch-7`
 
 ### Get Usage Record
@@ -176,7 +176,13 @@ This check is nonetheless what *bounds* that window rather than leaving it open-
 
 - [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-record-persistence-batch-partition`
 
-The batch MUST be resolved with exactly three ClickHouse statements — one catalog existence query over the distinct `gts_id`s, one dedup pre-read over the records that passed it, one multi-row `INSERT` of the composed rows — regardless of how many usage types it spans. There is no per-`gts_id` fan-out: three statements is strictly fewer round-trips than one pipeline per distinct type. Within-batch dedup stays correct because the composition map is keyed on the canonical dedup tuple, which is global to the batch. Failure granularity is per slot: a failed catalog read fails every slot, a failed dedup read fails the slots that passed the catalog check, and a failed `INSERT` fails only the slots backed by a composed row.
+The batch MUST be resolved with exactly two ClickHouse read statements — one catalog existence query over the distinct `gts_id`s, one dedup pre-read over the records that passed it — and one write of the composed rows, regardless of how many usage types it spans. There is no per-`gts_id` fan-out. The write is a submission to the group-commit queue (`cpt-cf-uc-ch-plugin-algo-record-persistence-group-commit`), so the batch's rows share a flush `INSERT` with other calls' rows rather than each call being its own statement; with group commit off it is one multi-row `INSERT` of the store's own. Within-batch dedup stays correct because the composition map is keyed on the canonical dedup tuple, which is global to the batch, and the queue's coalescing extends the same rule to rows pending from other calls of this instance. Failure granularity is per slot: a failed catalog read fails every slot, a failed dedup read fails the slots that passed the catalog check, and a failed flush or refused admission fails only the slots backed by a composed row.
+
+### Group Commit of Record Writes
+
+- [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-record-persistence-group-commit`
+
+Every `usage_records` write of `create_usage_record` and `create_usage_records` MUST go through one in-process queue per plugin instance (`infra/storage/ingest`), after the call's own checks and pre-read. A background flusher MUST cut queued calls into flushes on reaching `insert_batch.max_rows` or `max_bytes`, or once the oldest queued call has waited `max_wait_ms` (arrivals MUST NOT postpone that timer), and write each flush as one synchronous `INSERT` with an explicit `async_insert = 0` and one `insert_deduplication_token` over the flush's rows; a call's rows MUST stay together in one flush, in input order, and a call larger than a flush target MUST be flushed alone rather than split. Admission MUST bound outstanding calls, rows and estimated bytes (queued and in flight) and refuse with `Transient` beyond them (`Internal` for a call that could never fit). A row whose dedup tuple is already pending MUST be coalesced (identical) or refused as `IdempotencyConflict` (differing), never written twice or silently collapsed. No call MUST be acknowledged before its flush succeeded. A transient flush failure MUST be retried a bounded number of times with the identical payload and token, never while draining; a row-attributable failure of a combined flush MUST be isolated per call once, directly, without re-queueing; every other failure MUST fan out to every waiter. The flusher MUST be driven by the gear's lifecycle entry, close admission when its token fires, drain queued and in-flight work within the drain deadline, and complete every waiter on every exit path. Deactivation markers and catalog writes MUST bypass the queue.
 
 ### Versioned-Marker Deactivation Cascade
 
@@ -218,7 +224,7 @@ The system **MUST** implement `create_usage_record` as: refuse, before any state
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-record-persistence-create-batch`
 
-The system **MUST** implement `create_usage_records` with exactly three ClickHouse statements however many usage types the batch spans, preceded by a local value check that decides, in its own slot and without I/O, every record whose `value` is not exactly representable in `Decimal128(9)` (never rounded): one catalog existence query over the distinct `gts_id`s of the records that passed it, one batched dedup pre-read over the records that passed it, and one multi-row `INSERT` of the composed rows (a no-op when nothing was composed), carrying an `insert_deduplication_token` derived from the sorted row ids and always synchronous. Per-record outcomes **MUST** be returned in input order. A failed catalog read **MUST** be reported in every slot that passed the value check, a failed dedup read only in the slots that passed the catalog check, and a failed `INSERT` only in the slots backed by a composed row.
+The system **MUST** implement `create_usage_records` with exactly two ClickHouse read statements however many usage types the batch spans, preceded by a local value check that decides, in its own slot and without I/O, every record whose `value` is not exactly representable in `Decimal128(9)` (never rounded): one catalog existence query over the distinct `gts_id`s of the records that passed it, one batched dedup pre-read over the records that passed it, and then one write of the composed rows (a no-op when nothing was composed) — a submission to the group-commit queue, where the rows travel together in one synchronous flush `INSERT` under the flush's `insert_deduplication_token`, or one multi-row synchronous `INSERT` of the store's own when group commit is off. Per-record outcomes **MUST** be returned in input order. A failed catalog read **MUST** be reported in every slot that passed the value check, a failed dedup read only in the slots that passed the catalog check, and a failed write only in the slots backed by the affected composed row.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-record-persistence-batch-partition`, `cpt-cf-uc-ch-plugin-flow-record-persistence-create-batch`
 
@@ -228,27 +234,23 @@ The system **MUST** implement `create_usage_records` with exactly three ClickHou
 
 - Component: `cpt-cf-uc-ch-plugin-component-record-store`
 
-### Use server-side asynchronous inserts for usage_records
+### Group-commit record writes
 
-- [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-dod-record-persistence-async-insert`
+- [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-record-persistence-group-commit`
 
-The system **MUST** send every **single-row** `usage_records` `INSERT` with `async_insert = 1` and `wait_for_async_insert = 1` when the `async_insert` config field is enabled (the default), applied per statement rather than on the shared client so no read path is affected. This is what stops the one-`INSERT`-per-`create_usage_record` write path forming a part per record.
+The system **MUST** route every `usage_records` write of `create_usage_record` and `create_usage_records` through the plugin's group-commit queue when `insert_batch.enabled` (the default), per `cpt-cf-uc-ch-plugin-algo-record-persistence-group-commit`: flushes cut at `max_rows` / `max_bytes` / the oldest call's `max_wait_ms`, each one synchronous `INSERT` carrying an explicit `async_insert = 0` and one `insert_deduplication_token` (`record_store::insert_dedup_token`: UUIDv5 of the sorted, deduplicated row ids of the flush under the record namespace); a call's rows together, never split; admission bounded on calls, rows and bytes; instance-local coalescing; no acknowledgement before the flush succeeded; bounded retry, per-call isolation and fan-out as specified; drain on the gear's cancellation with every waiter completed. The `insert_batch` block **MUST** validate every field as positive and `max_wait_ms` as at most half of `request_timeout_secs`; a cluster **MUST** require `insert_batch.enabled`; `async_insert` **MUST** be refused together with `insert_batch.enabled`.
 
-`wait_for_async_insert` **MUST NOT** be configurable or set to `0`: both the durability acknowledgement and `create_usage_record`'s dependence on its own dedup pre-read observing a prior insert rest on it.
+With `insert_batch.enabled = false` the system **MUST** keep the direct path: one synchronous `INSERT` per call, and, when `async_insert` is on, single-row `INSERT`s with `async_insert = 1`, `wait_for_async_insert = 1` (pinned, never configurable) and `async_insert_deduplicate = 1`, applied per statement; startup validation **MUST** then reject a `request_timeout_secs` too small to absorb the server-side buffer-flush wait. Multi-row `usage_records` `INSERT`s — the deactivation cascade and the direct batch path — and all `usage_type_catalog` writes **MUST** remain synchronous in every mode.
 
-Multi-row `usage_records` `INSERT`s — `create_usage_records` and the deactivation cascade — **MUST** remain synchronous regardless of the config value, because the server-side buffer does not guarantee that one statement's rows become visible in a single commit, and both depend on that. All `usage_type_catalog` writes **MUST** likewise remain synchronous.
+Every `usage_records` `INSERT` — flush, direct, or marker — **MUST** carry an `insert_deduplication_token`. The table **MUST** keep `non_replicated_deduplication_window = 10000`, retrofitted onto pre-existing tables by the migration step `m0002_insert_dedup_window` (`ensure_insert_dedup_window`). The documented consequence: a retry of an identical statement within the finite window is dropped by the engine; a duplicate written by another instance carries another token, is stored, and is resolved to the highest version by every read (Feature 3) and at merge — no cross-instance first-writer-wins is provided.
 
-Startup validation **MUST** reject a `request_timeout_secs` too small to absorb the server-side buffer-flush wait while `async_insert` is enabled.
+**Implements**: `cpt-cf-uc-ch-plugin-algo-record-persistence-group-commit`, `cpt-cf-uc-ch-plugin-flow-record-persistence-create-single`, `cpt-cf-uc-ch-plugin-flow-record-persistence-create-batch`
 
-Every `usage_records` `INSERT` — single, batch, or marker — **MUST** carry an `insert_deduplication_token` (`record_store::insert_dedup_token`: UUIDv5 of the sorted, deduplicated row ids under a per-insert-kind namespace), and asynchronous inserts **MUST** also carry `async_insert_deduplicate = 1`. The table **MUST** keep `non_replicated_deduplication_window = 10000`, retrofitted onto pre-existing tables by the migration step `m0002_insert_dedup_window` (`ensure_insert_dedup_window`). The documented consequence: on a synchronous insert a racing identical write is dropped by the engine (first-writer-wins); with `async_insert` enabled on a non-replicated table the single-record path is deduplicated by `optimize_on_insert` within one flush and by merge otherwise, so `list`/`aggregate` may see such a twin twice until the merge.
-
-**Implements**: `cpt-cf-uc-ch-plugin-flow-record-persistence-create-single`
-
-**Sequences**: `cpt-cf-uc-ch-plugin-seq-ingest-dedup`
+**Sequences**: `cpt-cf-uc-ch-plugin-seq-group-commit-flush`, `cpt-cf-uc-ch-plugin-seq-ingest-dedup`, `cpt-cf-uc-ch-plugin-seq-ingest-batch`
 
 **Touches**:
 
-- Component: `cpt-cf-uc-ch-plugin-component-record-store`
+- Component: `cpt-cf-uc-ch-plugin-component-record-store`, `cpt-cf-uc-ch-plugin-component-ingest-queue`
 - DB Table: `cpt-cf-uc-ch-plugin-dbtable-usage-records`
 
 ### Implement get_usage_record
@@ -275,12 +277,13 @@ The system **MUST** implement `deactivate_usage_record` as: one version-resolved
 
 ## 6. Acceptance Criteria
 
-- [ ] Single-row `usage_records` `INSERT`s carry `async_insert = 1` and `wait_for_async_insert = 1` (verifiable in `system.query_log`), while multi-row `INSERT`s and every `usage_type_catalog` write carry neither. Every `usage_records` `INSERT` carries a UUID `insert_deduplication_token`; on a synchronous store two racing identical single creates, or two racing identical batches, store exactly one physical row per id, and a deactivation marker is stored next to the row it supersedes rather than deduplicated against it. An exact create retry is still absorbed rather than inserting a second row, which is what proves the acknowledgement implies queryability.
+- [x] Every group-commit flush carries `async_insert = 0` (resolved against the server default in `system.query_log`) and a UUID `insert_deduplication_token`; concurrent creates share flushes (fewer `INSERT`s than calls); a group-committed create is readable and absorbable when it returns, and racing identical creates in one instance store one physical row. On the direct path with `async_insert` on, single-row `INSERT`s carry `async_insert = 1` and `wait_for_async_insert = 1`, while multi-row `INSERT`s and every `usage_type_catalog` write carry neither. On a synchronous direct store two racing identical single creates, or two racing identical batches, store exactly one physical row per id, and a deactivation marker is stored next to the row it supersedes rather than deduplicated against it. An exact create retry is absorbed rather than inserting a second row, which is what proves the acknowledgement implies queryability.
 - [x] The catalog-existence check is `SELECT gts_id FROM usage_type_catalog WHERE gts_id = ? LIMIT 1`; an absent type returns `UsageTypeNotFound`, including a type that `delete_usage_type` previously removed.
 - [x] The dedup lookup keys on the canonical `(tenant_id, gts_id, created_at, idempotency_key)` tuple — emitted in sorting-key order (`gts_id` first) so it leads with the three-column sort-key prefix, never on `id` — and resolves versions per `id` (`ORDER BY id ASC, version DESC LIMIT 1 BY id`).
 - [x] An identical re-submission (same canonical fields) is absorbed silently; a re-submission with differing canonical fields returns `IdempotencyConflict`.
-- [x] `create_usage_records` issues exactly three statements however many usage types the batch spans — one catalog existence query, one dedup pre-read, one multi-row `INSERT` — with per-record outcomes in input order.
-- [x] A failed `INSERT` is reported only in the slots backed by a composed row; slots absorbed from storage keep the outcome the dedup pre-read decided.
+- [x] `create_usage_records` issues exactly two read statements however many usage types the batch spans — one catalog existence query, one dedup pre-read — and one write of the composed rows, with per-record outcomes in input order.
+- [x] A failed write, a refused admission or a conflict against a pending row is reported only in the slots backed by the affected composed row; slots absorbed from storage keep the outcome the dedup pre-read decided.
+- [x] The ingest queue's unit tests prove: concurrent calls share one flush with correctly mapped outcomes; no outcome before the sink returns; the timer fires at `max_wait` from the oldest call under continuous arrivals; admission and memory bounds hold; identical in-flight creates coalesce and differing ones conflict; transient failures reach every waiter after bounded identical retries; isolation is bounded and non-recursive; cancellation, a panicking flush task, the drain deadline and a hard abort leave nothing outstanding; markers and catalog writes bypass the queue.
 - [x] `deactivate_usage_record` flips the target and all depth-1 active compensations in a single multi-row `INSERT`; no partial cascade is observable by a version-resolving reader.
 - [x] `deactivate_usage_record` returns `UsageRecordNotFound` when the target does not exist and `UsageRecordAlreadyInactive` when it is already inactive.
 - [x] No `UPDATE` or `ALTER TABLE ... DELETE` statement is issued on any request-path code path.

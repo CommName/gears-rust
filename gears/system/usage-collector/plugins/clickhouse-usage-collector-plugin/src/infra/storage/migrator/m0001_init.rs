@@ -121,32 +121,30 @@ pub const VERSION_COLUMN: &str = "version";
 /// Engine: `ReplacingMergeTree(version)`, as for the catalog. A new versioned
 /// row with `status = inactive`, a higher `version` and the same `id` emulates
 /// deactivation (no in-place `UPDATE`; DESIGN.md §3.6 Deactivation Cascade).
-/// Read-time handling differs by read shape (`query::dedup`):
+/// Every read resolves versions itself (`query::dedup`):
 /// - point reads (get, the cascade's own read, the create-path dedup lookups)
 ///   resolve the highest version explicitly with
 ///   `ORDER BY version DESC LIMIT 1 BY <sort key>` over a bloom-filter-pruned
 ///   candidate set;
-/// - range reads (list, aggregate) do not resolve versions: they scan raw rows
-///   and exclude the ids that carry an inactive marker
-///   (`id NOT IN (SELECT id … WHERE … AND status = 'inactive')`), which is
-///   exact for deactivation before any merge and costs one hash probe per row
-///   instead of a sort or hash aggregation over the whole scan.
+/// - range reads (list, aggregate) read `FINAL` with
+///   `do_not_merge_across_partitions_select_final = 1` — correct because the
+///   partition key below is a function of the sort-key column `created_at`,
+///   so every version of a key shares its partition.
 ///
 /// The insert dedup window keeps the last [`INSERT_DEDUP_WINDOW_BLOCKS`]
 /// inserted blocks' `insert_deduplication_token`s (every insert carries one,
-/// see `record_store::insert_dedup_token`), so a racing retry of the same rows
-/// is dropped before it becomes a part. `ClickHouse` enforces the token on
-/// synchronous inserts; on asynchronous inserts only `Replicated*` engines do,
-/// so on a single node with `async_insert` on (the plugin default) a duplicate
-/// single-record create that lands in a different flush than its twin is
-/// visible to list/aggregate until the merge.
+/// see `record_store::insert_dedup_token`), so a retry of the same flush is
+/// dropped before it becomes a part. It is finite and matches only an
+/// identical flush: a duplicate written by another collector instance carries
+/// another token, is stored, and is resolved by the reads above and by the
+/// next merge.
 ///
 /// On a cluster it is sharded by [`RECORDS_SHARDING_KEY`]. This is required,
-/// not a tuning choice: a deactivation marker clones its source row and a
-/// compensation row belongs to the tenant it corrects, so every row an
-/// `id NOT IN (SELECT id … status = 'inactive')` anti-join must see lives on
-/// the same shard — which is what lets the plugin run those queries with
-/// `distributed_product_mode = 'local'` (`topology` module docs).
+/// not a tuning choice: a deactivation marker clones its source row, a
+/// duplicate create carries the same tenant, and a compensation row belongs
+/// to the tenant it corrects, so every version of a row lives on one shard —
+/// which is what makes the per-shard `FINAL` of the range reads exact
+/// (`topology` module docs).
 ///
 /// The TTL expires rows after the configured retention, measured on
 /// `created_at` directly (`table::ttl_expr`). Expiry is whole-partition only
@@ -233,9 +231,9 @@ fn records() -> Table {
 ///
 /// Permuting these four columns does not change what `ReplacingMergeTree`
 /// collapses on: the engine's row identity is the sort key as a *set* of
-/// columns, the `LIMIT 1 BY` resolution fragment (`query::dedup`) is
-/// order-insensitive too, and the marker anti-join keys on `id` alone. Only
-/// adding or removing a column would change which rows resolve together.
+/// columns, and both `FINAL` and the `LIMIT 1 BY` resolution fragment
+/// (`query::dedup`) are order-insensitive too. Only adding or removing a
+/// column would change which rows resolve together.
 ///
 /// The dedup lookup itself keys on the canonical tuple
 /// `(tenant_id, gts_id, created_at, idempotency_key)`, not on `id` — see
