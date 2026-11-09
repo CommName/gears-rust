@@ -38,6 +38,9 @@ env:
   # CARGO_* variable in its cache keys, so changing one rebuilds everything.
   # Usually better determinism and smaller cache churn in CI.
   CARGO_INCREMENTAL: "0"
+  CI_PREINSTALLED_TOOLS: nextest
+  # The one cargo-gears pin for CI; gears.mk reads it from the environment too.
+  CARGO_GEARS_VERSION: 0.0.8
   # Pinned nightly toolchain used by the coverage job. Independent of the pin in
   # shear-nightly.yml — they happen to match today but need not.
   RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
@@ -81,6 +84,8 @@ jobs:
               - 'gears-rust.mk'
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              - 'tools/scripts/check_crypto_facade.py'
+              - 'tools/scripts/tests/test_crypto_facade.py'
               # Input to `make check-release-config` in the repo-checks job: a config-only
               # edit must still get the release configuration validated.
               - 'release-plz.toml'
@@ -96,8 +101,11 @@ jobs:
               # silently never runs on exactly the diff it exists to catch.
               - 'testing/e2e/lib/sidecars.py'
             fips:
+              - 'libs/toolkit-security/**'
+              - 'libs/toolkit-auth/**'
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
+              - 'libs/toolkit-http-proxy/**'
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
@@ -161,7 +169,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -177,7 +185,7 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-hack
 
@@ -187,9 +195,11 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
+        id: sccache
         uses: ./.github/actions/sccache
         # Reused below as `*sccache-inputs`.
         with: &sccache-inputs
@@ -213,10 +223,20 @@ jobs:
       - name: No unpinned database container images
         run: cargo xtask check-test-container-pins
 
+      - name: Application crypto stays behind the facade
+        run: |
+          python3 tools/scripts/check_crypto_facade.py
+          python3 -m unittest discover -s tools/scripts/tests -p test_crypto_facade.py
+
       # The wrapper turns compiler/lint errors into annotations titled by
       # their code (E0308, DE0904, clippy::...) when the command fails.
       - name: cargo clippy
         run: tools/scripts/with_rust_annotations.sh make clippy
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   # Python checks of repo files. They need no Rust toolchain, so they run in
   # their own short job.
@@ -301,7 +321,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -317,7 +337,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
@@ -327,6 +347,7 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-integration-${{ hashFiles('rust-toolchain.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
@@ -357,6 +378,16 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-pg
+
+      - name: Test postgres-event-broker-plugin (pg integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-eb-pg
+
+      - name: Test event-broker gear database (SQLite, PostgreSQL, MySQL integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        # The lane sets EB_TEST_REQUIRE_DOCKER=1 itself, so an unreachable
+        # Docker fails the step instead of skipping the suite green.
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=eb-gear-db
 
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -420,6 +451,13 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=ledger-pg
 
+      # bss-orders' Postgres tier: the engine, sealed audit, idempotency, claims, role-isolation
+      # and gear-boot proofs all run against a real PostgreSQL. Without this step the tier
+      # compiles here and runs nowhere.
+      - name: Test bss-orders with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=orders-pg
+
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-redis
@@ -452,6 +490,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-db
 
+      - name: Test oagw (cluster feature)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-cluster
+
       # Published as GitHub Checks by test-report.yml (workflow_run), which has
       # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a
       # failing run still ships its report; a missing report (build failure)
@@ -464,6 +506,11 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.setup.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   test-fips:
     name: FIPS verification (${{ matrix.os }})
@@ -506,7 +553,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -524,7 +571,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
@@ -536,9 +583,11 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-fips
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
+        id: sccache
         uses: ./.github/actions/sccache
         with: *sccache-inputs
 
@@ -554,15 +603,38 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          cargo test -p cf-gears-toolkit-security --features fips,jwt,internal-auth-cache --lib --test jwt_no_backend_fallback
+          cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
           cargo test -p cf-gears-rustls-corecrypto-provider --features fips
           cargo test -p cf-gears-toolkit-http --features fips
+          cargo test -p cf-gears-toolkit-http-proxy --features fips --no-run
 
-      # Windows: build-verify the CNG provider path. Compile-only is sufficient —
-      # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
-      - name: FIPS build check (Windows / CNG)
+      # Windows: execute native CNG operations through internal test injection.
+      # This does not establish a FIPS witness on the hosted runner (ADR 0003).
+      - name: CNG operations and FIPS build check (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+        run: |
+          cargo test --locked -p cf-gears-toolkit-security --features fips,jwt --lib crypto::windows_tests::native_cng_operations
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-security --all-targets --features fips,jwt,internal-auth-cache
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http-proxy --features fips
+
+      - name: Check FIPS sidecar configuration
+        shell: bash
+        run: cargo check --locked -p cf-gears-file-storage --bin sidecar --features toolkit/fips
+
+      - name: Test native FIPS consumers
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo test --locked -p cf-gears-file-storage --features toolkit/fips --lib --bin sidecar
+          cargo test --locked -p cf-gears-credstore --features toolkit-security/fips --lib domain::secret::fence
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   # The gear's whole suite against a real PostgreSQL with pgvector, and its
   # own coverage floor, in one pass.
@@ -621,12 +693,13 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # The same pin as the workspace coverage job: the v2.70.3 one installed
       # cargo-llvm-cov 0.8.5, which on nightly-2026-08-21 ran every test and
       # then found no object files to report on.
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -732,9 +805,10 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -806,6 +880,7 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Fetch ONNX Runtime shared library
         shell: bash
@@ -905,9 +980,11 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
+        id: sccache
         uses: ./.github/actions/sccache
         with: *sccache-inputs
 
@@ -925,6 +1002,11 @@ jobs:
         shell: bash
         timeout-minutes: 10
         run: cargo test -p cf-gears-file-parser --features magika
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   cfs:
     name: CFS
@@ -951,7 +1033,7 @@ jobs:
 
       # Install tools via prebuilt binaries for speed.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-deny@0.20.2
 
@@ -987,7 +1069,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -1008,9 +1090,10 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -1031,6 +1114,9 @@ jobs:
       #   5. The toolkit-durable-execution PostgreSQL suites behind the integration
       #      feature, including subprocess recovery. A single test binary
       #      shares the workspace-pinned PostgreSQL container.
+      #   6. OAGW with its `cluster` feature, which pass 1 lacks: the proxy
+      #      cache's change log, publisher and watcher. Keep in sync with
+      #      the `oagw-cluster` lane of `make test-integration`.
       #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
@@ -1072,6 +1158,9 @@ jobs:
           # (cargo test: no JUnit).
           fresh_report
           "$W" make coverage-durable-execution-pg
+          # Pass 6: OAGW with the `cluster` feature.
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-gears-oagw --features cluster
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
@@ -1132,7 +1221,7 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -1142,7 +1231,21 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-gears
-        run: cargo install --locked cargo-gears@0.0.8
+        uses: ./.github/actions/cargo-gears
+        with:
+          version: ${{ env.CARGO_GEARS_VERSION }}
+
+      # rust-lang/rust-clippy renamed `master` to `main`, but dylint (up to 6.2.0) clones it and
+      # checks out `master`, so building the dylint driver fails. Serve that clone from a local
+      # mirror whose default branch `master` is `main`. Remove once dylint checks out `main`.
+      - name: Work around dylint's hard-coded rust-clippy `master`
+        shell: bash
+        run: |
+          mirror="$RUNNER_TEMP/rust-clippy.git"
+          git clone --bare --quiet https://github.com/rust-lang/rust-clippy "$mirror"
+          git -C "$mirror" branch -f master main
+          git -C "$mirror" symbolic-ref HEAD refs/heads/master
+          git config --global url."file://$mirror".insteadOf https://github.com/rust-lang/rust-clippy
 
       - name: Run architecture lints
-        run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint
+        run: tools/scripts/with_rust_annotations.sh make dylint
