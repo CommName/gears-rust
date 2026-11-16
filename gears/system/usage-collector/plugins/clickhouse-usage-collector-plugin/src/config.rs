@@ -61,6 +61,7 @@ pub(crate) fn decode_userinfo(encoded: &str) -> Result<String, std::str::Utf8Err
 /// Durations are whole seconds (repo convention).
 #[derive(Debug, Clone, Deserialize, toolkit_macros::ExpandVars)]
 #[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ClickHousePluginConfig {
     /// `ClickHouse` HTTP endpoint URL including credentials, e.g.
     /// `https://user:${CH_PASSWORD}@host:8443/db`. Held as a
@@ -190,6 +191,8 @@ pub struct ClickHousePluginConfig {
     /// deployment whose `ClickHouse` version or settings profile makes async
     /// inserts unavailable.
     pub async_insert: bool,
+    /// Whether creates run the dedup pre-read before inserting. Testing only.
+    pub dedup_lookup: bool,
     /// `usage_records` retention window in seconds; rows older are deleted via
     /// `ClickHouse` TTL. Must be in `(0, MAX_RETENTION_SECS]`.
     pub retention_period_secs: u64,
@@ -347,6 +350,7 @@ impl Default for ClickHousePluginConfig {
             // without server-side coalescing a request-shaped ingest stream
             // writes one small part per record.
             async_insert: true,
+            dedup_lookup: true,
             // Same window the migration DDL bakes in, so a config-less start
             // needs no `MODIFY TTL` reconciliation at startup.
             retention_period_secs: crate::infra::storage::pool::DEFAULT_RETENTION_SECS,

@@ -159,6 +159,9 @@ pub struct ChRecordStore {
     /// ([`crate::config::ClickHousePluginConfig::async_insert`]). Deactivation
     /// markers are synchronous regardless.
     async_insert: bool,
+    /// Whether creates run the dedup pre-read
+    /// ([`crate::config::ClickHousePluginConfig::dedup_lookup`]).
+    dedup_lookup: bool,
 }
 
 impl ChRecordStore {
@@ -193,7 +196,15 @@ impl ChRecordStore {
             metrics,
             request_timeout,
             async_insert,
+            dedup_lookup: true,
         }
+    }
+
+    /// Enable or disable the dedup pre-read on `create` / `create_batch`.
+    #[must_use]
+    pub fn with_dedup_lookup(mut self, enabled: bool) -> Self {
+        self.dedup_lookup = enabled;
+        self
     }
 
     /// Execute a `SELECT … FROM usage_type_catalog WHERE gts_id = ?` catalog
@@ -1078,7 +1089,9 @@ impl RecordStore for ChRecordStore {
         }
         self.check_catalog_existence(&record.gts_id).await?;
 
-        if let Some(row) = self.dedup_point_lookup(&record).await? {
+        if self.dedup_lookup
+            && let Some(row) = self.dedup_point_lookup(&record).await?
+        {
             return self.resolve_dedup_hit(&row, &record);
         }
 
@@ -1154,7 +1167,12 @@ impl RecordStore for ChRecordStore {
 
         // 2. One dedup pre-read over everything that passed the catalog check.
         let record_refs: Vec<&UsageRecord> = passed.iter().map(|&i| &records[i]).collect();
-        let existing = match self.batch_dedup_lookup(&record_refs).await {
+        let lookup = if self.dedup_lookup {
+            self.batch_dedup_lookup(&record_refs).await
+        } else {
+            Ok(HashMap::new())
+        };
+        let existing = match lookup {
             Ok(existing) => existing,
             Err(e) => {
                 for &idx in &passed {

@@ -15,6 +15,14 @@ fn config_defaults_are_applied() {
          request, so without server-side coalescing a request-shaped ingest \
          stream writes one small part per record"
     );
+    assert!(cfg.dedup_lookup);
+}
+
+#[test]
+fn dedup_lookup_can_be_disabled_from_config() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "dedup_lookup": false }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    assert!(!cfg.dedup_lookup);
 }
 
 /// The escape hatch must actually be reachable from config. `serde(default,

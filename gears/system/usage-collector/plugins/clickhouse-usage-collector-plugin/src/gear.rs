@@ -151,12 +151,15 @@ impl Gear for ClickHouseUsageCollectorPlugin {
         // Both stores share the same ClickHouse client (cheaply cloneable handle
         // to the shared HTTP pool). The cancel token is threaded in so the
         // catalog-size refresh worker aborts on shutdown.
-        let record_store: Arc<dyn RecordStore> = Arc::new(ChRecordStore::new(
-            client.clone(),
-            Arc::clone(&metrics),
-            client_deadline,
-            cfg.async_insert,
-        ));
+        let record_store: Arc<dyn RecordStore> = Arc::new(
+            ChRecordStore::new(
+                client.clone(),
+                Arc::clone(&metrics),
+                client_deadline,
+                cfg.async_insert,
+            )
+            .with_dedup_lookup(cfg.dedup_lookup),
+        );
 
         let catalog_store: Arc<dyn CatalogStore> = Arc::new(ChCatalogStore::new(
             client,
