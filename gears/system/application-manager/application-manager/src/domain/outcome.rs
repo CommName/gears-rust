@@ -1,96 +1,99 @@
-//! The outcome table of DESIGN 3.3 as pure functions, one per decision point.
-//!
-//! The first matching rank decides. Nothing here does I/O.
+//! Outcome ranking (DESIGN 3.3 "Outcome table"): the synchronous ranks of a
+//! seed or uninstall, as a pure function of the collected facts, and the
+//! category each refusal records. The categories after dispatch are
+//! [`crate::domain::operation::completed_category`].
 
-use application_manager_sdk::{RequestCategory, SectionOutcomeEntry, UnavailableItem};
+use application_manager_sdk::RequestCategory;
 use toolkit_macros::domain_model;
 
-use crate::domain::actions::Action;
+use crate::domain::actions::CallerAction;
 use crate::domain::error::DomainError;
 use crate::domain::operation::OpenOperation;
-use crate::domain::ports::{AccessError, StorageError};
-use crate::domain::router::UnavailableReason;
+use crate::domain::ports::StorageError;
 use crate::domain::schema_validator::Problem;
 
-/// What the gear's own gate found.
+/// What the request gate decided.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
-    /// Ready, not stopping, with a free request-task permit.
+    /// A request-task permit was taken.
     Open,
-    /// Startup has not finished, or `stop` has begun (rank 1).
+    /// Startup has not finished, or `stop` has begun.
     NotReady,
-    /// No free request-task permit (rank 1).
+    /// No request-task permit is free.
     AtCapacity,
 }
 
-/// Everything the synchronous ranks 1 to 4 look at.
+/// The facts the synchronous phase collects, in the order it collects them.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncFacts {
-    /// The action asked for, named by a rank 2 refusal.
-    pub action: Action,
-    /// The gate.
+    /// What the request asks for.
+    pub action: CallerAction,
+    /// The gate's answer.
     pub gate: Gate,
-    /// The access control answer.
-    pub access: Result<(), AccessError>,
-    /// The storage step of a permitted caller: the open operation of the
-    /// application. `None` when it was not consulted.
+    /// Whether the allowed callers grant `action`.
+    pub allowed: bool,
+    /// The open-operation step, run only for an allowed caller.
     pub open: Option<Result<Option<OpenOperation>, StorageError>>,
-    /// Envelope problems, or an uninstall id outside the limits.
+    /// Problems of the envelope or the uninstall id.
     pub envelope_problems: Vec<Problem>,
 }
 
-/// The refusal of ranks 1 to 4, in DESIGN order, or `None` to go on to
-/// acceptance. A storage answer counts only for a permitted caller; an open
-/// operation past its run deadline is not a conflict.
+/// The synchronous refusal of `facts`, or `None` when the request goes on to
+/// acceptance. The first matching rank decides (DESIGN 3.3):
+///
+/// 1. not ready or at capacity, or storage cannot answer for an allowed
+///    caller;
+/// 2. the caller is not allowed;
+/// 3. an open operation before its run deadline (an expired one is completed
+///    by the acceptance, not a conflict);
+/// 4. an envelope problem or an uninstall id outside the limits.
 #[must_use]
-pub fn sync_refusal(_facts: &SyncFacts) -> Option<DomainError> {
-    todo!("PR 5: ranks 1 to 4")
+pub fn sync_refusal(facts: &SyncFacts) -> Option<DomainError> {
+    match facts.gate {
+        Gate::NotReady => return Some(DomainError::NotReady),
+        Gate::AtCapacity => return Some(DomainError::AtCapacity),
+        Gate::Open => {}
+    }
+    if facts.allowed && matches!(facts.open, Some(Err(_))) {
+        return Some(DomainError::StorageUnavailable);
+    }
+    if !facts.allowed {
+        return Some(DomainError::NotPermitted {
+            action: facts.action,
+        });
+    }
+    if let Some(Ok(Some(open))) = facts.open
+        && !open.expired
+    {
+        return Some(DomainError::Conflict {
+            operation_id: open.operation_id,
+        });
+    }
+    if !facts.envelope_problems.is_empty() {
+        return Some(DomainError::InvalidManifest {
+            problems: facts.envelope_problems.clone(),
+        });
+    }
+    None
 }
 
-/// The category a refused event records for `err`; a gear defect records
-/// internal failure.
+/// The category a refused event records for `refusal`. A gear defect is not
+/// ranked and records internal failure.
 #[must_use]
-pub fn category_of(_err: &DomainError) -> RequestCategory {
-    todo!("PR 5: category of a refusal")
-}
-
-/// What one section plugin's `schema` gave, after checking.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaState {
-    /// A usable schema.
-    Usable,
-    /// No schema.
-    Unavailable(UnavailableReason),
-    /// The plugin refused the caller.
-    NotPermitted,
-}
-
-/// The decision of ranks 5 and 6.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchemaStage {
-    /// `temporarily_unavailable` (rank 5) or `not_permitted` (rank 6).
-    pub category: RequestCategory,
-    /// The unavailable schemas of rank 5, in plugin order; empty for rank 6.
-    pub unavailable: Vec<UnavailableItem>,
-}
-
-/// Ranks 5 and 6 over the `(key, state)` of every plugin in plugin order:
-/// unavailable wins over not permitted; `None` when every schema is usable.
-#[must_use]
-pub fn schema_category(_states: &[(&str, SchemaState)]) -> Option<SchemaStage> {
-    todo!("PR 5: ranks 5 and 6")
-}
-
-/// The category after dispatch: not permitted, then rejected, then internal
-/// failure (internal failure, timed out, not sent, not dispatched), else
-/// succeeded.
-#[must_use]
-pub fn dispatch_category(_sections: &[SectionOutcomeEntry]) -> RequestCategory {
-    todo!("PR 5: after-dispatch ranks")
+pub fn category_of(refusal: &DomainError) -> RequestCategory {
+    match refusal {
+        DomainError::NotReady | DomainError::AtCapacity | DomainError::StorageUnavailable => {
+            RequestCategory::TemporarilyUnavailable
+        }
+        DomainError::NotPermitted { .. } => RequestCategory::NotPermitted,
+        DomainError::Conflict { .. } => RequestCategory::Conflict,
+        DomainError::InvalidManifest { .. } => RequestCategory::InvalidManifest,
+        DomainError::UnknownSectionKey | DomainError::OperationNotFound | DomainError::Defect => {
+            RequestCategory::InternalFailure
+        }
+    }
 }
 
 #[cfg(test)]

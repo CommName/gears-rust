@@ -7,7 +7,10 @@ use axum::http::StatusCode;
 use toolkit::api::operation_builder::ThrottlingSpec;
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
-use super::dto::{AcceptedDto, ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto};
+use super::dto::{
+    AcceptedDto, ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto, SeedRequestDto,
+    UninstallRequestDto,
+};
 use super::gate::RequestGate;
 use super::handlers;
 use crate::domain::orchestrator::RequestOrchestrator;
@@ -21,8 +24,9 @@ pub const RATE_LIMIT_ZONE: &str = "rl_application_manager";
 /// Gateway in-flight-limit zone of the bounded routes (DESIGN 3.3).
 pub const IN_FLIGHT_LIMIT_ZONE: &str = "ifl_application_manager";
 
-/// The combined-schema read is bound to the gateway zones (DESIGN 3.3).
-fn manifest_schema_throttling() -> ThrottlingSpec {
+/// Seed, uninstall, the operation read, and the combined-schema read are
+/// bound to the gateway zones (DESIGN 3.3).
+fn bounded_throttling() -> ThrottlingSpec {
     ThrottlingSpec {
         rate_limit_zone: Some(RATE_LIMIT_ZONE.to_owned()),
         in_flight_limit_zone: Some(IN_FLIGHT_LIMIT_ZONE.to_owned()),
@@ -43,9 +47,10 @@ pub fn register_routes(
         .summary("Seed an application")
         .description("Submit a manifest; answers 202 with the operation id.")
         .tag(TAG)
-        .authenticated()
+        .platform_authenticated()
         .no_license_required()
-        .with_throttling(schema_read_throttling())
+        .with_throttling(bounded_throttling())
+        .json_request::<SeedRequestDto>(openapi, "The manifest")
         .handler(handlers::seed)
         .json_response_with_schema::<AcceptedDto>(openapi, StatusCode::ACCEPTED, "Accepted")
         .error_400(openapi)
@@ -63,9 +68,9 @@ pub fn register_routes(
         .description("The id is one percent-encoded path segment; answers 202.")
         .tag(TAG)
         .path_param("application_id", "The application id, percent-encoded")
-        .authenticated()
+        .platform_authenticated()
         .no_license_required()
-        .with_throttling(schema_read_throttling())
+        .with_throttling(bounded_throttling())
         .handler(handlers::uninstall_by_id)
         .json_response_with_schema::<AcceptedDto>(openapi, StatusCode::ACCEPTED, "Accepted")
         .error_400(openapi)
@@ -82,9 +87,10 @@ pub fn register_routes(
         .summary("Uninstall an application")
         .description("The body carries `application_id`; answers 202.")
         .tag(TAG)
-        .authenticated()
+        .platform_authenticated()
         .no_license_required()
-        .with_throttling(schema_read_throttling())
+        .with_throttling(bounded_throttling())
+        .json_request::<UninstallRequestDto>(openapi, "The application to uninstall")
         .handler(handlers::uninstall)
         .json_response_with_schema::<AcceptedDto>(openapi, StatusCode::ACCEPTED, "Accepted")
         .error_400(openapi)
@@ -102,9 +108,9 @@ pub fn register_routes(
         .description("The operation record and, once final, its outcome report.")
         .tag(TAG)
         .path_param("operation_id", "The operation id")
-        .authenticated()
+        .platform_authenticated()
         .no_license_required()
-        .with_throttling(schema_read_throttling())
+        .with_throttling(bounded_throttling())
         .handler(handlers::get_operation)
         .json_response_with_schema::<OperationDto>(openapi, StatusCode::OK, "Operation")
         .error_401(openapi)
@@ -160,7 +166,7 @@ pub fn register_routes(
         .tag(TAG)
         .platform_authenticated()
         .no_license_required()
-        .with_throttling(manifest_schema_throttling())
+        .with_throttling(bounded_throttling())
         .handler(handlers::get_manifest_schema)
         .json_response_with_schema::<ManifestSchemaDto>(
             openapi,

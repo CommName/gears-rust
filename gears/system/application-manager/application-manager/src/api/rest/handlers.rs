@@ -3,22 +3,23 @@
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
 
-use super::dto::{ManifestSchemaDto, SectionKeysDto, SectionSchemaDto, SectionTypeDto};
-use super::dto::SectionKeysDto;
-use axum::body::Bytes;
-use axum::response::Response;
-
 use super::dto::{
-    ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto, SectionVersionDto,
+    AcceptedDto, ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto, SectionTypeDto,
 };
 use super::error::to_canonical;
 use super::gate::RequestGate;
 use crate::domain::error::DomainError;
-use crate::domain::orchestrator::RequestOrchestrator;
+use crate::domain::operation::{Operation, OperationStatus};
+use crate::domain::orchestrator::{Receipt, RequestInput, RequestOrchestrator};
 use crate::domain::read_service::ReadService;
 
 /// `GET /application-manager/v1/section-keys`.
@@ -44,10 +45,6 @@ pub async fn list_section_keys(
 /// As [`list_section_keys`]; 404 for an unknown key.
 pub async fn get_section_schema(
     Extension(ctx): Extension<PlatformSecurityContext>,
-/// As [`list_section_keys`]; 404 for an unknown key; 503 when the plugin's
-/// schema is not served or unusable; 403 when the plugin refuses the caller.
-pub async fn get_section_schema(
-    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ReadService>>,
     Path(section_key): Path<String>,
 ) -> ApiResult<Json<SectionSchemaDto>> {
@@ -60,15 +57,6 @@ pub async fn get_section_schema(
         key: section.key().to_owned(),
         section_type: section.section_type().to_owned(),
         schema: section.schema().clone(),
-    let read = svc
-        .section_schema(&ctx, &section_key)
-        .instrument(span.clone())
-        .await
-        .map_err(|e| refusal(&span, &e, request_id))?;
-    Ok(Json(SectionSchemaDto {
-        key: read.key,
-        schema: read.schema,
-        schema_version: read.schema_version,
     }))
 }
 
@@ -78,20 +66,12 @@ pub async fn get_section_schema(
 /// As [`list_section_keys`].
 pub async fn get_manifest_schema(
     Extension(ctx): Extension<PlatformSecurityContext>,
-/// As [`list_section_keys`]; 503 when any plugin's schema is not served or
-/// unusable, which wins over 403 when a plugin refuses the caller.
-pub async fn get_manifest_schema(
-    Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ReadService>>,
 ) -> ApiResult<Json<ManifestSchemaDto>> {
     let request_id = Uuid::now_v7();
     let span = tracing::info_span!("get_manifest_schema", %request_id);
     let read = span
         .in_scope(|| svc.manifest_schema(&ctx))
-    let read = svc
-        .manifest_schema(&ctx)
-        .instrument(span.clone())
-        .await
         .map_err(|e| refusal(&span, &e, request_id))?;
     Ok(Json(ManifestSchemaDto {
         schema: read.schema,
@@ -99,28 +79,21 @@ pub async fn get_manifest_schema(
             .sections
             .into_iter()
             .map(|(key, section_type)| SectionTypeDto { key, section_type })
-            .map(|s| SectionVersionDto {
-                key: s.key,
-                schema_version: s.schema_version,
-            })
             .collect(),
     }))
 }
 
-/// The canonical error of a refused read. The read service logs a caller
-/// refusal; only not ready is logged here.
-/// `POST /application-manager/v1/applications`: 202 with the operation id and
-/// a `Location` header, or a refusal Problem.
+/// `POST /application-manager/v1/applications`.
 ///
 /// # Errors
-/// The refusals of DESIGN 3.3.
+/// The synchronous refusals of DESIGN 3.3: 503, 403, 409, 400, or 500.
 pub async fn seed(
-    Extension(_ctx): Extension<SecurityContext>,
-    Extension(_gate): Extension<Arc<RequestGate>>,
-    Extension(_orchestrator): Extension<Arc<RequestOrchestrator>>,
-    _body: Bytes,
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(gate): Extension<Arc<RequestGate>>,
+    Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
+    body: Bytes,
 ) -> ApiResult<Response> {
-    todo!("PR 5: seed")
+    submit(ctx, &gate, orchestrator, RequestInput::Seed(body)).await
 }
 
 /// `DELETE /application-manager/v1/applications/{application_id}`.
@@ -128,12 +101,18 @@ pub async fn seed(
 /// # Errors
 /// As [`seed`].
 pub async fn uninstall_by_id(
-    Extension(_ctx): Extension<SecurityContext>,
-    Extension(_gate): Extension<Arc<RequestGate>>,
-    Extension(_orchestrator): Extension<Arc<RequestOrchestrator>>,
-    Path(_application_id): Path<String>,
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(gate): Extension<Arc<RequestGate>>,
+    Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
+    Path(application_id): Path<String>,
 ) -> ApiResult<Response> {
-    todo!("PR 5: uninstall by id")
+    submit(
+        ctx,
+        &gate,
+        orchestrator,
+        RequestInput::UninstallById(application_id),
+    )
+    .await
 }
 
 /// `POST /application-manager/v1/applications:uninstall`.
@@ -141,28 +120,109 @@ pub async fn uninstall_by_id(
 /// # Errors
 /// As [`seed`].
 pub async fn uninstall(
-    Extension(_ctx): Extension<SecurityContext>,
-    Extension(_gate): Extension<Arc<RequestGate>>,
-    Extension(_orchestrator): Extension<Arc<RequestOrchestrator>>,
-    _body: Bytes,
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(gate): Extension<Arc<RequestGate>>,
+    Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
+    body: Bytes,
 ) -> ApiResult<Response> {
-    todo!("PR 5: uninstall")
+    submit(ctx, &gate, orchestrator, RequestInput::UninstallBody(body)).await
+}
+
+/// The gate, then the request task; 202 with the operation id and its
+/// `Location` once accepted.
+async fn submit(
+    ctx: PlatformSecurityContext,
+    gate: &RequestGate,
+    orchestrator: Arc<RequestOrchestrator>,
+    input: RequestInput,
+) -> ApiResult<Response> {
+    let receipt = Receipt::new(OffsetDateTime::now_utc());
+    let request_id = receipt.request_id;
+    let permit = match gate.admit() {
+        Ok(permit) => permit,
+        Err(refusal) => {
+            tracing::info!(%request_id, refusal = %refusal, "application-manager: refused at the gate");
+            orchestrator
+                .refuse_at_gate(&ctx, &input, &receipt, &refusal)
+                .await;
+            return Err(to_canonical(&refusal, request_id));
+        }
+    };
+    let submitted = orchestrator
+        .submit(ctx, input, receipt, permit)
+        .await
+        .map_err(|e| to_canonical(&e, request_id))?;
+    let location = format!(
+        "/application-manager/v1/operations/{}",
+        submitted.operation_id
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        [(header::LOCATION, location)],
+        Json(AcceptedDto {
+            operation_id: submitted.operation_id,
+            status: "accepted".to_owned(),
+        }),
+    )
+        .into_response())
 }
 
 /// `GET /application-manager/v1/operations/{operation_id}`.
 ///
 /// # Errors
-/// 403, 503, and 404 for a malformed or unknown operation id.
+/// 403 when the allowed callers do not grant `read_operation`; 404 for a
+/// malformed, unknown, or purged id; 503 when storage cannot answer.
 pub async fn get_operation(
-    Extension(_ctx): Extension<SecurityContext>,
-    Extension(_svc): Extension<Arc<ReadService>>,
-    Path(_operation_id): Path<String>,
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(svc): Extension<Arc<ReadService>>,
+    Path(operation_id): Path<String>,
 ) -> ApiResult<Json<OperationDto>> {
-    todo!("PR 5: operation read")
+    let request_id = Uuid::now_v7();
+    let span = tracing::info_span!("get_operation", %request_id);
+    let operation = svc
+        .read_operation(&ctx, &operation_id)
+        .await
+        .map_err(|e| refusal(&span, &e, request_id))?;
+    Ok(Json(operation_dto(operation)))
 }
 
-/// The canonical error of a refused read. Access and plugin refusals are
-/// logged where they are decided; only not ready is logged here.
+fn timestamp(at: OffsetDateTime) -> String {
+    at.format(&Rfc3339).unwrap_or_default()
+}
+
+fn token<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(token)) => token,
+        _ => String::new(),
+    }
+}
+
+/// The record, and the report only once the operation is completed.
+fn operation_dto(operation: Operation) -> OperationDto {
+    let status = match operation.status {
+        OperationStatus::Accepted => "accepted",
+        OperationStatus::Running => "running",
+        OperationStatus::Completed => "completed",
+    };
+    let report = (operation.status == OperationStatus::Completed)
+        .then(|| serde_json::to_value(&operation.report).ok())
+        .flatten();
+    OperationDto {
+        operation_id: operation.operation_id,
+        application_id: operation.application_id,
+        action: token(&operation.action),
+        status: status.to_owned(),
+        category: operation.category.as_ref().map(token),
+        accepted_at: timestamp(operation.accepted_at),
+        started_at: operation.started_at.map(timestamp),
+        finished_at: operation.finished_at.map(timestamp),
+        run_deadline: timestamp(operation.run_deadline),
+        report,
+    }
+}
+
+/// The canonical error of a refused read. The read service logs a caller
+/// refusal; only not ready is logged here.
 fn refusal(span: &tracing::Span, err: &DomainError, request_id: Uuid) -> CanonicalError {
     if *err == DomainError::NotReady {
         span.in_scope(|| tracing::info!("application-manager: refused, not ready"));

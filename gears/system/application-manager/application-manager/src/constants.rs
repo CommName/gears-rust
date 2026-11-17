@@ -64,6 +64,11 @@ pub const HISTORY_PAGE_MAX_LIMIT: u64 = 100;
 /// names the constant without a value; 100 is the implementation's choice.
 pub const APPLICATION_PAGE_MAX_LIMIT: u64 = 100;
 
+/// Longest plugin `Rejected` or `NotPermitted` detail kept in a report and
+/// returned, in bytes; a longer one is cut (DESIGN 3.1, 3.3). DESIGN names the
+/// constant without a value; 1024 is the implementation's choice.
+pub const PLUGIN_DETAIL_MAX_BYTES: usize = 1024;
+
 /// `text` cut to at most `max_bytes` bytes, on a character boundary.
 #[must_use]
 pub fn cut(text: &str, max_bytes: usize) -> &str {

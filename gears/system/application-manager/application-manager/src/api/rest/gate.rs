@@ -12,9 +12,7 @@ use crate::domain::plugin_set::StartupState;
 
 /// Admits request tasks.
 pub struct RequestGate {
-    #[allow(dead_code, reason = "implemented in PR 5")]
     startup: Arc<StartupState>,
-    #[allow(dead_code, reason = "implemented in PR 5")]
     permits: Arc<Semaphore>,
     stopping: AtomicBool,
 }
@@ -50,6 +48,16 @@ impl RequestGate {
     /// [`DomainError::NotReady`] before startup ends or after `stop`;
     /// [`DomainError::AtCapacity`] with no free permit.
     pub fn admit(&self) -> Result<OwnedSemaphorePermit, DomainError> {
-        todo!("PR 5: the gate")
+        if self.stopping.load(Ordering::SeqCst) || self.startup.plugin_set().is_none() {
+            return Err(DomainError::NotReady);
+        }
+        Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .map_err(|_| DomainError::AtCapacity)
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gate_tests.rs"]
+mod tests;

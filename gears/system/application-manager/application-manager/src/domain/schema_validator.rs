@@ -78,7 +78,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    fn new(mut location: String, rule: &str) -> Self {
+    pub(crate) fn new(mut location: String, rule: &str) -> Self {
         let end = cut(&location, PROBLEM_LOCATION_MAX_BYTES).len();
         location.truncate(end);
         let message = match rule {
@@ -248,6 +248,25 @@ impl SchemaValidator {
             {
                 problems.push(Problem::new(format!("/application/{field}"), "maxLength"));
             }
+        }
+        problems
+    }
+
+    /// Problems of an uninstall id, located at `/application_id`: the
+    /// envelope text rule, non-empty, at most the byte limit, and no Unicode
+    /// control character (DESIGN 3.1 "Manifest").
+    #[must_use]
+    pub fn check_application_id(&self, id: &str) -> Vec<Problem> {
+        let location = || "/application_id".to_owned();
+        let mut problems = Vec::new();
+        if id.is_empty() {
+            problems.push(Problem::new(location(), "minLength"));
+        }
+        if id.len() > self.max_text_bytes {
+            problems.push(Problem::new(location(), "maxLength"));
+        }
+        if id.chars().any(char::is_control) {
+            problems.push(Problem::new(location(), "pattern"));
         }
         problems
     }

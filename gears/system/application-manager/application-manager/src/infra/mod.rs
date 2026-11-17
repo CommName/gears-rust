@@ -1,7 +1,5 @@
-//! Infrastructure: implementations of the domain ports and startup.
+//! Infrastructure: the plugin call guard and startup registration.
 
 pub mod call_guard;
-pub mod clock;
-pub mod policy;
 pub mod startup;
 pub mod storage;

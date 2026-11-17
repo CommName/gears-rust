@@ -17,15 +17,11 @@ use crate::api::rest::health::StartupHealthcheck;
 use crate::config::ApplicationManagerConfig;
 use crate::domain::orchestrator::{OrchestratorSettings, RequestOrchestrator};
 use crate::domain::plugin_set::StartupState;
-use crate::domain::ports::OperationRepository;
-use crate::domain::ports::{AccessControl, Clock, OperationRepository, PluginCalls};
+use crate::domain::ports::{OperationRepository, PluginCalls};
 use crate::domain::read_service::ReadService;
-use crate::domain::schema_validator::SchemaValidator;
 use crate::domain::router::SectionPluginRouter;
 use crate::domain::schema_validator::SchemaValidator;
 use crate::infra::call_guard::CallGuard;
-use crate::infra::clock::SystemClock;
-use crate::infra::policy::PolicyAccessControl;
 use crate::infra::startup;
 use crate::infra::storage::SeaOrmOperationRepository;
 use crate::sdk::{ApplicationManagerSectionPluginSpecV1, OUTCOME_REPORT_TYPE, SECTION_BASE_TYPE};
@@ -46,12 +42,8 @@ struct Runtime {
     hub: Arc<ClientHub>,
     read: Arc<ReadService>,
     startup: Arc<StartupState>,
-    #[expect(dead_code, reason = "the request orchestrator uses it in PR 5")]
-    operations: Arc<dyn OperationRepository>,
-    orchestrator: Arc<RequestOrchestrator>,
     gate: Arc<RequestGate>,
-    run_window_margin: Duration,
-    storage_call_timeout: Duration,
+    orchestrator: Arc<RequestOrchestrator>,
 }
 
 impl ApplicationManager {
@@ -142,53 +134,44 @@ impl Gear for ApplicationManager {
                 Self::MODULE_NAME
             )
         })?;
-        let startup = Arc::new(StartupState::default());
-        let operations = Arc::new(SeaOrmOperationRepository::new(
-        let guard = Arc::new(CallGuard::new(
-            config.plugin_call_timeout,
-            config.plugin_max_in_flight,
-        ));
         let validator = Arc::new(validator);
+        let startup = Arc::new(StartupState::default());
         let operations: Arc<dyn OperationRepository> = Arc::new(SeaOrmOperationRepository::new(
             Arc::new(db),
             config.storage_call_timeout,
         ));
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let read = ReadService::new(
-            Arc::clone(&access) as Arc<dyn AccessControl>,
-            Arc::clone(&startup),
-            SectionPluginRouter::new(Arc::clone(&guard) as Arc<dyn PluginCalls>),
-            Arc::clone(&validator),
+        let guard: Arc<dyn PluginCalls> = Arc::new(CallGuard::new(
+            config.plugin_call_timeout,
+            config.plugin_max_in_flight,
+        ));
+        let orchestrator = Arc::new(RequestOrchestrator::new(
+            Arc::clone(&allowed),
             Arc::clone(&operations),
-            Arc::clone(&clock),
-        );
-        let orchestrator = RequestOrchestrator::new(
-            access,
-            operations,
-            SectionPluginRouter::new(Arc::clone(&guard) as Arc<dyn PluginCalls>),
-            validator,
+            Arc::new(SectionPluginRouter::new(guard)),
+            Arc::clone(&validator),
             Arc::clone(&startup),
-            clock,
             OrchestratorSettings {
                 plugin_call_timeout: config.plugin_call_timeout,
+                storage_call_timeout: config.storage_call_timeout,
                 run_window_margin: config.run_window_margin,
                 max_envelope_text_length: config.max_envelope_text_length,
             },
-        );
-        let gate = RequestGate::new(Arc::clone(&startup), config.max_request_tasks);
+        ));
+        let gate = Arc::new(RequestGate::new(
+            Arc::clone(&startup),
+            config.max_request_tasks,
+        ));
         let runtime = Runtime {
             hub: ctx.client_hub(),
             read: Arc::new(ReadService::new(
                 allowed,
                 Arc::clone(&startup),
-                Arc::new(validator),
+                validator,
+                operations,
             )),
             startup,
-            operations,
-            orchestrator: Arc::new(orchestrator),
-            gate: Arc::new(gate),
-            run_window_margin: config.run_window_margin,
-            storage_call_timeout: config.storage_call_timeout,
+            gate,
+            orchestrator,
         };
         self.runtime
             .set(runtime)
@@ -259,6 +242,8 @@ impl RunnableCapability for ApplicationManager {
         Ok(())
     }
 
+    /// Refuse every later seed and uninstall. Request tasks already running
+    /// finish on their own; the drain is PR 6.
     async fn stop(&self, _deadline_token: CancellationToken) -> anyhow::Result<()> {
         if let Some(runtime) = self.runtime.get() {
             runtime.gate.stop();

@@ -6,12 +6,12 @@ use std::time::Duration;
 use application_manager_sdk::SectionPluginError;
 use serde_json::{Map, json};
 
+use async_trait::async_trait;
+
 use super::*;
 use crate::domain::ports::CallFailure;
 use crate::infra::call_guard::CallGuard;
 use crate::test_support::{Answer, FakePlugin, platform_ctx, section_plugin};
-use crate::test_support::{ApplyAnswer, FakePlugin, KeyAnswer, SchemaAnswer, ctx, section};
-use application_manager_sdk::{PLUGIN_DETAIL_MAX_BYTES, SectionOutcome};
 
 const LIMIT: Duration = Duration::from_secs(10);
 const OPERATION: Uuid = Uuid::from_u128(42);
@@ -73,6 +73,29 @@ fn tokens(routed: &[Routed]) -> Vec<(String, &'static str)> {
         .collect()
 }
 
+/// Records every question and answer; refuses `before` for `stop_before`
+/// and stops `after` the answer of `stop_after`.
+#[derive(Default)]
+struct Recorder {
+    stop_before: Option<&'static str>,
+    stop_after: Option<&'static str>,
+    log: Vec<String>,
+}
+
+#[async_trait]
+impl DispatchObserver for Recorder {
+    async fn before(&mut self, plugin: &SectionPlugin) -> bool {
+        self.log.push(format!("before {}", plugin.key));
+        self.stop_before != Some(plugin.key.as_str())
+    }
+
+    async fn after(&mut self, plugin: &SectionPlugin, answer: &CallResult) -> bool {
+        let token = tokens(&[(plugin.key.clone(), answer.clone())])[0].1;
+        self.log.push(format!("after {} {token}", plugin.key));
+        self.stop_after != Some(plugin.key.as_str())
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn apply_runs_in_priority_order_and_continues_after_every_failure() {
     let plugins = [
@@ -95,7 +118,7 @@ async fn apply_runs_in_priority_order_and_continues_after_every_failure() {
             OPERATION,
             &envelope(),
             &sections_for(&set),
-            |_| true,
+            &mut Recorder::default(),
         )
         .await;
     assert_eq!(
@@ -116,27 +139,6 @@ async fn apply_runs_in_priority_order_and_continues_after_every_failure() {
         let seen = plugin.seen.lock().unwrap().clone();
         assert_eq!(seen, [("apply", OPERATION, caller())]);
     }
-
-    async fn apply(
-        &self,
-        _plugin: &SectionPlugin,
-        _caller: &CallerIdentity,
-        _operation_id: Uuid,
-        _envelope: &Envelope,
-        _section: &serde_json::Value,
-    ) -> Result<Result<(), SectionPluginError>, CallFailure> {
-        unimplemented!("not used by the schema tests")
-    }
-
-    async fn remove(
-        &self,
-        _plugin: &SectionPlugin,
-        _caller: &CallerIdentity,
-        _operation_id: Uuid,
-        _application_id: &str,
-    ) -> Result<Result<(), SectionPluginError>, CallFailure> {
-        unimplemented!("not used by the schema tests")
-    }
 }
 
 #[tokio::test]
@@ -145,7 +147,7 @@ async fn remove_runs_in_priority_order_with_the_caller_and_operation() {
     let set = set_of(&plugins);
     let (sut, _) = router_over(1);
     let answers = sut
-        .remove_all(&set, &caller(), OPERATION, "app", |_| true)
+        .remove_all(&set, &caller(), OPERATION, "app", &mut Recorder::default())
         .await;
     assert_eq!(
         tokens(&answers),
@@ -160,11 +162,28 @@ async fn remove_runs_in_priority_order_with_the_caller_and_operation() {
 }
 
 #[tokio::test]
-async fn may_call_stops_the_dispatch_before_the_refused_plugin() {
+async fn the_observer_is_asked_before_and_told_after_each_call() {
+    let plugins = [Answer::Ok, Answer::Rejected].map(FakePlugin::answering);
+    let set = set_of(&plugins);
+    let (sut, _) = router_over(1);
+    let mut observer = Recorder::default();
+    sut.remove_all(&set, &caller(), OPERATION, "app", &mut observer)
+        .await;
+    assert_eq!(
+        observer.log,
+        ["before k0", "after k0 ok", "before k1", "after k1 rejected"]
+    );
+}
+
+#[tokio::test]
+async fn before_stops_the_dispatch_before_the_refused_plugin() {
     let plugins = [Answer::Ok, Answer::Ok, Answer::Ok].map(FakePlugin::answering);
     let set = set_of(&plugins);
     let (sut, _) = router_over(1);
-    let mut asked = Vec::new();
+    let mut observer = Recorder {
+        stop_before: Some("k1"),
+        ..Recorder::default()
+    };
     let answers = sut
         .apply_all(
             &set,
@@ -172,18 +191,37 @@ async fn may_call_stops_the_dispatch_before_the_refused_plugin() {
             OPERATION,
             &envelope(),
             &sections_for(&set),
-            |p| {
-                asked.push(p.key.clone());
-                p.key != "k1"
-            },
+            &mut observer,
         )
         .await;
     assert_eq!(tokens(&answers), [("k0".to_owned(), "ok")]);
+    assert_eq!(observer.log, ["before k0", "after k0 ok", "before k1"]);
     assert_eq!(
-        asked,
-        ["k0", "k1"],
-        "asked before each call, stopped at the first no"
+        plugins.iter().map(|p| p.calls()).collect::<Vec<_>>(),
+        [1, 0, 0]
     );
+}
+
+#[tokio::test]
+async fn after_stops_the_dispatch_after_the_answered_plugin() {
+    let plugins = [Answer::Ok, Answer::Ok, Answer::Ok].map(FakePlugin::answering);
+    let set = set_of(&plugins);
+    let (sut, _) = router_over(1);
+    let mut observer = Recorder {
+        stop_after: Some("k0"),
+        ..Recorder::default()
+    };
+    let answers = sut
+        .apply_all(
+            &set,
+            &caller(),
+            OPERATION,
+            &envelope(),
+            &sections_for(&set),
+            &mut observer,
+        )
+        .await;
+    assert_eq!(tokens(&answers), [("k0".to_owned(), "ok")]);
     assert_eq!(
         plugins.iter().map(|p| p.calls()).collect::<Vec<_>>(),
         [1, 0, 0]
@@ -200,7 +238,7 @@ async fn a_full_in_flight_cap_is_not_sent_and_the_dispatch_continues() {
     let held = guard.call(&busy.instance_id, async move { wait.await.unwrap() });
     let dispatch = async {
         let answers = sut
-            .remove_all(&set, &caller(), OPERATION, "app", |_| true)
+            .remove_all(&set, &caller(), OPERATION, "app", &mut Recorder::default())
             .await;
         release.send(()).unwrap();
         answers
@@ -219,173 +257,15 @@ async fn an_empty_set_calls_nothing() {
     let (sut, _) = router_over(1);
     let set = PluginSet::new(vec![]);
     assert!(
-        sut.apply_all(&set, &caller(), OPERATION, &envelope(), &Map::new(), |_| {
-            true
-        })
+        sut.apply_all(
+            &set,
+            &caller(),
+            OPERATION,
+            &envelope(),
+            &Map::new(),
+            &mut Recorder::default()
+        )
         .await
         .is_empty()
     );
-}
-
-// ── apply and remove ────────────────────────────────────────────────────────
-
-const OP: Uuid = Uuid::from_u128(0x00C0_FFEE);
-
-fn envelope() -> Envelope {
-    Envelope {
-        id: "acme".to_owned(),
-        version: "1.0".to_owned(),
-    }
-}
-
-fn applying(answer: ApplyAnswer) -> Arc<FakePlugin> {
-    let plugin = answering(SchemaAnswer::serve(json!({}), "1"));
-    plugin.set_apply(answer.clone());
-    plugin.set_remove(answer);
-    plugin
-}
-
-/// What `apply_one` and `remove_one` record for a plugin answering `answer`.
-async fn both(guard: &Arc<CallGuard>, plugin: &Arc<FakePlugin>) -> [SectionOutcomeEntry; 2] {
-    let set = section("k", 1, plugin);
-    let router = router(guard);
-    let applied = router
-        .apply_one(&set, &caller(), OP, &envelope(), &json!({ "x": 1 }))
-        .await;
-    let removed = router.remove_one(&set, &caller(), OP, "acme").await;
-    [applied, removed]
-}
-
-fn entry(
-    outcome: SectionOutcome,
-    detail: Option<String>,
-    location: Option<&str>,
-) -> SectionOutcomeEntry {
-    SectionOutcomeEntry {
-        key: "k".to_owned(),
-        outcome,
-        schema_version: None,
-        detail,
-        location: location.map(str::to_owned),
-    }
-}
-
-#[tokio::test]
-async fn a_succeeding_plugin_gets_its_section_unchanged() {
-    let plugin = applying(ApplyAnswer::Ok);
-    let guard = Arc::new(CallGuard::new(LIMIT, 1));
-    let [applied, removed] = both(&guard, &plugin).await;
-    assert_eq!(applied, entry(SectionOutcome::Succeeded, None, None));
-    assert_eq!(removed, entry(SectionOutcome::Succeeded, None, None));
-    assert_eq!(
-        *plugin.apply_args.lock().unwrap(),
-        [(OP, envelope(), json!({ "x": 1 }))]
-    );
-    assert_eq!(
-        *plugin.remove_args.lock().unwrap(),
-        [(OP, "acme".to_owned())]
-    );
-}
-
-#[tokio::test]
-async fn rejected_keeps_its_detail_and_location() {
-    let plugin = applying(ApplyAnswer::Rejected {
-        detail: "bad port".to_owned(),
-        location: Some("/port".to_owned()),
-    });
-    let guard = Arc::new(CallGuard::new(LIMIT, 1));
-    for got in both(&guard, &plugin).await {
-        assert_eq!(
-            got,
-            entry(
-                SectionOutcome::Rejected,
-                Some("bad port".to_owned()),
-                Some("/port")
-            )
-        );
-    }
-}
-
-#[tokio::test]
-async fn rejected_and_not_permitted_detail_is_cut_at_the_limit() {
-    let long = "d".repeat(PLUGIN_DETAIL_MAX_BYTES + 50);
-    let cut = "d".repeat(PLUGIN_DETAIL_MAX_BYTES);
-    let guard = Arc::new(CallGuard::new(LIMIT, 1));
-    let rejected = applying(ApplyAnswer::Rejected {
-        detail: long.clone(),
-        location: None,
-    });
-    for got in both(&guard, &rejected).await {
-        assert_eq!(got.detail.as_deref(), Some(cut.as_str()));
-    }
-    let refused = applying(ApplyAnswer::NotPermitted(long));
-    for got in both(&guard, &refused).await {
-        assert_eq!(got.outcome, SectionOutcome::NotPermitted);
-        assert_eq!(got.detail.as_deref(), Some(cut.as_str()));
-        assert_eq!(got.location, None);
-    }
-}
-
-#[tokio::test]
-async fn not_permitted_keeps_its_detail() {
-    let plugin = applying(ApplyAnswer::NotPermitted("needs the role".to_owned()));
-    let guard = Arc::new(CallGuard::new(LIMIT, 1));
-    for got in both(&guard, &plugin).await {
-        assert_eq!(
-            got,
-            entry(
-                SectionOutcome::NotPermitted,
-                Some("needs the role".to_owned()),
-                None
-            )
-        );
-    }
-}
-
-#[tokio::test]
-#[tracing_test::traced_test]
-async fn internal_and_panic_are_internal_failure_logged_not_returned() {
-    let guard = Arc::new(CallGuard::new(LIMIT, 1));
-    for answer in [ApplyAnswer::Internal, ApplyAnswer::Panic] {
-        let plugin = applying(answer);
-        for got in both(&guard, &plugin).await {
-            assert_eq!(got, entry(SectionOutcome::InternalFailure, None, None));
-        }
-    }
-    assert!(logs_contain("key=\"k\""));
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_call_past_the_time_limit_is_timed_out() {
-    let plugin = applying(ApplyAnswer::Hang);
-    let guard = Arc::new(CallGuard::new(LIMIT, 1));
-    let started = tokio::time::Instant::now();
-    for got in both(&guard, &plugin).await {
-        assert_eq!(got, entry(SectionOutcome::TimedOut, None, None));
-    }
-    assert_eq!(started.elapsed(), LIMIT * 2);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_full_cap_is_not_sent_without_calling_the_plugin() {
-    let plugin = applying(ApplyAnswer::Ok);
-    let set = section("k", 1, &plugin);
-    let guard = Arc::new(CallGuard::new(LIMIT, 1));
-    let (release, wait) = oneshot::channel::<()>();
-    let held = guard.call("id-k", async move { wait.await.unwrap() });
-    let refused = async {
-        let router = router(&guard);
-        let applied = router
-            .apply_one(&set, &caller(), OP, &envelope(), &json!({}))
-            .await;
-        let removed = router.remove_one(&set, &caller(), OP, "acme").await;
-        release.send(()).unwrap();
-        [applied, removed]
-    };
-    let (held, refused) = tokio::join!(held, refused);
-    assert_eq!(held, Ok(()));
-    for got in refused {
-        assert_eq!(got, entry(SectionOutcome::NotSent, None, None));
-    }
-    assert_eq!(plugin.calls(), 0, "not called");
 }

@@ -745,3 +745,27 @@ fn causes_have_stable_names() {
         ]
     );
 }
+
+#[test]
+fn an_uninstall_id_follows_the_envelope_text_rule() {
+    let v = validator();
+    assert_eq!(v.check_application_id("app"), []);
+    assert_eq!(v.check_application_id(&"a".repeat(8)), []);
+    assert_eq!(
+        rules(&v.check_application_id("")),
+        [("/application_id", "minLength")]
+    );
+    assert_eq!(
+        rules(&v.check_application_id(&"\u{e9}".repeat(5))),
+        [("/application_id", "maxLength")],
+        "10 bytes"
+    );
+    for c in ['\u{0}', '\u{7}', '\u{9f}', '\n'] {
+        assert_eq!(
+            rules(&v.check_application_id(&format!("a{c}b"))),
+            [("/application_id", "pattern")],
+            "{c:?}"
+        );
+    }
+    assert_eq!(v.check_application_id("a\u{a0}b"), [], "U+00A0 is not Cc");
+}
