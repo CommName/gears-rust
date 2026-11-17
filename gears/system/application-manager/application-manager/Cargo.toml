@@ -27,6 +27,7 @@ toolkit-gts = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-utils = { workspace = true, features = ["humantime-serde"] }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 
 # GTS (section plugin type registration check)
 gts = { workspace = true }
@@ -35,6 +36,8 @@ gts = { workspace = true }
 types-registry = { workspace = true }
 types-registry-sdk = { workspace = true }
 authz-resolver = { workspace = true }
+# PDP decision of the tenant-plane reads (ADR 0004)
+authz-resolver-sdk = { workspace = true }
 
 # Raw request bodies of the request orchestrator
 
@@ -71,8 +74,9 @@ aws-lc-rs = { workspace = true }
 # Required by toolkit::gear macro
 inventory = { workspace = true }
 
-# Logging
+# Logging and operational signals (DESIGN 4.1)
 tracing = { workspace = true }
+opentelemetry = { workspace = true, features = ["metrics"] }
 
 [features]
 # Gates the container-backed PostgreSQL / MySQL storage tests; they need a
@@ -93,3 +97,4 @@ types-registry-sdk = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 proptest = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }

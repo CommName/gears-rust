@@ -87,12 +87,16 @@ pub fn category_of(refusal: &DomainError) -> RequestCategory {
         DomainError::NotReady | DomainError::AtCapacity | DomainError::StorageUnavailable => {
             RequestCategory::TemporarilyUnavailable
         }
-        DomainError::NotPermitted { .. } => RequestCategory::NotPermitted,
+        DomainError::NotPermitted { .. } | DomainError::AccessDenied { .. } => {
+            RequestCategory::NotPermitted
+        }
+        DomainError::AccessUnavailable => RequestCategory::TemporarilyUnavailable,
         DomainError::Conflict { .. } => RequestCategory::Conflict,
         DomainError::InvalidManifest { .. } => RequestCategory::InvalidManifest,
-        DomainError::UnknownSectionKey | DomainError::OperationNotFound | DomainError::Defect => {
-            RequestCategory::InternalFailure
-        }
+        DomainError::UnknownSectionKey
+        | DomainError::OperationNotFound
+        | DomainError::InvalidQuery { .. }
+        | DomainError::Defect => RequestCategory::InternalFailure,
     }
 }
 

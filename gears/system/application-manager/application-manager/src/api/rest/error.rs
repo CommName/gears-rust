@@ -37,6 +37,20 @@ pub fn to_canonical(err: &DomainError, request_id: Uuid) -> CanonicalError {
                 "request {request_id}: action {action} is not permitted"
             ))
             .create(),
+        DomainError::AccessDenied { action } => ApplicationError::permission_denied()
+            .with_reason(format!(
+                "request {request_id}: action {action} is not permitted"
+            ))
+            .create(),
+        DomainError::AccessUnavailable => unavailable(request_id, "access control cannot answer"),
+        DomainError::InvalidQuery {
+            parameter,
+            reason,
+            message,
+        } => ApplicationError::invalid_argument()
+            .with_field_violation("request_id", request_id.to_string(), "request_id")
+            .with_field_violation(*parameter, message.clone(), *reason)
+            .create(),
         DomainError::Conflict { operation_id } => ApplicationError::aborted(format!(
             "request {request_id}: operation {operation_id} of the application is open"
         ))

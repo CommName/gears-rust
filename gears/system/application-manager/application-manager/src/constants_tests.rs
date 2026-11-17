@@ -28,3 +28,9 @@ fn cut_keeps_whole_characters() {
     assert_eq!(cut("a\u{e9}", 2), "a");
     assert_eq!(cut("a\u{e9}", 3), "a\u{e9}");
 }
+
+#[test]
+fn the_sweeper_expires_more_often_than_it_purges() {
+    assert!(!SWEEP_INTERVAL.is_zero());
+    assert!(SWEEP_INTERVAL < PURGE_INTERVAL);
+}

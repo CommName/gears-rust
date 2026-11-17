@@ -17,15 +17,16 @@ use super::register_routes;
 use crate::api::rest::gate::RequestGate;
 use crate::constants::REFUSAL_RETRY_AFTER_SECONDS;
 use crate::domain::actions::CallerAction;
+use crate::domain::actions::TenantAction;
 use crate::domain::orchestrator::{OrchestratorSettings, RequestOrchestrator};
 use crate::domain::plugin_set::{PluginSet, StartupState};
-use crate::domain::ports::{OperationRepository, PluginCalls};
+use crate::domain::ports::{AccessControl, AccessError, OperationRepository, PluginCalls};
 use crate::domain::read_service::ReadService;
 use crate::domain::router::SectionPluginRouter;
 use crate::domain::schema_validator::SchemaValidator;
 use crate::infra::call_guard::CallGuard;
 use crate::test_support::{
-    FakePlugin, Hook, HookedRepo, allowed_callers, platform_ctx, section_plugin,
+    FakeAccess, FakePlugin, Hook, HookedRepo, allowed_callers, platform_ctx, section_plugin,
 };
 
 const PATH: &str = "/application-manager/v1/section-keys";
@@ -37,6 +38,7 @@ struct Harness {
     router: Router,
     plugin: Arc<FakePlugin>,
     repo: Arc<HookedRepo>,
+    access: Arc<FakeAccess>,
 }
 
 /// The routes over their real components and a repository on `SQLite`.
@@ -46,6 +48,7 @@ fn routes(
     actions: Vec<CallerAction>,
     repo: Arc<HookedRepo>,
     max_request_tasks: u32,
+    access: Arc<dyn AccessControl>,
 ) -> Router {
     let allowed = Arc::new(allowed_callers("app-seeder", actions));
     let validator = Arc::new(SchemaValidator::new(255).unwrap());
@@ -65,13 +68,23 @@ fn routes(
         },
     ));
     let gate = Arc::new(RequestGate::new(Arc::clone(&state), max_request_tasks));
-    let read = Arc::new(ReadService::new(allowed, state, validator, repo));
+    let read = Arc::new(ReadService::new(allowed, state, validator, repo, access));
     register_routes(Router::new(), registry, read, orchestrator, gate)
 }
 
 /// Routes over a startup state, ready or not, where `app-seeder` holds
 /// `actions`.
 async fn harness_with(ready: bool, actions: Vec<CallerAction>, max_request_tasks: u32) -> Harness {
+    harness_over(ready, actions, max_request_tasks, FakeAccess::permit()).await
+}
+
+/// [`harness_with`] whose PDP answers as `access` does.
+async fn harness_over(
+    ready: bool,
+    actions: Vec<CallerAction>,
+    max_request_tasks: u32,
+    access: Arc<FakeAccess>,
+) -> Harness {
     let plugin = FakePlugin::new();
     let state = Arc::new(StartupState::default());
     if ready {
@@ -89,11 +102,13 @@ async fn harness_with(ready: bool, actions: Vec<CallerAction>, max_request_tasks
         actions,
         Arc::clone(&repo),
         max_request_tasks,
+        Arc::clone(&access) as Arc<dyn AccessControl>,
     );
     Harness {
         router,
         plugin,
         repo,
+        access,
     }
 }
 
@@ -272,6 +287,7 @@ async fn the_bounded_routes_are_throttled_and_the_other_reads_are_not() {
         vec![],
         HookedRepo::new().await,
         1,
+        FakeAccess::permit(),
     ));
     let spec =
         serde_json::to_value(registry.build_openapi(&OpenApiInfo::default()).unwrap()).unwrap();
@@ -293,6 +309,8 @@ async fn the_bounded_routes_are_throttled_and_the_other_reads_are_not() {
             .is_some()
     );
     assert!(has_429("/application-manager/v1/operations/{operation_id}"));
+    assert!(has_429(HISTORY_PATH));
+    assert!(has_429(SEED_PATH));
     assert!(!has_429(
         "/application-manager/v1/section-keys/{section_key}/schema"
     ));
@@ -652,4 +670,208 @@ async fn a_malformed_or_unknown_operation_is_404_and_a_caller_not_allowed_is_403
         StatusCode::FORBIDDEN,
         "the caller check comes first"
     );
+}
+
+// ---- the tenant-plane reads ----
+
+const HISTORY_PATH: &str = "/application-manager/v1/operation-history";
+
+async fn get_tenant(
+    h: &Harness,
+    path_and_query: &str,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut req = Request::builder()
+        .uri(path_and_query)
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(crate::test_support::tenant_ctx());
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    (status, headers, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn tenant_harness(answer: Result<(), AccessError>) -> Harness {
+    harness_over(true, vec![], 16, FakeAccess::new(answer)).await
+}
+
+#[tokio::test]
+async fn a_seed_shows_in_the_history_and_the_application_list() {
+    let h = harness(true, writer()).await;
+    let (status, _, body) = send(
+        &h,
+        "POST",
+        SEED_PATH,
+        &seed_body(),
+        platform_ctx("app-seeder"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let operation_id = body["operation_id"].as_str().unwrap().to_owned();
+    let operation_id = uuid::Uuid::parse_str(&operation_id).unwrap();
+    h.repo.completed(operation_id).await;
+
+    let filter = format!("$filter=operation_id%20eq%20{operation_id}");
+    let (status, _, body) = get_tenant(&h, &format!("{HISTORY_PATH}?{filter}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let kinds: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["accepted", "finished"], "{body}");
+    assert_eq!(body["items"][0]["action"], "seed");
+    assert_eq!(body["items"][0]["correlation_id"], operation_id.to_string());
+    assert_eq!(body["page_info"]["limit"], 100);
+    assert!(body["page_info"]["next_cursor"].is_null());
+
+    let (status, _, body) = get_tenant(&h, SEED_PATH).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"][0]["application_id"], "acme.app", "{body}");
+    assert_eq!(body["items"][0]["category"], "succeeded");
+    assert_eq!(body["items"][0]["operation_id"], operation_id.to_string());
+    assert_eq!(
+        *h.access.actions.lock().unwrap(),
+        vec![TenantAction::ReadHistory, TenantAction::ReadApplications]
+    );
+}
+
+#[tokio::test]
+async fn an_empty_store_is_an_empty_page_with_the_limit_capped() {
+    let h = tenant_harness(Ok(())).await;
+    for path in [HISTORY_PATH, SEED_PATH] {
+        let (status, _, body) = get_tenant(&h, &format!("{path}?limit=1000")).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(body["items"], json!([]), "{path}");
+        assert_eq!(body["page_info"]["limit"], 100, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn query_options_the_reads_do_not_serve_are_400() {
+    let h = tenant_harness(Ok(())).await;
+    let cases = [
+        (
+            format!("{HISTORY_PATH}?$orderby=event_id%20desc"),
+            "$orderby",
+            "INVALID_ORDERBY_FIELD",
+        ),
+        (
+            format!("{HISTORY_PATH}?$select=kind"),
+            "$select",
+            "INVALID_SELECT",
+        ),
+        (
+            format!("{HISTORY_PATH}?$filter=kind%20eq%20'refused'"),
+            "$filter",
+            "INVALID_FILTER",
+        ),
+        (
+            format!("{SEED_PATH}?$filter=application_id%20ne%20'a'"),
+            "$filter",
+            "INVALID_FILTER",
+        ),
+    ];
+    for (path, field, reason) in cases {
+        let (status, _, body) = get_tenant(&h, &path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_problem(&body, "invalid_argument");
+        let violations = body["context"]["field_violations"].as_array().unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v["field"] == field && v["reason"] == reason),
+            "{path}: {body}"
+        );
+    }
+    assert_eq!(h.repo.calls("history_page"), 0);
+    assert_eq!(h.repo.calls("applications_page"), 0);
+}
+
+#[tokio::test]
+async fn a_pdp_refusal_is_403_and_a_pdp_failure_is_503() {
+    for (answer, status, kind) in [
+        (
+            Err(AccessError::NotPermitted),
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+        ),
+        (
+            Err(AccessError::Unavailable),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+        ),
+    ] {
+        let h = tenant_harness(answer).await;
+        for path in [HISTORY_PATH, SEED_PATH] {
+            let (got, headers, body) = get_tenant(&h, path).await;
+            assert_eq!(got, status, "{path}: {body}");
+            assert_problem(&body, kind);
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(headers.contains_key(header::RETRY_AFTER), "{path}");
+            }
+        }
+        assert_eq!(h.repo.calls("history_page"), 0);
+        assert_eq!(h.repo.calls("applications_page"), 0);
+        assert_eq!(h.plugin.calls(), 0);
+    }
+}
+
+#[tokio::test]
+async fn storage_that_cannot_answer_a_tenant_read_is_503() {
+    let h = tenant_harness(Ok(())).await;
+    h.repo.hook("history_page", Hook::Fail);
+    h.repo.hook("applications_page", Hook::Fail);
+    for path in [HISTORY_PATH, SEED_PATH] {
+        let (status, headers, body) = get_tenant(&h, path).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+        assert!(headers.contains_key(header::RETRY_AFTER), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn the_platform_routes_make_no_pdp_call() {
+    let h = harness(true, writer()).await;
+    let (status, _, _) = send(
+        &h,
+        "POST",
+        SEED_PATH,
+        &seed_body(),
+        platform_ctx("app-seeder"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _, _) = get(&h, platform_ctx("someone-else")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(h.access.calls(), 0);
+}
+
+#[tokio::test]
+async fn the_tenant_reads_document_their_filter_and_pages() {
+    let registry = OpenApiRegistryImpl::new();
+    drop(routes(
+        &registry,
+        Arc::new(StartupState::default()),
+        vec![],
+        HookedRepo::new().await,
+        1,
+        FakeAccess::permit(),
+    ));
+    let spec =
+        serde_json::to_value(registry.build_openapi(&OpenApiInfo::default()).unwrap()).unwrap();
+    for (path, field) in [
+        (HISTORY_PATH, "operation_id"),
+        (SEED_PATH, "application_id"),
+    ] {
+        let get = &spec["paths"][path]["get"];
+        assert!(get.is_object(), "{path}");
+        let text = get.to_string();
+        assert!(text.contains(field), "{path}: {text}");
+        assert!(get["responses"].get("200").is_some(), "{path}");
+        assert!(get["responses"].get("400").is_some(), "{path}");
+        assert!(get["responses"].get("403").is_some(), "{path}");
+    }
 }

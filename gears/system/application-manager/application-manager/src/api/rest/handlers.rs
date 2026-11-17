@@ -9,17 +9,20 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::OwnedSemaphorePermit;
 use toolkit::api::canonical_prelude::*;
-use toolkit_security::PlatformSecurityContext;
+use toolkit_odata::Page;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use super::dto::{
-    AcceptedDto, ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto, SectionTypeDto,
-    UninstallRequestDto,
+    AcceptedDto, ApplicationDto, HistoryEventDto, ManifestSchemaDto, OperationDto, SectionKeysDto,
+    SectionSchemaDto, SectionTypeDto, UninstallRequestDto,
 };
 use super::error::to_canonical;
 use super::gate::RequestGate;
 use crate::domain::error::DomainError;
-use crate::domain::operation::{Operation, OperationStatus};
+use crate::domain::history::{HistoryEvent, HistoryKind};
+use crate::domain::operation::{ApplicationRecord, Operation, OperationStatus};
 use crate::domain::orchestrator::{Receipt, RequestOrchestrator, Submitted};
 use crate::domain::read_service::ReadService;
 
@@ -183,6 +186,71 @@ pub async fn get_operation(
         .await
         .map_err(|e| refusal(&span, &e, request_id))?;
     Ok(Json(operation_dto(operation)))
+}
+
+/// `GET /application-manager/v1/operation-history`.
+///
+/// # Errors
+/// 403 or 503 from the PDP before any storage read; 400 for a query option
+/// the read does not serve; 503 when storage cannot answer.
+pub async fn read_history(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ReadService>>,
+    OData(query): OData,
+) -> ApiResult<Json<Page<HistoryEventDto>>> {
+    let request_id = Uuid::now_v7();
+    let span = tracing::info_span!("read_history", %request_id);
+    let page = svc
+        .read_history(&ctx, &query)
+        .instrument(span.clone())
+        .await
+        .map_err(|e| refusal(&span, &e, request_id))?;
+    Ok(Json(page.map_items(history_event_dto)))
+}
+
+/// `GET /application-manager/v1/applications`.
+///
+/// # Errors
+/// As [`read_history`].
+pub async fn list_applications(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ReadService>>,
+    OData(query): OData,
+) -> ApiResult<Json<Page<ApplicationDto>>> {
+    let request_id = Uuid::now_v7();
+    let span = tracing::info_span!("list_applications", %request_id);
+    let page = svc
+        .list_applications(&ctx, &query)
+        .instrument(span.clone())
+        .await
+        .map_err(|e| refusal(&span, &e, request_id))?;
+    Ok(Json(page.map_items(application_dto)))
+}
+
+fn history_event_dto(event: HistoryEvent) -> HistoryEventDto {
+    let kind = match event.kind {
+        HistoryKind::Accepted => "accepted",
+        HistoryKind::Finished => "finished",
+        HistoryKind::Refused => "refused",
+    };
+    HistoryEventDto {
+        event_id: event.event_id,
+        kind: kind.to_owned(),
+        correlation_id: event.correlation_id,
+        action: token(&event.action),
+        written_at: timestamp(event.written_at),
+        content: event.content,
+    }
+}
+
+fn application_dto(record: ApplicationRecord) -> ApplicationDto {
+    ApplicationDto {
+        application_id: record.application_id,
+        version: record.version,
+        operation_id: record.operation_id,
+        category: token(&record.category),
+        finished_at: timestamp(record.finished_at),
+    }
 }
 
 fn timestamp(at: OffsetDateTime) -> String {

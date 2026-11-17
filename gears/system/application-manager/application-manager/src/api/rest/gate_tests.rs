@@ -31,3 +31,35 @@ fn a_stopping_gate_is_not_ready() {
     gate.stop();
     assert_eq!(gate.admit().err(), Some(DomainError::NotReady));
 }
+
+#[tokio::test]
+async fn drain_returns_at_once_with_nothing_in_flight() {
+    let gate = RequestGate::new(ready(), 2);
+    gate.stop();
+    assert!(gate.drain(&CancellationToken::new()).await);
+}
+
+#[tokio::test]
+async fn drain_waits_for_the_last_request_task() {
+    let gate = Arc::new(RequestGate::new(ready(), 2));
+    let permit = gate.admit().unwrap();
+    gate.stop();
+    let draining = tokio::spawn({
+        let gate = Arc::clone(&gate);
+        async move { gate.drain(&CancellationToken::new()).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!draining.is_finished(), "a request task is still running");
+    drop(permit);
+    assert!(draining.await.unwrap());
+}
+
+#[tokio::test]
+async fn drain_gives_up_at_the_deadline() {
+    let gate = RequestGate::new(ready(), 2);
+    let _permit = gate.admit().unwrap();
+    gate.stop();
+    let deadline = CancellationToken::new();
+    deadline.cancel();
+    assert!(!gate.drain(&deadline).await);
+}

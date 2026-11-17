@@ -56,6 +56,16 @@ pub const PROBLEM_LOCATION_MAX_BYTES: usize = 1024;
 /// bind-parameter limit.
 pub const MAINTENANCE_BATCH_SIZE: u64 = 100;
 
+/// How often the operation sweeper runs the expiry completion over expired
+/// open operations (DESIGN 3.6, 4.2). DESIGN names the constant without a
+/// value; 30 seconds is the implementation's choice.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often the operation sweeper purges completed operations past
+/// `operation_retention` (DESIGN 3.6, 4.2). DESIGN names the constant without
+/// a value; one hour is the implementation's choice.
+pub const PURGE_INTERVAL: Duration = Duration::from_hours(1);
+
 /// Largest and default page of the history read (DESIGN 3.3, 4.2). DESIGN
 /// names the constant without a value; 100 is the implementation's choice.
 pub const HISTORY_PAGE_MAX_LIMIT: u64 = 100;

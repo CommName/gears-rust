@@ -18,6 +18,7 @@ use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio::time::Instant;
 use toolkit_macros::domain_model;
 use toolkit_security::PlatformSecurityContext;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::constants::{LOG_TEXT_MAX_BYTES, PLUGIN_DETAIL_MAX_BYTES, cut};
@@ -35,6 +36,7 @@ use crate::domain::plugin_set::{PluginSet, SectionPlugin, StartupState};
 use crate::domain::ports::{CallFailure, CallResult, OperationRepository, StorageError};
 use crate::domain::router::{DispatchObserver, SectionPluginRouter};
 use crate::domain::schema_validator::{Problem, SchemaValidator, validate_sections};
+use crate::domain::signals::{NoSignals, Signals, action_label, category_label, outcome_label};
 
 /// The ids and time assigned when a request is received (the REST layer
 /// builds one before the gate).
@@ -124,6 +126,7 @@ pub struct RequestOrchestrator {
     validator: Arc<SchemaValidator>,
     startup: Arc<StartupState>,
     settings: OrchestratorSettings,
+    signals: Arc<dyn Signals>,
 }
 
 impl fmt::Debug for RequestOrchestrator {
@@ -152,7 +155,15 @@ impl RequestOrchestrator {
             validator,
             startup,
             settings,
+            signals: Arc::new(NoSignals),
         }
+    }
+
+    /// The same orchestrator, raising its signals on `signals`.
+    #[must_use]
+    pub fn with_signals(mut self, signals: Arc<dyn Signals>) -> Self {
+        self.signals = signals;
+        self
     }
 
     /// Seed `manifest`. `admission` is the gate's answer: a refusal records
@@ -217,8 +228,10 @@ impl RequestOrchestrator {
             answer,
             Arc::clone(&progress),
         ));
+        self.signals.request_tasks(1);
         tokio::spawn(async move {
             let _permit = permit;
+            let _in_flight = InFlight(Arc::clone(&self.signals));
             let Err(failure) = task.await else {
                 return;
             };
@@ -234,12 +247,7 @@ impl RequestOrchestrator {
                         .await;
                 }
                 Progress::Accepted => {
-                    if let Err(error) = self.repo.complete_by_supervisor(receipt.request_id).await {
-                        tracing::warn!(
-                            %error,
-                            "application-manager: supervisor completion not written"
-                        );
-                    }
+                    self.supervise(receipt.request_id, parsed.action).await;
                 }
                 Progress::Refused => {}
             }
@@ -258,7 +266,16 @@ impl RequestOrchestrator {
         progress: Arc<Mutex<Progress>>,
     ) {
         let settle = |stage| *progress.lock().unwrap_or_else(PoisonError::into_inner) = stage;
-        match self.synchronous(&ctx, &parsed, &receipt).await {
+        let request_span = tracing::info_span!(
+            "application_manager.request",
+            request_id = %receipt.request_id,
+            action = parsed.caller_action.as_str()
+        );
+        match self
+            .synchronous(&ctx, &parsed, &receipt)
+            .instrument(request_span.clone())
+            .await
+        {
             Err(refusal) => {
                 settle(Progress::Refused);
                 answer.send(Err(refusal)).ok();
@@ -270,7 +287,15 @@ impl RequestOrchestrator {
                         operation_id: receipt.request_id,
                     }))
                     .ok();
-                self.operate(&ctx, &parsed, receipt.request_id, &set).await;
+                let operation_span = tracing::info_span!(
+                    "application_manager.operation",
+                    operation_id = %receipt.request_id,
+                    action = parsed.caller_action.as_str()
+                );
+                operation_span.follows_from(&request_span);
+                self.operate(&ctx, &parsed, receipt.request_id, &set)
+                    .instrument(operation_span)
+                    .await;
             }
         }
     }
@@ -358,19 +383,30 @@ impl RequestOrchestrator {
                 receipt.received_at,
             ),
         };
+        let action = action_label(parsed.action);
         match self.repo.accept(new, accepted).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.signals.request(action, "accepted");
+                self.signals.history_event(true);
+                Ok(())
+            }
             Err(StorageError::IndexViolated) => {
                 let event = Self::refused_event_builder(ctx, parsed, receipt);
-                match self
+                let lost = self
                     .repo
                     .refuse_after_lost_race(&parsed.application_id, event)
-                    .await
-                {
-                    Ok(winner) => Err(DomainError::Conflict {
+                    .await;
+                if let Ok(winner) = lost {
+                    self.signals.request(action, "conflict");
+                    self.signals.history_event(true);
+                    Err(DomainError::Conflict {
                         operation_id: winner,
-                    }),
-                    Err(_) => Err(DomainError::StorageUnavailable),
+                    })
+                } else {
+                    self.signals.request(action, "temporarily_unavailable");
+                    self.signals.history_event(false);
+                    self.signals.dependency_unavailable("storage");
+                    Err(DomainError::StorageUnavailable)
                 }
             }
             Err(_) => {
@@ -390,6 +426,7 @@ impl RequestOrchestrator {
         operation_id: Uuid,
         set: &PluginSet,
     ) {
+        let started = Instant::now();
         let mut report = initial_report(operation_id, parsed);
         if parsed.action == OperationAction::Seed && !self.validate(parsed, set, &mut report).await
         {
@@ -406,6 +443,9 @@ impl RequestOrchestrator {
             Err(error) => {
                 // An expired or unreadable record is left to the expiry
                 // completion.
+                if error == StorageError::Unavailable {
+                    self.signals.dependency_unavailable("storage");
+                }
                 tracing::warn!(%error, "application-manager: mark running not written");
                 return;
             }
@@ -423,8 +463,16 @@ impl RequestOrchestrator {
         self.dispatch(ctx, parsed, operation_id, set, left, &mut report)
             .await;
         complete_open_sections(&mut report, false);
+        for entry in &report.sections {
+            if let Some(outcome) = entry.outcome {
+                self.signals
+                    .section_call(&entry.key, outcome_label(outcome));
+            }
+        }
         let category = completed_category(&report.sections);
         self.finish(operation_id, report, category).await;
+        self.signals
+            .operation_duration(action_label(parsed.action), started.elapsed());
     }
 
     /// Validate a seed's sections against the compiled schemas. With
@@ -435,7 +483,7 @@ impl RequestOrchestrator {
         let compiled: Arc<[_]> = set.sections().into();
         let Ok(problems) = validate_sections(compiled, sections).await else {
             tracing::error!("application-manager: section validation aborted");
-            self.supervise(report.operation_id).await;
+            self.supervise(report.operation_id, report.action).await;
             return false;
         };
         if problems.is_empty() {
@@ -506,15 +554,39 @@ impl RequestOrchestrator {
     }
 
     async fn finish(&self, operation_id: Uuid, report: OutcomeReport, category: RequestCategory) {
-        if let Err(error) = self.repo.finish(operation_id, &report, category).await {
-            // A final record, or one the expiry completion will finish.
-            tracing::warn!(%error, "application-manager: final transaction not written");
+        match self.repo.finish(operation_id, &report, category).await {
+            Ok(()) => self.completed(report.action, category, "run"),
+            Err(error) => {
+                // A final record, or one the expiry completion will finish.
+                self.not_written(error);
+                tracing::warn!(%error, "application-manager: final transaction not written");
+            }
         }
     }
 
-    async fn supervise(&self, operation_id: Uuid) {
-        if let Err(error) = self.repo.complete_by_supervisor(operation_id).await {
-            tracing::warn!(%error, "application-manager: supervisor completion not written");
+    async fn supervise(&self, operation_id: Uuid, action: OperationAction) {
+        match self.repo.complete_by_supervisor(operation_id).await {
+            Ok(()) => self.completed(action, RequestCategory::InternalFailure, "supervisor"),
+            Err(error) => {
+                self.not_written(error);
+                tracing::warn!(%error, "application-manager: supervisor completion not written");
+            }
+        }
+    }
+
+    /// A completion and its finished event were written.
+    fn completed(&self, action: OperationAction, category: RequestCategory, reason: &'static str) {
+        self.signals.history_event(true);
+        self.signals
+            .operation_completed(action_label(action), category_label(category), reason);
+    }
+
+    /// A completion was not written: storage could not answer, or the record
+    /// is already final (its finished event is someone else's).
+    fn not_written(&self, error: StorageError) {
+        if error == StorageError::Unavailable {
+            self.signals.history_event(false);
+            self.signals.dependency_unavailable("storage");
         }
     }
 
@@ -592,13 +664,25 @@ impl RequestOrchestrator {
         receipt: &Receipt,
         refusal: &DomainError,
     ) {
+        let category = category_of(refusal);
+        self.signals
+            .request(action_label(parsed.action), category_label(category));
+        match refusal {
+            DomainError::NotPermitted { action } => self.signals.caller_refused(action.as_str()),
+            DomainError::StorageUnavailable => self.signals.dependency_unavailable("storage"),
+            _ => {}
+        }
         let event = refused_event(ctx, parsed, receipt, refusal);
-        if let Err(error) = self.repo.record_refused(event).await {
-            tracing::warn!(
-                %error,
-                category = ?category_of(refusal),
-                "application-manager: refused event not recorded"
-            );
+        match self.repo.record_refused(event).await {
+            Ok(()) => self.signals.history_event(true),
+            Err(error) => {
+                self.signals.history_event(false);
+                tracing::warn!(
+                    %error,
+                    category = ?category,
+                    "application-manager: refused event not recorded"
+                );
+            }
         }
     }
 
@@ -739,6 +823,15 @@ fn outcome_of(key: &str, answer: &CallResult) -> (SectionOutcome, Option<String>
         }
         Err(CallFailure::TimedOut) => (SectionOutcome::TimedOut, None, None),
         Err(CallFailure::NotSent) => (SectionOutcome::NotSent, None, None),
+    }
+}
+
+/// Counts one request task down when its supervisor ends, however it ends.
+struct InFlight(Arc<dyn Signals>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.request_tasks(-1);
     }
 }
 

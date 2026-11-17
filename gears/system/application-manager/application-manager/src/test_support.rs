@@ -541,3 +541,188 @@ impl OperationRepository for HookedRepo {
             .await
     }
 }
+
+// ── Access control and signals for the read-service, policy and REST tests ───
+
+use authz_resolver_sdk::AuthZResolverApi;
+use authz_resolver_sdk::constraints::{Constraint, EqPredicate, Predicate};
+use authz_resolver_sdk::models::{
+    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+};
+use toolkit_canonical_errors::CanonicalError;
+use toolkit_security::{SecurityContext, pep_properties};
+
+use crate::domain::actions::TenantAction;
+use crate::domain::ports::{AccessControl, AccessError};
+use crate::domain::signals::Signals;
+
+/// An authenticated tenant-plane caller.
+pub fn tenant_ctx() -> SecurityContext {
+    SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0xA))
+        .subject_tenant_id(Uuid::from_u128(0xB))
+        .build()
+        .expect("test ctx")
+}
+
+/// How a [`FakeAuthZ`] answers.
+#[derive(Clone, Copy, Debug)]
+pub enum Pdp {
+    Permit,
+    Deny,
+    ConstrainedPermit,
+    Fail,
+    Hang,
+}
+
+/// A PDP double that records every request.
+pub struct FakeAuthZ {
+    answer: Pdp,
+    pub requests: Mutex<Vec<EvaluationRequest>>,
+}
+
+impl FakeAuthZ {
+    pub fn new(answer: Pdp) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for FakeAuthZ {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.requests.lock().expect("lock").push(request);
+        let permit = |constraints| EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints,
+                ..Default::default()
+            },
+        };
+        match self.answer {
+            Pdp::Permit => Ok(permit(vec![])),
+            Pdp::Deny => Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext::default(),
+            }),
+            Pdp::ConstrainedPermit => Ok(permit(vec![Constraint {
+                predicates: vec![Predicate::Eq(EqPredicate::new(
+                    pep_properties::OWNER_TENANT_ID,
+                    Uuid::from_u128(0xB),
+                ))],
+            }])),
+            Pdp::Fail => Err(CanonicalError::service_unavailable()
+                .with_detail("pdp down")
+                .create()),
+            Pdp::Hang => std::future::pending().await,
+        }
+    }
+}
+
+/// An [`AccessControl`] double with a fixed answer that records each action.
+pub struct FakeAccess {
+    answer: Result<(), AccessError>,
+    pub actions: Mutex<Vec<TenantAction>>,
+}
+
+impl FakeAccess {
+    pub fn new(answer: Result<(), AccessError>) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            actions: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn permit() -> Arc<Self> {
+        Self::new(Ok(()))
+    }
+
+    pub fn calls(&self) -> usize {
+        self.actions.lock().expect("lock").len()
+    }
+}
+
+#[async_trait]
+impl AccessControl for FakeAccess {
+    async fn authorize(
+        &self,
+        _ctx: &SecurityContext,
+        action: TenantAction,
+    ) -> Result<(), AccessError> {
+        self.actions.lock().expect("lock").push(action);
+        self.answer
+    }
+}
+
+/// Signals recorded as `name:label,label` lines, in order.
+#[derive(Default)]
+pub struct RecordedSignals {
+    pub lines: Mutex<Vec<String>>,
+}
+
+impl RecordedSignals {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn push(&self, line: String) {
+        self.lines.lock().expect("lock").push(line);
+    }
+
+    /// Every recorded line.
+    pub fn lines(&self) -> Vec<String> {
+        self.lines.lock().expect("lock").clone()
+    }
+
+    /// How many recorded lines equal `line`.
+    pub fn count(&self, line: &str) -> usize {
+        self.lines().iter().filter(|l| *l == line).count()
+    }
+}
+
+impl Signals for RecordedSignals {
+    fn request(&self, action: &'static str, outcome: &'static str) {
+        self.push(format!("request:{action},{outcome}"));
+    }
+    fn operation_completed(
+        &self,
+        action: &'static str,
+        category: &'static str,
+        reason: &'static str,
+    ) {
+        self.push(format!("completed:{action},{category},{reason}"));
+    }
+    fn operation_duration(&self, action: &'static str, _took: Duration) {
+        self.push(format!("duration:{action}"));
+    }
+    fn section_call(&self, key: &str, outcome: &'static str) {
+        self.push(format!("section:{key},{outcome}"));
+    }
+    fn caller_refused(&self, action: &'static str) {
+        self.push(format!("refused:{action}"));
+    }
+    fn request_tasks(&self, delta: i64) {
+        self.push(format!("tasks:{delta}"));
+    }
+    fn history_event(&self, recorded: bool) {
+        self.push(format!("history:{recorded}"));
+    }
+    fn dependency_unavailable(&self, dependency: &'static str) {
+        self.push(format!("unavailable:{dependency}"));
+    }
+    fn sweep(&self, step: &'static str, succeeded: bool) {
+        self.push(format!("sweep:{step},{succeeded}"));
+    }
+    fn operations_expired(&self, count: u64) {
+        self.push(format!("expired:{count}"));
+    }
+    fn startup_failed(&self, reason: &'static str) {
+        self.push(format!("startup_failed:{reason}"));
+    }
+}

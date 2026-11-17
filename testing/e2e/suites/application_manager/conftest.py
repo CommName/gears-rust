@@ -5,8 +5,10 @@ with the no-op section plugin as the whole section plugin set. The gear's
 platform-plane routes admit only allowed callers, a Kubernetes service account
 or a SPIFFE identity. Local e2e has only the gateway's shared-secret platform
 auth (``platform_headers`` from the root conftest), which yields a shared
-identity that never matches, so the suite checks 401 and 403 only; permitted
-paths are covered by the gear's in-process route tests.
+identity that never matches, so the suite checks 401 and 403 only for them;
+permitted paths are covered by the gear's in-process route tests. The two
+tenant-plane reads take the tenant token (``auth_headers``) and are decided by
+the e2e PDP, which permits them.
 """
 from __future__ import annotations
 
