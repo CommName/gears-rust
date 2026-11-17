@@ -3,55 +3,61 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::domain::plugin_set::{PluginSet, SectionPlugin};
-use crate::test_support::{FakeAccess, FakePlugin, KeyAnswer, ctx};
+use crate::domain::plugin_set::PluginSet;
+use crate::test_support::{FakePlugin, allowed_callers, platform_ctx, section_plugin};
 
 fn ready_state(plugin: &Arc<FakePlugin>) -> Arc<StartupState> {
     let state = Arc::new(StartupState::default());
-    let make = |key: &str, priority| SectionPlugin {
-        key: key.to_owned(),
-        priority,
-        instance_id: format!("id-{key}"),
-        client: plugin.clone(),
-    };
     state
-        .publish(PluginSet::new(vec![make("second", 2), make("first", 1)]))
+        .publish(PluginSet::new(vec![
+            section_plugin("second", 2, plugin),
+            section_plugin("first", 1, plugin),
+        ]))
         .unwrap();
     state
 }
 
-#[tokio::test]
-async fn not_ready_refuses_without_an_access_check() {
-    let access = FakeAccess::new(Ok(()));
-    let svc = ReadService::new(access.clone(), Arc::new(StartupState::default()));
+#[test]
+fn not_ready_refuses_before_the_caller_check() {
+    let svc = ReadService::new(
+        Arc::new(AllowedCallers::default()),
+        Arc::new(StartupState::default()),
+    );
     assert_eq!(
-        svc.list_section_keys(&ctx()).await,
+        svc.list_section_keys(&platform_ctx("app-seeder")),
         Err(DomainError::NotReady)
     );
-    assert_eq!(access.calls(), 0);
 }
 
-#[tokio::test]
-async fn keys_follow_access_control_and_never_call_a_plugin() {
+#[test]
+fn keys_follow_the_allowed_callers_and_never_call_a_plugin() {
+    let not_permitted = Err(DomainError::NotPermitted {
+        action: CallerAction::ReadSchema,
+    });
     let cases = [
-        (Ok(()), Ok(vec!["first".to_owned(), "second".to_owned()])),
         (
-            Err(AccessError::Unavailable),
-            Err(DomainError::AccessUnavailable),
+            "app-seeder",
+            vec![CallerAction::ReadSchema],
+            Ok(vec!["first".to_owned(), "second".to_owned()]),
         ),
         (
-            Err(AccessError::NotPermitted),
-            Err(DomainError::NotPermitted {
-                action: Action::ReadSchema,
-            }),
+            "someone-else",
+            vec![CallerAction::ReadSchema],
+            not_permitted.clone(),
         ),
+        ("app-seeder", vec![CallerAction::Seed], not_permitted),
     ];
-    for (answer, expected) in cases {
-        let plugin = FakePlugin::new(KeyAnswer::Key("unused"));
-        let access = FakeAccess::new(answer);
-        let svc = ReadService::new(access.clone(), ready_state(&plugin));
-        assert_eq!(svc.list_section_keys(&ctx()).await, expected, "{answer:?}");
-        assert_eq!(access.calls(), 1);
+    for (caller, actions, expected) in cases {
+        let plugin = FakePlugin::new();
+        let svc = ReadService::new(
+            Arc::new(allowed_callers("app-seeder", actions)),
+            ready_state(&plugin),
+        );
+        assert_eq!(
+            svc.list_section_keys(&platform_ctx(caller)),
+            expected,
+            "{caller}"
+        );
         assert_eq!(
             plugin.calls(),
             0,

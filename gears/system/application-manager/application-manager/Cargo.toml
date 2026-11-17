@@ -31,15 +31,13 @@ toolkit-utils = { workspace = true, features = ["humantime-serde"] }
 # GTS (section plugin type registration check)
 gts = { workspace = true }
 
-# Gears named in the `deps` of the gear declaration, and their client APIs
+# Gears named in the `deps` of the gear declaration, and the registry client
 types-registry = { workspace = true }
 types-registry-sdk = { workspace = true }
 authz-resolver = { workspace = true }
-authz-resolver-sdk = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
-futures = { workspace = true }
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tokio-util = { workspace = true }
 

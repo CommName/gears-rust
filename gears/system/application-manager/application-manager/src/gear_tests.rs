@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -11,11 +12,9 @@ use uuid::Uuid;
 
 use super::*;
 use crate::domain::error::DomainError;
-use crate::infra::call_guard::GuardError;
 use crate::test_support::{
-    FakeAuthZ, KeyAnswer, Pdp, PluginSpec, ctx, hub_with, hub_with_registry, valid_config_json,
+    PluginSpec, hub_with, hub_with_registry, platform_ctx, valid_config_json,
 };
-use authz_resolver_sdk::AuthZResolverApi;
 use types_registry_sdk::testing::{MockTypesRegistryClient, internal};
 
 struct StaticConfigProvider {
@@ -129,9 +128,9 @@ async fn start_before_init_fails() {
 async fn start_publishes_the_plugin_set_and_stop_succeeds() {
     let gear = ApplicationManager::default();
     let plugins = [PluginSpec::new(
-        "cf.test.a.section.v1",
+        "cf.test.a.plugin.v1",
         1,
-        KeyAnswer::Key("a"),
+        "cf.test.a.section.v1",
     )];
     let root = json!({ "application-manager": { "config": valid_config() } });
     gear.init(&ctx_with_hub(root, hub_with(&plugins)))
@@ -140,7 +139,12 @@ async fn start_publishes_the_plugin_set_and_stop_succeeds() {
     let state = &gear.runtime.get().unwrap().startup;
     assert!(state.plugin_set().is_none(), "not ready before start");
     gear.start(CancellationToken::new()).await.unwrap();
-    assert_eq!(state.plugin_set().unwrap().keys(), ["a"]);
+    assert_eq!(state.plugin_set().unwrap().keys(), ["cf.test.a.section"]);
+    assert_eq!(
+        plugins[0].client.as_ref().unwrap().calls(),
+        0,
+        "no plugin call"
+    );
     gear.stop(CancellationToken::new()).await.unwrap();
 }
 
@@ -177,7 +181,11 @@ async fn initialized(overrides: &Value, hub: Arc<ClientHub>) -> ApplicationManag
 
 #[tokio::test(start_paused = true)]
 async fn cancelled_start_publishes_nothing() {
-    let plugins = [PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Hang)];
+    let plugins = [PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    )];
     let gear = initialized(&json!({}), hub_with(&plugins)).await;
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -188,71 +196,19 @@ async fn cancelled_start_publishes_nothing() {
     assert!(gear.runtime.get().unwrap().startup.plugin_set().is_none());
 }
 
-#[tokio::test(start_paused = true)]
-async fn plugin_call_timeout_bounds_the_key_call() {
-    let plugins = [PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Hang)];
-    let gear = initialized(&json!({ "plugin_call_timeout": "3s" }), hub_with(&plugins)).await;
-    let started = tokio::time::Instant::now();
-    let err = gear.start(CancellationToken::new()).await.unwrap_err();
-    assert!(
-        format!("{err:#}").contains("startup_failed: section_key_unavailable: "),
-        "{err:#}"
-    );
-    assert_eq!(started.elapsed(), Duration::from_secs(3));
-}
-
-#[tokio::test(start_paused = true)]
-async fn plugin_max_in_flight_caps_each_plugin() {
-    let gear = initialized(&json!({ "plugin_max_in_flight": 2 }), hub_with(&[])).await;
-    let guard = &gear.runtime.get().unwrap().guard;
-    let (release_a, wait_a) = tokio::sync::oneshot::channel::<()>();
-    let (release_b, wait_b) = tokio::sync::oneshot::channel::<()>();
-    let third = async move {
-        let refused = guard.call("p", async {}).await;
-        release_a.send(()).unwrap();
-        release_b.send(()).unwrap();
-        refused
-    };
-    let (a, b, refused) = tokio::join!(
-        guard.call("p", async move { wait_a.await.unwrap() }),
-        guard.call("p", async move { wait_b.await.unwrap() }),
-        third
-    );
-    assert_eq!((a, b), (Ok(()), Ok(())));
-    assert_eq!(refused, Err(GuardError::NotSent));
-}
-
-#[tokio::test(start_paused = true)]
-async fn pdp_call_timeout_bounds_the_access_check() {
-    let hub = hub_with(&[]);
-    let pdp: Arc<dyn AuthZResolverApi> = FakeAuthZ::new(Pdp::Hang);
-    hub.register::<dyn AuthZResolverApi>(pdp);
-    let gear = initialized(&json!({ "pdp_call_timeout": "1s" }), hub).await;
+#[tokio::test]
+async fn allowed_callers_from_config_decide_read_schema() {
+    let gear = initialized(&json!({}), hub_with(&[])).await;
     gear.start(CancellationToken::new()).await.unwrap();
-    let started = tokio::time::Instant::now();
-    let refused = gear
-        .runtime
-        .get()
-        .unwrap()
-        .read
-        .list_section_keys(&ctx())
-        .await;
-    assert_eq!(refused, Err(DomainError::AccessUnavailable));
-    assert_eq!(started.elapsed(), Duration::from_secs(1));
-}
-
-#[test]
-fn margin_floor_is_n_plus_two_storage_timeouts() {
-    let secs = Duration::from_secs;
-    assert_eq!(margin_below_floor(secs(30), secs(2), 0), None);
-    assert_eq!(margin_below_floor(secs(30), secs(10), 1), None);
-    assert_eq!(margin_below_floor(secs(29), secs(10), 1), Some(secs(30)));
-    assert_eq!(margin_below_floor(secs(30), secs(2), 14), Some(secs(32)));
+    let read = &gear.runtime.get().unwrap().read;
     assert_eq!(
-        margin_below_floor(secs(30), secs(2), usize::MAX),
-        Some(Duration::MAX),
-        "an overflowing floor always warns"
+        read.list_section_keys(&platform_ctx("app-seeder")),
+        Ok(vec![])
     );
+    assert!(matches!(
+        read.list_section_keys(&platform_ctx("someone-else")),
+        Err(DomainError::NotPermitted { .. })
+    ));
 }
 
 #[test]
@@ -286,9 +242,9 @@ fn sdk_type_missing_from_inventory_fails() {
 async fn healthcheck_follows_startup() {
     let root = json!({ "application-manager": { "config": valid_config() } });
     let plugins = [PluginSpec::new(
-        "cf.test.a.section.v1",
+        "cf.test.a.plugin.v1",
         1,
-        KeyAnswer::Key("a"),
+        "cf.test.a.section.v1",
     )];
     let ctx = ctx_with_hub(root, hub_with(&plugins));
     let gear = ApplicationManager::default();

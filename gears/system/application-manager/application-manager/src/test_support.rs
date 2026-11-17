@@ -28,60 +28,59 @@ pub fn valid_config_json() -> Value {
 
 // ── Doubles shared by the domain, infra, REST and gear tests ─────────────────
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use application_manager_sdk::{
-    ApplicationManagerSectionPluginSpecV1, CallerIdentity, Envelope, SectionPluginClientV1,
-    SectionPluginError, SectionSchema,
+    ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1, CallerIdentity, Envelope,
+    SectionPluginClientV1, SectionPluginError,
 };
 use async_trait::async_trait;
-use authz_resolver_sdk::AuthZResolverApi;
-use authz_resolver_sdk::constraints::{Constraint, EqPredicate, Predicate};
-use authz_resolver_sdk::models::{
-    EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
-};
+use gts::{GtsInstanceId, GtsSchema};
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::gts::PluginV1;
-use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::{PlatformIdentity, PlatformSecurityContext};
 use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::{GtsTypeId, GtsTypeSchema, TypesRegistryClient};
 use uuid::Uuid;
 
-use crate::domain::actions::Action;
-use crate::domain::ports::{AccessControl, AccessError};
+use crate::domain::actions::CallerAction;
+use crate::domain::allowed_callers::{AllowedCallers, CallerPattern};
+use crate::domain::plugin_set::SectionPlugin;
 
-/// An authenticated caller.
-pub fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0xA))
-        .subject_tenant_id(Uuid::from_u128(0xB))
-        .build()
-        .expect("test ctx")
+/// The namespace of every test service account.
+pub const NAMESPACE: &str = "deploy";
+
+/// A platform context holding the service account `name` in [`NAMESPACE`].
+pub fn platform_ctx(name: &str) -> PlatformSecurityContext {
+    PlatformSecurityContext::new(PlatformIdentity::KubernetesServiceAccount {
+        namespace: NAMESPACE.to_owned(),
+        service_account: name.to_owned(),
+        pod: Some("pod-1".to_owned()),
+    })
 }
 
-/// How a [`FakePlugin`] answers `key`.
-#[derive(Clone)]
-pub enum KeyAnswer {
-    Key(&'static str),
-    Error,
-    Panic,
-    Hang,
+/// Allowed callers granting `actions` to the service account `name` in
+/// [`NAMESPACE`].
+pub fn allowed_callers(name: &str, actions: Vec<CallerAction>) -> AllowedCallers {
+    AllowedCallers::new([(
+        CallerPattern::KubernetesServiceAccount {
+            namespace: NAMESPACE.to_owned(),
+            service_account: name.to_owned(),
+        },
+        actions,
+    )])
 }
 
 /// A section plugin that counts every call.
+#[derive(Default)]
 pub struct FakePlugin {
-    key: KeyAnswer,
     pub calls: AtomicUsize,
 }
 
 impl FakePlugin {
-    pub fn new(key: KeyAnswer) -> Arc<Self> {
-        Arc::new(Self {
-            key,
-            calls: AtomicUsize::new(0),
-        })
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
     }
 
     pub fn calls(&self) -> usize {
@@ -91,23 +90,6 @@ impl FakePlugin {
 
 #[async_trait]
 impl SectionPluginClientV1 for FakePlugin {
-    async fn key(&self) -> Result<String, SectionPluginError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        match self.key {
-            KeyAnswer::Key(k) => Ok(k.to_owned()),
-            KeyAnswer::Error => Err(SectionPluginError::Internal {
-                message: "key failed".to_owned(),
-            }),
-            KeyAnswer::Panic => panic!("key panicked"),
-            KeyAnswer::Hang => std::future::pending().await,
-        }
-    }
-
-    async fn schema(&self, _caller: &CallerIdentity) -> Result<SectionSchema, SectionPluginError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(SectionSchema::new(serde_json::json!({}), "1"))
-    }
-
     async fn apply(
         &self,
         _caller: &CallerIdentity,
@@ -130,44 +112,112 @@ impl SectionPluginClientV1 for FakePlugin {
     }
 }
 
+/// A [`SectionPlugin`] with section key `key`, as startup would build it.
+pub fn section_plugin(key: &str, priority: i16, client: &Arc<FakePlugin>) -> SectionPlugin {
+    SectionPlugin {
+        key: key.to_owned(),
+        section_type: format!("{}{key}.v1~", base_type_id()),
+        priority,
+        instance_id: format!("id-{key}"),
+        client: client.clone(),
+        schema: json!({ "type": "object" }),
+    }
+}
+
+/// The GTS id of the section base type.
+pub fn base_type_id() -> &'static str {
+    <ApplicationManagerSectionV1 as GtsSchema>::TYPE_ID
+}
+
+/// The section type id derived from the base type by `segment`.
+pub fn section_type(segment: &str) -> String {
+    format!("{}{segment}~", base_type_id())
+}
+
 /// The full GTS instance id of a section plugin instance named `segment`.
 pub fn instance_id(segment: &str) -> String {
     format!(
         "{}{segment}",
-        <ApplicationManagerSectionPluginSpecV1 as gts::GtsSchema>::TYPE_ID
+        <ApplicationManagerSectionPluginSpecV1 as GtsSchema>::TYPE_ID
     )
 }
 
-/// The registry content of a section plugin instance.
-pub fn instance_content(segment: &str, priority: i16) -> Value {
-    PluginV1::<ApplicationManagerSectionPluginSpecV1>::build_registration(
-        segment,
-        "constructorfabric".to_owned(),
+/// The registry content of a section plugin instance naming `section_type`.
+pub fn instance_content(segment: &str, priority: i16, section_type: &str) -> Value {
+    serde_json::to_value(PluginV1::<ApplicationManagerSectionPluginSpecV1> {
+        id: GtsInstanceId::new(
+            <ApplicationManagerSectionPluginSpecV1 as GtsSchema>::TYPE_ID,
+            segment,
+        ),
+        vendor: "constructorfabric".to_owned(),
         priority,
-    )
+        properties: ApplicationManagerSectionPluginSpecV1 {
+            section_type: section_type.to_owned(),
+        },
+    })
     .expect("registration")
-    .1
 }
 
-/// A plugin for [`hub_with`]: instance segment, registry content, and client
-/// (`None` registers no client).
+/// The registered schema of `type_id`, derived from the section base type
+/// when `type_id` is.
+pub fn type_schema(type_id: &str, schema: Value) -> GtsTypeSchema {
+    let base = Arc::new(
+        GtsTypeSchema::try_new(
+            GtsTypeId::new(base_type_id()),
+            json!({ "type": "object" }),
+            None,
+            None,
+        )
+        .expect("base type"),
+    );
+    let parent = GtsTypeSchema::derive_parent_type_id(type_id).map(|p| {
+        if p.as_ref() == base_type_id() {
+            base
+        } else {
+            Arc::new(types_registry_sdk::testing::make_test_type_schema(
+                p.as_ref(),
+            ))
+        }
+    });
+    GtsTypeSchema::try_new(GtsTypeId::new(type_id), schema, None, parent).expect("type schema")
+}
+
+/// A plugin for [`hub_with`]: instance segment, registry content, client
+/// (`None` registers no client), and its section type (`None` registers no
+/// type schema).
 pub struct PluginSpec {
     pub segment: &'static str,
     pub content: Value,
     pub client: Option<Arc<FakePlugin>>,
+    pub section_type: Option<GtsTypeSchema>,
 }
 
 impl PluginSpec {
-    pub fn new(segment: &'static str, priority: i16, key: KeyAnswer) -> Self {
+    /// A plugin whose section type is derived from the base type by
+    /// `type_segment`, e.g. `cf.test.a.section.v1`.
+    pub fn new(segment: &'static str, priority: i16, type_segment: &str) -> Self {
+        let type_id = section_type(type_segment);
         Self {
             segment,
-            content: instance_content(segment, priority),
-            client: Some(FakePlugin::new(key)),
+            content: instance_content(segment, priority, &type_id),
+            client: Some(FakePlugin::new()),
+            section_type: Some(type_schema(&type_id, json!({ "type": "object" }))),
+        }
+    }
+
+    /// A plugin naming `type_id`, registered with a synthetic schema chain.
+    pub fn naming(segment: &'static str, priority: i16, type_id: &str) -> Self {
+        Self {
+            segment,
+            content: instance_content(segment, priority, type_id),
+            client: Some(FakePlugin::new()),
+            section_type: Some(type_schema(type_id, json!({ "type": "object" }))),
         }
     }
 }
 
-/// A hub with a mock types registry listing `plugins` and their clients.
+/// A hub with a mock types registry listing `plugins`, their section types,
+/// and their clients.
 pub fn hub_with(plugins: &[PluginSpec]) -> Arc<ClientHub> {
     hub_with_registry(plugins, MockTypesRegistryClient::new())
 }
@@ -181,7 +231,9 @@ pub fn hub_with_registry(
     let instances = plugins
         .iter()
         .map(|p| make_test_instance(&instance_id(p.segment), p.content.clone()));
-    let registry: Arc<dyn TypesRegistryClient> = Arc::new(registry.with_instances(instances));
+    let types = plugins.iter().filter_map(|p| p.section_type.clone());
+    let registry: Arc<dyn TypesRegistryClient> =
+        Arc::new(registry.with_instances(instances).with_type_schemas(types));
     hub.register::<dyn TypesRegistryClient>(registry);
     for p in plugins {
         if let Some(client) = &p.client {
@@ -193,91 +245,4 @@ pub fn hub_with_registry(
         }
     }
     hub
-}
-
-/// How a [`FakeAuthZ`] answers.
-#[derive(Clone, Copy, Debug)]
-pub enum Pdp {
-    Permit,
-    Deny,
-    ConstrainedPermit,
-    Fail,
-    Hang,
-}
-
-/// A PDP double that records every request.
-pub struct FakeAuthZ {
-    answer: Pdp,
-    pub requests: Mutex<Vec<EvaluationRequest>>,
-}
-
-impl FakeAuthZ {
-    pub fn new(answer: Pdp) -> Arc<Self> {
-        Arc::new(Self {
-            answer,
-            requests: Mutex::new(Vec::new()),
-        })
-    }
-}
-
-#[async_trait]
-impl AuthZResolverApi for FakeAuthZ {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        self.requests.lock().expect("lock").push(request);
-        let permit = |constraints| EvaluationResponse {
-            decision: true,
-            context: EvaluationResponseContext {
-                constraints,
-                ..Default::default()
-            },
-        };
-        match self.answer {
-            Pdp::Permit => Ok(permit(vec![])),
-            Pdp::Deny => Ok(EvaluationResponse {
-                decision: false,
-                context: EvaluationResponseContext::default(),
-            }),
-            Pdp::ConstrainedPermit => Ok(permit(vec![Constraint {
-                predicates: vec![Predicate::Eq(EqPredicate::new(
-                    pep_properties::OWNER_TENANT_ID,
-                    Uuid::from_u128(0xB),
-                ))],
-            }])),
-            Pdp::Fail => Err(CanonicalError::service_unavailable()
-                .with_detail("pdp down")
-                .create()),
-            Pdp::Hang => std::future::pending().await,
-        }
-    }
-}
-
-/// An [`AccessControl`] double with a fixed answer that counts its calls.
-pub struct FakeAccess {
-    answer: Result<(), AccessError>,
-    pub calls: AtomicUsize,
-}
-
-impl FakeAccess {
-    pub fn new(answer: Result<(), AccessError>) -> Arc<Self> {
-        Arc::new(Self {
-            answer,
-            calls: AtomicUsize::new(0),
-        })
-    }
-
-    pub fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl AccessControl for FakeAccess {
-    async fn authorize(&self, _ctx: &SecurityContext, _action: Action) -> Result<(), AccessError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.answer
-    }
 }

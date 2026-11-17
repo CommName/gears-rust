@@ -7,6 +7,8 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::constants::{APPLICATION_ID_MAX_BYTES, GATEWAY_REQUEST_DEADLINE};
+pub use crate::domain::actions::CallerAction;
+use crate::domain::allowed_callers::{AllowedCallers, CallerPattern};
 
 /// Operator configuration. Every field is required; there are no defaults.
 #[derive(Debug, Clone, Deserialize)]
@@ -66,20 +68,6 @@ pub enum AllowedIdentity {
         /// Workload name.
         name: String,
     },
-}
-
-/// A platform-plane action granted by the allowed callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CallerAction {
-    /// Seed an application.
-    Seed,
-    /// Uninstall an application.
-    Uninstall,
-    /// Read the section keys and schemas.
-    ReadSchema,
-    /// Read an operation.
-    ReadOperation,
 }
 
 /// A rejected setting: names the setting and the broken rule.
@@ -145,6 +133,27 @@ impl ApplicationManagerConfig {
             );
         }
         Ok(())
+    }
+
+    /// The allowed callers component built from `allowed_callers`.
+    #[must_use]
+    pub fn allowed_callers(&self) -> AllowedCallers {
+        AllowedCallers::new(self.allowed_callers.iter().map(|entry| {
+            let pattern = match &entry.identity {
+                AllowedIdentity::KubernetesServiceAccount {
+                    namespace,
+                    service_account,
+                } => CallerPattern::KubernetesServiceAccount {
+                    namespace: namespace.clone(),
+                    service_account: service_account.clone(),
+                },
+                AllowedIdentity::Spiffe { trust_domain, name } => CallerPattern::Spiffe {
+                    trust_domain: trust_domain.clone(),
+                    name: name.clone(),
+                },
+            };
+            (pattern, entry.actions.clone())
+        }))
     }
 
     /// Every entry has actions and no two entries share an identity. Errors

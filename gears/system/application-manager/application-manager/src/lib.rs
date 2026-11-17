@@ -9,7 +9,6 @@ pub mod config;
 pub mod constants;
 pub mod domain;
 pub mod gear;
-pub mod gts;
 pub mod infra;
 
 // === PUBLIC API (from SDK) ===

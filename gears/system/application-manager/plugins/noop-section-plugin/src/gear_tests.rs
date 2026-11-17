@@ -26,6 +26,10 @@ fn registration_chains_from_the_section_plugin_type() {
     assert_eq!(payload["id"], id);
     assert_eq!(payload["priority"], 7);
     assert_eq!(payload["vendor"], "constructorfabric");
+    assert_eq!(
+        payload["properties"]["section_type"],
+        crate::section::SECTION_TYPE
+    );
 }
 
 /// A types registry that records `register` payloads and answers each with
@@ -33,6 +37,7 @@ fn registration_chains_from_the_section_plugin_type() {
 struct Registry {
     accept: bool,
     registered: Mutex<Vec<Value>>,
+    type_schemas: Mutex<Vec<Value>>,
 }
 
 impl Registry {
@@ -40,7 +45,25 @@ impl Registry {
         Arc::new(Self {
             accept,
             registered: Mutex::new(Vec::new()),
+            type_schemas: Mutex::new(Vec::new()),
         })
+    }
+
+    fn answer(&self, entities: &[Value], key: &str) -> Vec<RegisterResult> {
+        entities
+            .iter()
+            .map(|e| {
+                let gts_id = e[key].as_str().unwrap().to_owned();
+                if self.accept {
+                    RegisterResult::Ok { gts_id }
+                } else {
+                    RegisterResult::Err {
+                        gts_id: Some(gts_id),
+                        error: CanonicalError::internal("rejected").create(),
+                    }
+                }
+            })
+            .collect()
     }
 }
 
@@ -51,28 +74,17 @@ fn unexpected() -> CanonicalError {
 #[async_trait]
 impl TypesRegistryClient for Registry {
     async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
-        let results = entities
-            .iter()
-            .map(|e| {
-                let gts_id = e["id"].as_str().unwrap().to_owned();
-                if self.accept {
-                    RegisterResult::Ok { gts_id }
-                } else {
-                    RegisterResult::Err {
-                        gts_id: Some(gts_id),
-                        error: CanonicalError::internal("rejected").create(),
-                    }
-                }
-            })
-            .collect();
+        let results = self.answer(&entities, "id");
         self.registered.lock().unwrap().extend(entities);
         Ok(results)
     }
     async fn register_type_schemas(
         &self,
-        _type_schemas: Vec<Value>,
+        type_schemas: Vec<Value>,
     ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        Err(unexpected())
+        let results = self.answer(&type_schemas, "$id");
+        self.type_schemas.lock().unwrap().extend(type_schemas);
+        Ok(results)
     }
     async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
         Err(unexpected())
@@ -168,11 +180,13 @@ async fn init_registers_the_instance_and_its_client_under_one_id() {
         .unwrap();
 
     let (id, payload) = registration(&NoopSectionPluginConfig::default()).unwrap();
+    assert_eq!(
+        *registry.type_schemas.lock().unwrap(),
+        [crate::section::section_type_schema()]
+    );
     assert_eq!(*registry.registered.lock().unwrap(), [payload]);
-    let client = hub
-        .try_get_scoped::<dyn SectionPluginClientV1>(&ClientScope::gts_id(&id))
+    hub.try_get_scoped::<dyn SectionPluginClientV1>(&ClientScope::gts_id(&id))
         .expect("client scoped by the registered instance id");
-    assert_eq!(client.key().await.unwrap(), "noop");
 }
 
 #[tokio::test]

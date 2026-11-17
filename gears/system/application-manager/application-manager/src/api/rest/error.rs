@@ -23,7 +23,6 @@ pub struct ApplicationError;
 pub fn to_canonical(err: &DomainError, request_id: Uuid) -> CanonicalError {
     match err {
         DomainError::NotReady => unavailable(request_id, "the application manager is not ready"),
-        DomainError::AccessUnavailable => unavailable(request_id, "access control cannot answer"),
         DomainError::NotPermitted { action } => ApplicationError::permission_denied()
             .with_reason(format!(
                 "request {request_id}: action {action} is not permitted"

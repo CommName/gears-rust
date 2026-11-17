@@ -1,20 +1,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::json;
 use types_registry_sdk::testing::{MockTypesRegistryClient, internal, make_test_instance};
 
 use super::*;
-use crate::test_support::{KeyAnswer, PluginSpec, hub_with, hub_with_registry, instance_id};
-
-fn guard() -> CallGuard {
-    CallGuard::new(Duration::from_secs(10), 4)
-}
+use crate::test_support::{
+    PluginSpec, hub_with, hub_with_registry, instance_id, section_type, type_schema,
+};
 
 async fn failure_of(plugins: &[PluginSpec]) -> StartupFailure {
-    discover(&hub_with(plugins), &guard())
+    discover(&hub_with(plugins))
         .await
         .expect_err("startup must fail")
 }
@@ -34,34 +31,72 @@ fn assert_detail_names(failure: &StartupFailure, segments: &[&str]) {
     }
 }
 
+fn no_client(mut spec: PluginSpec) -> PluginSpec {
+    spec.client = None;
+    spec
+}
+
+fn unregistered_type(mut spec: PluginSpec) -> PluginSpec {
+    spec.section_type = None;
+    spec
+}
+
+fn bad_priority(mut spec: PluginSpec) -> PluginSpec {
+    spec.content["priority"] = json!("first");
+    spec
+}
+
 #[tokio::test]
 async fn empty_registry_gives_an_empty_set() {
-    let set = discover(&hub_with(&[]), &guard()).await.unwrap();
+    let set = discover(&hub_with(&[])).await.unwrap();
     assert!(set.plugins().is_empty());
 }
 
 #[tokio::test]
-async fn plugins_are_ordered_by_priority_with_their_keys() {
+async fn plugins_are_ordered_by_priority_with_their_derived_keys() {
     let plugins = [
-        PluginSpec::new("cf.test.b.section.v1", 30, KeyAnswer::Key("b")),
-        PluginSpec::new("cf.test.a.section.v1", -5, KeyAnswer::Key("a")),
-        PluginSpec::new("cf.test.c.section.v1", 10, KeyAnswer::Key("c")),
+        PluginSpec::new("cf.test.b.plugin.v1", 30, "cf.test.b.section.v1"),
+        PluginSpec::new("cf.test.a.plugin.v1", -5, "cf.test.a.section.v1.2"),
+        PluginSpec::new("cf.test.c.plugin.v1", 10, "cf.test.c.section.v1"),
     ];
-    let set = discover(&hub_with(&plugins), &guard()).await.unwrap();
-    assert_eq!(set.keys(), ["a", "c", "b"]);
+    let set = discover(&hub_with(&plugins)).await.unwrap();
+    assert_eq!(
+        set.keys(),
+        [
+            "cf.test.a.section",
+            "cf.test.c.section",
+            "cf.test.b.section"
+        ]
+    );
     let priorities: Vec<i16> = set.plugins().iter().map(|p| p.priority).collect();
     assert_eq!(priorities, [-5, 10, 30]);
-    assert_eq!(
-        set.plugins()[0].instance_id,
-        instance_id("cf.test.a.section.v1")
-    );
+    let first = &set.plugins()[0];
+    assert_eq!(first.instance_id, instance_id("cf.test.a.plugin.v1"));
+    assert_eq!(first.section_type, section_type("cf.test.a.section.v1.2"));
+    assert_eq!(first.schema["type"], "object");
     for p in &plugins {
-        assert_eq!(
-            p.client.as_ref().unwrap().calls(),
-            1,
-            "key read once per plugin"
-        );
+        assert_eq!(p.client.as_ref().unwrap().calls(), 0, "no plugin call");
     }
+}
+
+#[tokio::test]
+async fn the_kept_schema_inlines_the_base_type() {
+    let type_id = section_type("cf.test.a.section.v1");
+    let mut spec = PluginSpec::new("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1");
+    spec.section_type = Some(type_schema(
+        &type_id,
+        json!({
+            "allOf": [{ "$ref": format!("gts://{}", crate::test_support::base_type_id()) }],
+            "properties": { "roles": { "type": "array" } }
+        }),
+    ));
+    let set = discover(&hub_with(&[spec])).await.unwrap();
+    let schema = &set.plugins()[0].schema;
+    assert_eq!(schema["properties"]["roles"]["type"], "array");
+    assert!(
+        !schema.to_string().contains("\"$ref\""),
+        "the parent is inlined: {schema}"
+    );
 }
 
 #[tokio::test]
@@ -69,7 +104,7 @@ async fn registry_is_listed_once_with_the_section_plugin_pattern() {
     let registry = Arc::new(MockTypesRegistryClient::new());
     let hub = ClientHub::new();
     hub.register::<dyn TypesRegistryClient>(registry.clone());
-    discover(&hub, &guard()).await.unwrap();
+    discover(&hub).await.unwrap();
     assert_eq!(registry.list_instance_calls(), 1);
     let queries = registry.received_instance_queries();
     let type_id = <ApplicationManagerSectionPluginSpecV1 as GtsSchema>::TYPE_ID;
@@ -87,20 +122,20 @@ async fn instances_of_other_types_are_ignored() {
     );
     let registry = MockTypesRegistryClient::new().with_instances([other]);
     let plugins = [PluginSpec::new(
-        "cf.test.a.section.v1",
+        "cf.test.a.plugin.v1",
         1,
-        KeyAnswer::Key("a"),
+        "cf.test.a.section.v1",
     )];
-    let set = discover(&hub_with_registry(&plugins, registry), &guard())
+    let set = discover(&hub_with_registry(&plugins, registry))
         .await
         .unwrap();
-    assert_eq!(set.keys(), ["a"]);
+    assert_eq!(set.keys(), ["cf.test.a.section"]);
 }
 
 #[tokio::test]
 async fn unreachable_registry_is_not_an_empty_set() {
     let registry = MockTypesRegistryClient::new().with_list_error(internal("registry down"));
-    let err = discover(&hub_with_registry(&[], registry), &guard())
+    let err = discover(&hub_with_registry(&[], registry))
         .await
         .unwrap_err();
     assert_eq!(err.reason, StartupReason::TypesRegistryUnreachable);
@@ -108,134 +143,155 @@ async fn unreachable_registry_is_not_an_empty_set() {
 
 #[tokio::test]
 async fn missing_registry_client_is_unreachable() {
-    let err = discover(&ClientHub::new(), &guard()).await.unwrap_err();
+    let err = discover(&ClientHub::new()).await.unwrap_err();
     assert_eq!(err.reason, StartupReason::TypesRegistryUnreachable);
 }
 
 #[tokio::test]
-async fn unreadable_priority_fails() {
-    let mut bad_priority = PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key("a"));
-    bad_priority.content["priority"] = json!("first");
-    let mut wrong_id = PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key("a"));
-    wrong_id.content["id"] = json!(instance_id("cf.test.other.section.v1"));
-    for spec in [bad_priority, wrong_id] {
+async fn unreadable_properties_fail() {
+    let spec = || PluginSpec::new("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1");
+    let mut no_section_type = spec();
+    no_section_type.content["properties"] = json!({});
+    let mut wrong_id = spec();
+    wrong_id.content["id"] = json!(instance_id("cf.test.other.plugin.v1"));
+    for spec in [bad_priority(spec()), no_section_type, wrong_id] {
         let failure = failure_of(&[spec]).await;
-        assert_eq!(failure.reason, StartupReason::PriorityUnreadable);
-        assert_detail_names(&failure, &["cf.test.a.section.v1"]);
+        assert_eq!(failure.reason, StartupReason::PluginPropertiesUnreadable);
+        assert_detail_names(&failure, &["cf.test.a.plugin.v1"]);
+    }
+}
+
+#[tokio::test]
+async fn unresolved_section_type_fails() {
+    let spec = unregistered_type(PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    ));
+    let failure = failure_of(&[spec]).await;
+    assert_eq!(failure.reason, StartupReason::SectionTypeUnresolved);
+    assert_detail_names(&failure, &["cf.test.a.plugin.v1"]);
+    let mut empty = PluginSpec::new("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1");
+    empty.content["properties"]["section_type"] = json!("");
+    assert_eq!(
+        reason_of(&[empty]).await,
+        StartupReason::SectionTypeUnresolved
+    );
+}
+
+#[tokio::test]
+async fn section_type_of_the_wrong_shape_fails() {
+    let deeper = format!(
+        "{}cf.test.a.section.v1~cf.test.a.deeper.v1~",
+        crate::test_support::base_type_id()
+    );
+    for type_id in [
+        "gts.cf.core.other_base.section.v1~cf.test.a.section.v1~".to_owned(),
+        deeper,
+    ] {
+        let spec = PluginSpec::naming("cf.test.a.plugin.v1", 1, &type_id);
+        let failure = failure_of(&[spec]).await;
+        assert_eq!(
+            failure.reason,
+            StartupReason::InvalidSectionType,
+            "{type_id}"
+        );
+        assert_detail_names(&failure, &["cf.test.a.plugin.v1"]);
     }
 }
 
 #[tokio::test]
 async fn missing_client_fails() {
-    let mut spec = PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key("a"));
-    spec.client = None;
+    let spec = no_client(PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    ));
     let failure = failure_of(&[spec]).await;
     assert_eq!(failure.reason, StartupReason::PluginClientUnresolved);
-    assert_detail_names(&failure, &["cf.test.a.section.v1"]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn unavailable_key_fails() {
-    for answer in [KeyAnswer::Error, KeyAnswer::Panic, KeyAnswer::Hang] {
-        let spec = PluginSpec::new("cf.test.a.section.v1", 1, answer);
-        let failure = failure_of(&[spec]).await;
-        assert_eq!(failure.reason, StartupReason::SectionKeyUnavailable);
-        assert_detail_names(&failure, &["cf.test.a.section.v1"]);
-    }
+    assert_detail_names(&failure, &["cf.test.a.plugin.v1"]);
 }
 
 #[tokio::test]
-async fn invalid_key_fails() {
-    for key in ["", "Noop", "a/b", "a b"] {
-        let spec = PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key(key));
-        let failure = failure_of(&[spec]).await;
-        assert_eq!(failure.reason, StartupReason::InvalidSectionKey, "{key:?}");
-        assert_detail_names(&failure, &["cf.test.a.section.v1"]);
-    }
-}
-
-#[tokio::test]
-async fn duplicate_key_fails() {
+async fn duplicate_key_fails_including_two_versions_of_one_type() {
     let plugins = [
-        PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key("same")),
-        PluginSpec::new("cf.test.b.section.v1", 2, KeyAnswer::Key("same")),
+        PluginSpec::new("cf.test.a.plugin.v1", 1, "cf.test.same.section.v1"),
+        PluginSpec::new("cf.test.b.plugin.v1", 2, "cf.test.same.section.v2"),
     ];
     let failure = failure_of(&plugins).await;
     assert_eq!(failure.reason, StartupReason::DuplicateSectionKey);
-    assert_detail_names(&failure, &["cf.test.a.section.v1", "cf.test.b.section.v1"]);
-    assert!(failure.detail.contains("\"same\""), "{:?}", failure.detail);
+    assert_detail_names(&failure, &["cf.test.a.plugin.v1", "cf.test.b.plugin.v1"]);
+    assert!(
+        failure.detail.contains("\"cf.test.same.section\""),
+        "{:?}",
+        failure.detail
+    );
 }
 
 #[tokio::test]
 async fn equal_priority_fails() {
     let plugins = [
-        PluginSpec::new("cf.test.a.section.v1", 7, KeyAnswer::Key("a")),
-        PluginSpec::new("cf.test.b.section.v1", 7, KeyAnswer::Key("b")),
+        PluginSpec::new("cf.test.a.plugin.v1", 7, "cf.test.a.section.v1"),
+        PluginSpec::new("cf.test.b.plugin.v1", 7, "cf.test.b.section.v1"),
     ];
     let failure = failure_of(&plugins).await;
     assert_eq!(failure.reason, StartupReason::EqualPriority);
-    assert_detail_names(&failure, &["cf.test.a.section.v1", "cf.test.b.section.v1"]);
+    assert_detail_names(&failure, &["cf.test.a.plugin.v1", "cf.test.b.plugin.v1"]);
     assert!(failure.detail.starts_with("7: "), "{:?}", failure.detail);
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn checks_run_in_design_order() {
-    // Both an unresolved client and an equal priority: the earlier check wins.
-    let mut no_client = PluginSpec::new("cf.test.a.section.v1", 7, KeyAnswer::Key("a"));
-    no_client.client = None;
+    let spec = |segment: &'static str, priority, ty: &str| PluginSpec::new(segment, priority, ty);
+    let invalid = |segment: &'static str, priority| {
+        PluginSpec::naming(
+            segment,
+            priority,
+            "gts.cf.core.other_base.section.v1~cf.test.x.section.v1~",
+        )
+    };
+
+    // Every property is read before any section type is resolved.
     let plugins = [
-        no_client,
-        PluginSpec::new("cf.test.b.section.v1", 7, KeyAnswer::Key("b")),
+        unregistered_type(spec("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1")),
+        bad_priority(spec("cf.test.b.plugin.v1", 2, "cf.test.b.section.v1")),
+    ];
+    assert_eq!(
+        reason_of(&plugins).await,
+        StartupReason::PluginPropertiesUnreadable
+    );
+
+    // Every section type is resolved before any shape is checked.
+    let plugins = [
+        invalid("cf.test.a.plugin.v1", 1),
+        unregistered_type(spec("cf.test.b.plugin.v1", 2, "cf.test.b.section.v1")),
+    ];
+    assert_eq!(
+        reason_of(&plugins).await,
+        StartupReason::SectionTypeUnresolved
+    );
+
+    // Every shape is checked before any client is resolved.
+    let plugins = [
+        no_client(spec("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1")),
+        invalid("cf.test.b.plugin.v1", 2),
+    ];
+    assert_eq!(reason_of(&plugins).await, StartupReason::InvalidSectionType);
+
+    // Every client is resolved before keys and priorities are compared.
+    let plugins = [
+        spec("cf.test.a.plugin.v1", 7, "cf.test.same.section.v1"),
+        no_client(spec("cf.test.b.plugin.v1", 7, "cf.test.same.section.v2")),
     ];
     assert_eq!(
         reason_of(&plugins).await,
         StartupReason::PluginClientUnresolved
-    );
-
-    // An invalid key and a duplicate key: the grammar check comes first.
-    let plugins = [
-        PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key("dup")),
-        PluginSpec::new("cf.test.b.section.v1", 2, KeyAnswer::Key("dup")),
-        PluginSpec::new("cf.test.c.section.v1", 3, KeyAnswer::Key("BAD")),
-    ];
-    assert_eq!(reason_of(&plugins).await, StartupReason::InvalidSectionKey);
-
-    // An invalid key and an unavailable key: reading every key comes first.
-    let plugins = [
-        PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key("BAD")),
-        PluginSpec::new("cf.test.b.section.v1", 2, KeyAnswer::Error),
-    ];
-    assert_eq!(
-        reason_of(&plugins).await,
-        StartupReason::SectionKeyUnavailable
-    );
-
-    // Every client is resolved before any key is read.
-    let mut no_client = PluginSpec::new("cf.test.b.section.v1", 2, KeyAnswer::Key("b"));
-    no_client.client = None;
-    let plugins = [
-        PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Error),
-        no_client,
-    ];
-    assert_eq!(
-        reason_of(&plugins).await,
-        StartupReason::PluginClientUnresolved
-    );
-
-    // Every priority is read before any client is resolved.
-    let mut no_client = PluginSpec::new("cf.test.a.section.v1", 1, KeyAnswer::Key("a"));
-    no_client.client = None;
-    let mut bad_priority = PluginSpec::new("cf.test.b.section.v1", 2, KeyAnswer::Key("b"));
-    bad_priority.content["priority"] = json!("first");
-    assert_eq!(
-        reason_of(&[no_client, bad_priority]).await,
-        StartupReason::PriorityUnreadable
     );
 
     // A duplicate key and an equal priority: the key check comes first.
     let plugins = [
-        PluginSpec::new("cf.test.a.section.v1", 4, KeyAnswer::Key("dup")),
-        PluginSpec::new("cf.test.b.section.v1", 4, KeyAnswer::Key("dup")),
+        spec("cf.test.a.plugin.v1", 4, "cf.test.same.section.v1"),
+        spec("cf.test.b.plugin.v1", 4, "cf.test.same.section.v2"),
     ];
     assert_eq!(
         reason_of(&plugins).await,
@@ -263,16 +319,19 @@ fn reasons_use_the_design_names() {
             StartupReason::TypesRegistryUnreachable,
             "types_registry_unreachable",
         ),
-        (StartupReason::PriorityUnreadable, "priority_unreadable"),
+        (
+            StartupReason::PluginPropertiesUnreadable,
+            "plugin_properties_unreadable",
+        ),
+        (
+            StartupReason::SectionTypeUnresolved,
+            "section_type_unresolved",
+        ),
+        (StartupReason::InvalidSectionType, "invalid_section_type"),
         (
             StartupReason::PluginClientUnresolved,
             "plugin_client_unresolved",
         ),
-        (
-            StartupReason::SectionKeyUnavailable,
-            "section_key_unavailable",
-        ),
-        (StartupReason::InvalidSectionKey, "invalid_section_key"),
         (StartupReason::DuplicateSectionKey, "duplicate_section_key"),
         (StartupReason::EqualPriority, "equal_priority"),
     ];

@@ -23,7 +23,7 @@ pub fn register_routes(
         .summary("List section keys")
         .description("The section keys of the startup plugin set, in priority order.")
         .tag(TAG)
-        .authenticated()
+        .platform_authenticated()
         .no_license_required()
         .handler(handlers::list_section_keys)
         .json_response_with_schema::<SectionKeysDto>(openapi, StatusCode::OK, "Section keys")

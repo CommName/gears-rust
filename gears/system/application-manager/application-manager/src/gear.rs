@@ -1,11 +1,9 @@
 //! Gear declaration and lifecycle.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use authz_resolver_sdk::PolicyEnforcer;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
@@ -18,8 +16,6 @@ use crate::api::rest::health::StartupHealthcheck;
 use crate::config::ApplicationManagerConfig;
 use crate::domain::plugin_set::StartupState;
 use crate::domain::read_service::ReadService;
-use crate::infra::call_guard::CallGuard;
-use crate::infra::policy::PolicyAccessControl;
 use crate::infra::startup;
 use crate::sdk::{ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1};
 
@@ -37,11 +33,8 @@ pub struct ApplicationManager {
 /// What `init` builds; `start` and the routes use it.
 struct Runtime {
     hub: Arc<ClientHub>,
-    guard: CallGuard,
     read: Arc<ReadService>,
     startup: Arc<StartupState>,
-    run_window_margin: Duration,
-    storage_call_timeout: Duration,
 }
 
 impl ApplicationManager {
@@ -82,21 +75,6 @@ fn ensure_sdk_types_registered(registered: &[serde_json::Value]) -> anyhow::Resu
     Ok(())
 }
 
-/// The DESIGN 4.2 floor `(N + 2) × storage_call_timeout` for `plugins`
-/// plugins, when `run_window_margin` is below it.
-fn margin_below_floor(
-    run_window_margin: Duration,
-    storage_call_timeout: Duration,
-    plugins: usize,
-) -> Option<Duration> {
-    let floor = u32::try_from(plugins)
-        .ok()
-        .and_then(|n| n.checked_add(2))
-        .and_then(|factor| storage_call_timeout.checked_mul(factor))
-        .unwrap_or(Duration::MAX);
-    (run_window_margin < floor).then_some(floor)
-}
-
 /// Render a config load failure as `invalid_setting: config: <reason>`, the
 /// same `<setting>: <reason>` form as [`ApplicationManagerConfig::validate`].
 fn config_load_reason(err: &ConfigError) -> String {
@@ -135,19 +113,12 @@ impl Gear for ApplicationManager {
             "application-manager: configuration validated"
         );
 
-        let hub = ctx.client_hub();
-        let access = Arc::new(PolicyAccessControl::new(
-            PolicyEnforcer::from_hub(Arc::clone(&hub)),
-            config.pdp_call_timeout,
-        ));
+        let allowed = Arc::new(config.allowed_callers());
         let startup = Arc::new(StartupState::default());
         let runtime = Runtime {
-            hub,
-            guard: CallGuard::new(config.plugin_call_timeout, config.plugin_max_in_flight),
-            read: Arc::new(ReadService::new(access, Arc::clone(&startup))),
+            hub: ctx.client_hub(),
+            read: Arc::new(ReadService::new(allowed, Arc::clone(&startup))),
             startup,
-            run_window_margin: config.run_window_margin,
-            storage_call_timeout: config.storage_call_timeout,
         };
         self.runtime
             .set(runtime)
@@ -194,25 +165,13 @@ impl RunnableCapability for ApplicationManager {
                 tracing::warn!("application-manager: start cancelled before the plugin set was fixed");
                 return Err(anyhow!("{}: start cancelled", Self::MODULE_NAME));
             }
-            discovered = startup::discover(&runtime.hub, &runtime.guard) => discovered,
+            discovered = startup::discover(&runtime.hub) => discovered,
         };
         let set = discovered.map_err(|e| {
             tracing::error!(reason = e.reason.as_str(), detail = %e.detail, "application-manager: startup failed");
             anyhow!("{}: {e}", Self::MODULE_NAME)
         })?;
         tracing::info!(keys = ?set.keys(), "application-manager: section plugin set fixed");
-        if let Some(floor) = margin_below_floor(
-            runtime.run_window_margin,
-            runtime.storage_call_timeout,
-            set.plugins().len(),
-        ) {
-            tracing::warn!(
-                run_window_margin = ?runtime.run_window_margin,
-                floor = ?floor,
-                plugins = set.plugins().len(),
-                "application-manager: run_window_margin is below (N + 2) x storage_call_timeout"
-            );
-        }
         runtime
             .startup
             .publish(set)
