@@ -17,4 +17,7 @@ pub enum DomainError {
         /// The refused action.
         action: CallerAction,
     },
+    /// No section plugin owns the requested section key (read: 404).
+    #[error("unknown section key")]
+    UnknownSectionKey,
 }

@@ -64,6 +64,7 @@ inventory = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+noop-section-plugin = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }

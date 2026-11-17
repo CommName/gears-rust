@@ -1,68 +1,27 @@
 //! Section plugin router (`cpt-cf-application-manager-component-section-plugin-router`).
 //!
-//! Routes only to the startup plugin set, so a request cannot select a
-//! plugin. Every call goes through the plugin call guard. The router never
-//! retries and does not record outcomes.
+//! Routes only through the startup plugin set, so a manifest cannot select a
+//! plugin. Calls `apply` or `remove` one at a time in priority order through
+//! the plugin call guard, continuing after failures, with the caller identity
+//! and operation id. It never retries, never consults the types registry, and
+//! neither records outcomes nor checks the run deadline: before each call it
+//! asks its caller whether the call may still be made.
 
 use std::fmt;
 use std::sync::Arc;
 
-use application_manager_sdk::{CallerIdentity, SectionPluginError, SectionSchema};
+use application_manager_sdk::{CallerIdentity, Envelope};
+use serde_json::Value;
 use toolkit_macros::domain_model;
+use uuid::Uuid;
 
-use crate::constants::{LOG_TEXT_MAX_BYTES, cut};
-use crate::domain::plugin_set::SectionPlugin;
-use crate::domain::ports::{CallFailure, PluginCalls};
+use crate::domain::plugin_set::{PluginSet, SectionPlugin};
+use crate::domain::ports::{CallResult, PluginCalls};
 
-/// Why a section schema is not available (DESIGN 3.3).
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnavailableReason {
-    /// The plugin failed, panicked, or could not be reached.
-    Unreachable,
-    /// The call was dropped at `plugin_call_timeout`.
-    TimedOut,
-    /// The served schema cannot be used.
-    Unusable,
-    /// The plugin's in-flight cap was full; it was not called.
-    NotSent,
-}
+/// The answer of one plugin the router called, by section key.
+pub type Routed = (String, CallResult);
 
-impl UnavailableReason {
-    /// The reason as DESIGN names it.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unreachable => "unreachable",
-            Self::TimedOut => "timed_out",
-            Self::Unusable => "unusable",
-            Self::NotSent => "not_sent",
-        }
-    }
-}
-
-impl fmt::Display for UnavailableReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// What one plugin answered to `schema`.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SchemaFetch {
-    /// The plugin served a schema; it is not checked yet.
-    Served(SectionSchema),
-    /// The plugin refused the caller.
-    NotPermitted {
-        /// The plugin's detail, as sent.
-        detail: String,
-    },
-    /// No schema.
-    Unavailable(UnavailableReason),
-}
-
-/// Routes calls to the startup plugin set.
+/// Dispatches seed and uninstall calls over the plugin set.
 #[domain_model]
 pub struct SectionPluginRouter {
     calls: Arc<dyn PluginCalls>,
@@ -76,88 +35,63 @@ impl fmt::Debug for SectionPluginRouter {
 }
 
 impl SectionPluginRouter {
-    /// A router over bounded plugin calls.
+    /// A router whose calls go through `calls`.
     #[must_use]
     pub fn new(calls: Arc<dyn PluginCalls>) -> Self {
         Self { calls }
     }
 
-    /// Ask `plugin` for its schema.
-    pub async fn fetch_schema(
+    /// Call `apply` on every plugin in priority order, each with its own
+    /// section from `sections` (a validated seed has one per key). Before each
+    /// call `may_call` is asked; the first `false` stops the dispatch. The
+    /// answers of the plugins called come back in order.
+    pub async fn apply_all(
         &self,
-        plugin: &SectionPlugin,
+        set: &PluginSet,
         caller: &CallerIdentity,
-    ) -> SchemaFetch {
-        classify(&plugin.key, self.calls.schema(plugin, caller).await)
+        operation_id: Uuid,
+        envelope: &Envelope,
+        sections: &serde_json::Map<String, Value>,
+        mut may_call: impl FnMut(&SectionPlugin) -> bool,
+    ) -> Vec<Routed> {
+        let mut routed = Vec::with_capacity(set.plugins().len());
+        for plugin in set.plugins() {
+            if !may_call(plugin) {
+                break;
+            }
+            let section = sections.get(&plugin.key).unwrap_or(&Value::Null);
+            let answer = self
+                .calls
+                .apply(plugin, caller, operation_id, envelope, section)
+                .await;
+            routed.push((plugin.key.clone(), answer));
+        }
+        routed
     }
 
-    /// Ask every plugin in `plugins` for its schema, concurrently. Each
-    /// answer comes with the plugin that gave it, in the order of `plugins`.
-    pub async fn fetch_schemas<'p>(
+    /// Call `remove` for `application_id` on every plugin in priority order,
+    /// asking `may_call` before each call as [`Self::apply_all`] does.
+    pub async fn remove_all(
         &self,
-        plugins: &'p [SectionPlugin],
+        set: &PluginSet,
         caller: &CallerIdentity,
-    ) -> Vec<(&'p SectionPlugin, SchemaFetch)> {
-        futures::future::join_all(
-            plugins
-                .iter()
-                .map(|plugin| async move { (plugin, self.fetch_schema(plugin, caller).await) }),
-        )
-        .await
-    }
-}
-
-fn classify(
-    key: &str,
-    answer: Result<Result<SectionSchema, SectionPluginError>, CallFailure>,
-) -> SchemaFetch {
-    match answer {
-        Ok(Ok(schema)) => SchemaFetch::Served(schema),
-        Ok(Err(SectionPluginError::NotPermitted { detail })) => {
-            tracing::info!(
-                key,
-                call = "schema",
-                detail = cut(&detail, LOG_TEXT_MAX_BYTES),
-                "application-manager: section plugin refused the caller"
-            );
-            SchemaFetch::NotPermitted { detail }
+        operation_id: Uuid,
+        application_id: &str,
+        mut may_call: impl FnMut(&SectionPlugin) -> bool,
+    ) -> Vec<Routed> {
+        let mut routed = Vec::with_capacity(set.plugins().len());
+        for plugin in set.plugins() {
+            if !may_call(plugin) {
+                break;
+            }
+            let answer = self
+                .calls
+                .remove(plugin, caller, operation_id, application_id)
+                .await;
+            routed.push((plugin.key.clone(), answer));
         }
-        Ok(Err(err)) => {
-            tracing::warn!(
-                key,
-                call = "schema",
-                error = cut(&err.to_string(), LOG_TEXT_MAX_BYTES),
-                "application-manager: section plugin failed"
-            );
-            SchemaFetch::Unavailable(UnavailableReason::Unreachable)
-        }
-        Err(failure) => SchemaFetch::Unavailable(unanswered(key, &failure)),
+        routed
     }
-}
-
-/// Log a call that produced no plugin answer, and name its reason.
-fn unanswered(key: &str, failure: &CallFailure) -> UnavailableReason {
-    let reason = match failure {
-        CallFailure::TimedOut => UnavailableReason::TimedOut,
-        CallFailure::NotSent => UnavailableReason::NotSent,
-        CallFailure::Panicked(_) => UnavailableReason::Unreachable,
-    };
-    if let CallFailure::Panicked(message) = failure {
-        tracing::error!(
-            key,
-            call = "schema",
-            panic = cut(message, LOG_TEXT_MAX_BYTES),
-            "application-manager: section plugin call panicked"
-        );
-    } else {
-        tracing::warn!(
-            key,
-            call = "schema",
-            reason = reason.as_str(),
-            "application-manager: section plugin call not answered"
-        );
-    }
-    reason
 }
 
 #[cfg(test)]

@@ -2,11 +2,9 @@
 //!
 //! Every refusal is a canonical Problem with no extension member, carrying
 //! the request id. Temporarily unavailable carries
-//! [`REFUSAL_RETRY_AFTER_SECONDS`] and, for a section schema, every unavailable
-//! key with its reason; not permitted names the action, or the section and
-//! the plugin's detail. An unknown section key is not found. The
-//! permission-denied builder fixes the Problem `detail`, so the request id and
-//! action go in its `reason`.
+//! [`REFUSAL_RETRY_AFTER_SECONDS`]; not permitted names the action; an unknown
+//! section key is not found. The permission-denied builder fixes the Problem
+//! `detail`, so the request id and action go in its `reason`.
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use uuid::Uuid;
@@ -35,17 +33,6 @@ pub fn to_canonical(err: &DomainError, request_id: Uuid) -> CanonicalError {
                 .with_resource("section_key")
                 .create()
         }
-        DomainError::SchemaUnavailable { items } => {
-            let listed = items
-                .iter()
-                .map(|i| format!("{} ({})", i.key, i.reason))
-                .collect::<Vec<_>>()
-                .join(", ");
-            unavailable(request_id, &format!("section schema unavailable: {listed}"))
-        }
-        DomainError::SectionNotPermitted { key, detail } => ApplicationError::permission_denied()
-            .with_reason(format!("request {request_id}: section {key}: {detail}"))
-            .create(),
     }
 }
 

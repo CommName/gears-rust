@@ -16,8 +16,16 @@ fn inventory_schema(type_id: &str) -> serde_json::Value {
 }
 
 #[test]
-fn gts_inventory_holds_section_base_type() {
-    inventory_schema(SECTION_TYPE_ID);
+fn gts_inventory_holds_an_open_abstract_section_base_type() {
+    assert_eq!(SECTION_BASE_TYPE, SECTION_TYPE_ID);
+    let schema = inventory_schema(SECTION_TYPE_ID);
+    assert_eq!(schema, section_base_type_schema());
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["x-gts-abstract"], true);
+    assert!(
+        schema.get("additionalProperties").is_none(),
+        "a closed base refuses every derived member: {schema}"
+    );
 }
 
 #[test]

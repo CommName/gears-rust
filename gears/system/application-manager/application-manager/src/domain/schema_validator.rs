@@ -3,30 +3,27 @@
 //! Owns the envelope schema and the one composition rule that seed validation
 //! and the discovery combined schema share: each section schema is placed
 //! under its key with the `$id` `urn:cf:application-manager:section:<key>`.
-//! Served schemas are untrusted input; one that cannot be used safely is
-//! `unusable`. No compiled section schema outlives the read or operation that
-//! prepared it, and no problem message contains a manifest value.
+//! Each registered section schema is compiled once at `start`, as JSON Schema
+//! Draft-07, and kept in memory until the next start. One that refers outside
+//! its own document or does not compile is `unusable` and fails startup. No
+//! problem message contains a manifest value.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::io;
 use std::iter;
 use std::sync::Arc;
 
-use application_manager_sdk::{
-    SCHEMA_VERSION_MAX_BYTES, SERVED_SCHEMA_MAX_BYTES, SERVED_SCHEMA_MAX_DEPTH, SectionSchema,
-};
 use jsonschema::{PatternOptions, Retrieve, Uri, Validator};
 use serde_json::{Map, Value, json};
 use toolkit_macros::domain_model;
 
 use crate::constants::{
     PROBLEM_LOCATION_MAX_BYTES, PROBLEMS_MAX, SCHEMA_EVALUATION_PATHS_MAX, SCHEMA_REF_CHAIN_MAX,
-    UTF8_MAX_CHAR_BYTES, cut,
+    SCHEMA_REGEX_DFA_SIZE_LIMIT, SCHEMA_REGEX_SIZE_LIMIT, cut,
 };
 
-/// The only dialect a served schema may declare.
-pub const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+/// The dialect of every section schema and of the combined schema.
+pub const DIALECT: &str = "http://json-schema.org/draft-07/schema#";
 
 /// Prefix of the `$id` a section schema is composed under.
 pub const SECTION_ID_PREFIX: &str = "urn:cf:application-manager:section:";
@@ -41,29 +38,29 @@ pub const UNKNOWN_SECTION: &str = "unknown_section";
 /// U+001F and U+007F to U+009F), as an ECMA-262 and `regex` pattern.
 const NO_CONTROL_CHARACTER: &str = r"^[^\u0000-\u001F\u007F-\u009F]*$";
 
-/// Draft 2020-12 keywords whose value is one subschema.
-const SUBSCHEMA_KEYWORDS: [&str; 11] = [
+/// Draft-07 keywords whose value is one subschema. `items` is one subschema
+/// only when it is not an array.
+const SUBSCHEMA_KEYWORDS: [&str; 9] = [
+    "additionalItems",
     "additionalProperties",
     "contains",
-    "contentSchema",
     "else",
     "if",
     "items",
     "not",
     "propertyNames",
     "then",
-    "unevaluatedItems",
-    "unevaluatedProperties",
 ];
 
-/// Draft 2020-12 keywords whose value is an array of subschemas.
-const SUBSCHEMA_ARRAY_KEYWORDS: [&str; 4] = ["allOf", "anyOf", "oneOf", "prefixItems"];
+/// Draft-07 keywords whose value is an array of subschemas. `items` is one
+/// only when it is an array.
+const SUBSCHEMA_ARRAY_KEYWORDS: [&str; 4] = ["allOf", "anyOf", "items", "oneOf"];
 
-/// Keywords whose value maps names to subschemas.
-const SUBSCHEMA_MAP_KEYWORDS: [&str; 5] = [
-    "$defs",
+/// Draft-07 keywords whose value maps names to subschemas. A `dependencies`
+/// member that is an array of property names is not a subschema.
+const SUBSCHEMA_MAP_KEYWORDS: [&str; 4] = [
     "definitions",
-    "dependentSchemas",
+    "dependencies",
     "patternProperties",
     "properties",
 ];
@@ -97,40 +94,37 @@ impl Problem {
     }
 }
 
-/// Why a served schema is `unusable`, in check order.
+/// Why a registered section schema is `unusable`, in check order.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnusableCause {
-    /// Larger than `SERVED_SCHEMA_MAX_BYTES` once serialized, nested deeper
-    /// than `SERVED_SCHEMA_MAX_DEPTH`, allowing more than
-    /// `SCHEMA_EVALUATION_PATHS_MAX` evaluation paths, or with a chain of more
-    /// than `SCHEMA_REF_CHAIN_MAX` references. A schema that reaches itself
-    /// through `$ref` or `$dynamicRef` (a recursive schema) has no bound on
-    /// its evaluation paths and is also `TooLarge`.
-    TooLarge,
-    /// The schema version is not 1 to `SCHEMA_VERSION_MAX_BYTES` bytes.
-    BadSchemaVersion,
-    /// Not a schema of the Draft 2020-12 dialect.
-    OtherDialect,
-    /// A reference to anything but a subschema of the served document.
+    /// A `$ref` at the root: Draft-07 ignores its siblings, so the composed
+    /// `$id` would not apply.
+    RootRef,
+    /// A reference to anything but a subschema of the schema's own document.
     ExternalRef,
-    /// A subschema with its own `$id`, which would add a second resource to
-    /// the combined schema.
+    /// A subschema with its own non-fragment `$id`, which would start a second
+    /// resource that the reference check never saw.
     EmbeddedResource,
-    /// The schema does not compile.
+    /// More than `SCHEMA_EVALUATION_PATHS_MAX` evaluation paths, or a chain of
+    /// more than `SCHEMA_REF_CHAIN_MAX` references. A schema that reaches
+    /// itself through `$ref` has no bound on its evaluation paths and is also
+    /// `TooComplex`.
+    TooComplex,
+    /// Not an object or boolean schema, or it does not compile, including a
+    /// pattern over the regex limits.
     CompileFailed,
 }
 
 impl UnusableCause {
-    /// The cause as written to logs.
+    /// The cause as written to logs and startup failures.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::TooLarge => "too_large",
-            Self::BadSchemaVersion => "bad_schema_version",
-            Self::OtherDialect => "other_dialect",
+            Self::RootRef => "root_ref",
             Self::ExternalRef => "external_ref",
             Self::EmbeddedResource => "embedded_resource",
+            Self::TooComplex => "too_complex",
             Self::CompileFailed => "compile_failed",
         }
     }
@@ -142,48 +136,43 @@ impl fmt::Display for UnusableCause {
     }
 }
 
-/// A usable section schema, composed under its key and compiled, for one read
-/// or operation. The parts cannot change after compilation, so the schema
-/// published and the schema validated are always the same.
+/// A section schema composed under its key and compiled once at `start`. The
+/// parts cannot change after compilation, so the schema published and the
+/// schema validated are always the same.
 #[domain_model]
-pub struct PreparedSection {
+pub struct CompiledSection {
     key: String,
+    section_type: String,
     schema: Value,
-    schema_version: String,
     validator: Validator,
 }
 
-impl PreparedSection {
+impl CompiledSection {
     /// The section key.
     #[must_use]
     pub fn key(&self) -> &str {
         &self.key
     }
 
-    /// The served schema composed under the key ([`compose_section`]).
+    /// The exact GTS id of the section type.
+    #[must_use]
+    pub fn section_type(&self) -> &str {
+        &self.section_type
+    }
+
+    /// The section type's schema composed under the key
+    /// ([`compose_section`]).
     #[must_use]
     pub fn schema(&self) -> &Value {
         &self.schema
     }
-
-    /// The schema version, as served.
-    #[must_use]
-    pub fn schema_version(&self) -> &str {
-        &self.schema_version
-    }
-
-    /// The key, the composed schema, and the schema version.
-    #[must_use]
-    pub fn into_parts(self) -> (String, Value, String) {
-        (self.key, self.schema, self.schema_version)
-    }
 }
 
-impl fmt::Debug for PreparedSection {
+impl fmt::Debug for CompiledSection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PreparedSection")
+        f.debug_struct("CompiledSection")
             .field("key", &self.key)
-            .field("schema_version", &self.schema_version)
+            .field("section_type", &self.section_type)
             .finish_non_exhaustive()
     }
 }
@@ -224,11 +213,10 @@ impl SchemaValidator {
     /// # Errors
     /// [`EnvelopeSchemaError`] when the envelope schema does not compile.
     pub fn new(max_envelope_text_length: u32) -> Result<Self, EnvelopeSchemaError> {
-        // Published: a character limit any text within which fits the byte
-        // limit. Checked: the byte limit itself, in `check_envelope`.
-        let envelope_schema = envelope(Some(
-            max_envelope_text_length.div_euclid(UTF8_MAX_CHAR_BYTES),
-        ));
+        // Published: the same number as a character limit, which JSON Schema
+        // can express; a text within it may still be longer in bytes.
+        // Checked: the byte limit itself, in `check_envelope`.
+        let envelope_schema = envelope(Some(max_envelope_text_length));
         let shape = manifest_schema(&envelope(None), &Value::Bool(true));
         let manifest_shape = compile(&shape).map_err(|e| EnvelopeSchemaError(e.to_string()))?;
         Ok(Self {
@@ -239,8 +227,7 @@ impl SchemaValidator {
     }
 
     /// The published envelope schema: `application` with exactly `id` and
-    /// `version`, each short enough in characters to be within the byte
-    /// limit.
+    /// `version`, each at most `max_envelope_text_length` characters.
     #[must_use]
     pub fn envelope_schema(&self) -> &Value {
         &self.envelope_schema
@@ -268,13 +255,12 @@ impl SchemaValidator {
     /// The combined schema of a whole manifest: the envelope schema and every
     /// section schema in `sections`, each required, and no other section.
     #[must_use]
-    pub fn combined_schema(&self, sections: Vec<PreparedSection>) -> Value {
+    pub fn combined_schema(&self, sections: &[Arc<CompiledSection>]) -> Value {
         let mut required = Vec::with_capacity(sections.len());
         let mut properties = Map::with_capacity(sections.len());
         for section in sections {
-            let (key, schema, _) = section.into_parts();
-            required.push(Value::String(key.clone()));
-            properties.insert(key, schema);
+            required.push(Value::String(section.key.clone()));
+            properties.insert(section.key.clone(), section.schema.clone());
         }
         let sections_schema = json!({
             "type": "object",
@@ -316,12 +302,14 @@ fn manifest_schema(application: &Value, sections: &Value) -> Value {
 }
 
 /// The one composition rule: `schema` placed under `key`, with the `$id`
-/// `urn:cf:application-manager:section:<key>` replacing any served `$id`.
+/// `urn:cf:application-manager:section:<key>` replacing the registered `$id`,
+/// and no `$schema` of its own.
 #[must_use]
 pub fn compose_section(key: &str, schema: Value) -> Value {
     let id = Value::String(format!("{SECTION_ID_PREFIX}{key}"));
     match schema {
         Value::Object(mut members) => {
+            members.remove("$schema");
             members.insert("$id".to_owned(), id);
             Value::Object(members)
         }
@@ -329,119 +317,89 @@ pub fn compose_section(key: &str, schema: Value) -> Value {
     }
 }
 
-/// Check, compose, and compile the schema `key` served, all off the async
-/// executor.
+/// Check, compose, and compile the registered schema of `section_type`, whose
+/// key is `key`. Blocking: the caller runs it off the async executor.
 ///
 /// # Errors
 /// The [`UnusableCause`] of the first failed check.
-pub async fn prepare_section(
+pub fn compile_section(
     key: &str,
-    served: SectionSchema,
-) -> Result<PreparedSection, UnusableCause> {
-    let SectionSchema {
-        schema,
-        schema_version,
-        ..
-    } = served;
-    let owned_key = key.to_owned();
-    match tokio::task::spawn_blocking(move || prepare_blocking(owned_key, schema, schema_version))
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(e) => {
-            // The panic payload may quote the schema, so only its kind is logged.
-            tracing::error!(
-                key,
-                panicked = e.is_panic(),
-                "application-manager: section schema preparation aborted"
-            );
-            Err(UnusableCause::CompileFailed)
-        }
-    }
-}
-
-fn prepare_blocking(
-    key: String,
-    schema: Value,
-    schema_version: String,
-) -> Result<PreparedSection, UnusableCause> {
-    check_served(&schema, &schema_version)?;
-    let schema = compose_section(&key, schema);
+    section_type: &str,
+    schema: &Value,
+) -> Result<CompiledSection, UnusableCause> {
+    check_registered(schema)?;
+    let schema = compose_section(key, schema.clone());
     let validator = compile(&schema).map_err(|_| UnusableCause::CompileFailed)?;
-    Ok(PreparedSection {
-        key,
+    Ok(CompiledSection {
+        key: key.to_owned(),
+        section_type: section_type.to_owned(),
         schema,
-        schema_version,
         validator,
     })
 }
 
 /// The checks before compilation, in order.
-fn check_served(schema: &Value, schema_version: &str) -> Result<(), UnusableCause> {
-    if !within_depth(schema, SERVED_SCHEMA_MAX_DEPTH) || !fits(schema, SERVED_SCHEMA_MAX_BYTES) {
-        return Err(UnusableCause::TooLarge);
-    }
-    if schema_version.is_empty() || schema_version.len() > SCHEMA_VERSION_MAX_BYTES {
-        return Err(UnusableCause::BadSchemaVersion);
+fn check_registered(schema: &Value) -> Result<(), UnusableCause> {
+    let Some(root) = schema.as_object() else {
+        return if schema.is_boolean() {
+            Ok(())
+        } else {
+            Err(UnusableCause::CompileFailed)
+        };
+    };
+    if root.contains_key("$ref") {
+        return Err(UnusableCause::RootRef);
     }
     let walk = Subschemas::of(schema);
-    if !(schema.is_object() || schema.is_boolean())
-        || walk.objects.iter().any(|(_, members)| {
-            members
-                .get("$schema")
-                .is_some_and(|dialect| !is_dialect(dialect))
-        })
-    {
-        return Err(UnusableCause::OtherDialect);
-    }
     if walk.objects.iter().any(|(_, members)| {
-        REF_KEYWORDS.iter().any(|keyword| {
-            members
-                .get(*keyword)
-                .is_some_and(|target| walk.resolve(target).is_none())
-        })
+        members
+            .get("$ref")
+            .is_some_and(|target| walk.resolve(target).is_none())
     }) {
         return Err(UnusableCause::ExternalRef);
     }
-    if walk
-        .objects
-        .iter()
-        .any(|(depth, members)| *depth > 0 && members.contains_key("$id"))
-    {
+    if walk.objects.iter().any(|(depth, members)| {
+        *depth > 0
+            && members
+                .get("$id")
+                .is_some_and(|id| !id.as_str().is_some_and(|id| id.starts_with('#')))
+    }) {
         return Err(UnusableCause::EmbeddedResource);
     }
     walk.check_evaluation()
 }
 
-/// Whether `value` names the Draft 2020-12 meta-schema.
-fn is_dialect(value: &Value) -> bool {
-    value
-        .as_str()
-        .is_some_and(|uri| uri.strip_suffix('#').unwrap_or(uri) == DIALECT)
+/// Whether `value` can be a subschema: an object or a boolean.
+fn is_schema(value: &Value) -> bool {
+    matches!(value, Value::Object(_) | Value::Bool(_))
 }
-
-/// Keywords whose value refers to another subschema.
-const REF_KEYWORDS: [&str; 2] = ["$ref", "$dynamicRef"];
 
 /// The values in subschema positions of one schema object.
 fn subschemas_of(members: &Map<String, Value>) -> impl Iterator<Item = &Value> {
     members.iter().flat_map(|(keyword, value)| {
         let keyword = keyword.as_str();
-        let found: Box<dyn Iterator<Item = &Value>> = if SUBSCHEMA_KEYWORDS.contains(&keyword) {
-            Box::new(iter::once(value))
-        } else if SUBSCHEMA_ARRAY_KEYWORDS.contains(&keyword) {
-            Box::new(value.as_array().into_iter().flatten())
-        } else if SUBSCHEMA_MAP_KEYWORDS.contains(&keyword) {
-            Box::new(value.as_object().into_iter().flat_map(Map::values))
-        } else {
-            Box::new(iter::empty())
-        };
+        let found: Box<dyn Iterator<Item = &Value>> =
+            if SUBSCHEMA_KEYWORDS.contains(&keyword) && is_schema(value) {
+                Box::new(iter::once(value))
+            } else if SUBSCHEMA_ARRAY_KEYWORDS.contains(&keyword) {
+                Box::new(value.as_array().into_iter().flatten())
+            } else if SUBSCHEMA_MAP_KEYWORDS.contains(&keyword) {
+                Box::new(
+                    value
+                        .as_object()
+                        .into_iter()
+                        .flat_map(Map::values)
+                        .filter(|v| is_schema(v)),
+                )
+            } else {
+                Box::new(iter::empty())
+            };
         found
     })
 }
 
-/// The subschemas of a served schema: the root and every value in a
-/// subschema position of Draft 2020-12. Annotation and data keywords such as
+/// The subschemas of a registered schema: the root and every value in a
+/// Draft-07 subschema position. Annotation and data keywords such as
 /// `default` or `examples` are not schemas and are skipped, while property
 /// names are never mistaken for keywords. Nothing is copied out of the
 /// document: references are resolved on demand.
@@ -449,7 +407,7 @@ struct Subschemas<'a> {
     root: &'a Value,
     /// Each object subschema with its depth below the root.
     objects: Vec<(usize, &'a Map<String, Value>)>,
-    /// The subschema each `$anchor` or `$dynamicAnchor` names.
+    /// The subschema each fragment-only `$id` (`#name`) names.
     anchors: HashMap<&'a str, &'a Value>,
 }
 
@@ -467,10 +425,13 @@ impl<'a> Subschemas<'a> {
             };
             let below = depth.saturating_add(1);
             pending.extend(subschemas_of(members).map(|child| (child, below)));
-            for keyword in ["$anchor", "$dynamicAnchor"] {
-                if let Some(name) = members.get(keyword).and_then(Value::as_str) {
-                    walk.anchors.entry(name).or_insert(value);
-                }
+            if let Some(name) = members
+                .get("$id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.strip_prefix('#'))
+                .filter(|name| !name.is_empty())
+            {
+                walk.anchors.entry(name).or_insert(value);
             }
             walk.objects.push((depth, members));
         }
@@ -504,7 +465,7 @@ impl<'a> Subschemas<'a> {
         let mut current = self.root;
         while let Some(keyword) = tokens.next() {
             let member = current.as_object()?.get(&keyword)?;
-            current = if SUBSCHEMA_KEYWORDS.contains(&keyword.as_str()) {
+            current = if SUBSCHEMA_KEYWORDS.contains(&keyword.as_str()) && is_schema(member) {
                 member
             } else if SUBSCHEMA_ARRAY_KEYWORDS.contains(&keyword.as_str()) {
                 member.as_array()?.get(array_index(&tokens.next()?)?)?
@@ -514,7 +475,7 @@ impl<'a> Subschemas<'a> {
                 return None;
             };
         }
-        matches!(current, Value::Object(_) | Value::Bool(_)).then_some(current)
+        is_schema(current).then_some(current)
     }
 
     /// Reject a schema whose evaluation paths or reference chains exceed the
@@ -538,12 +499,12 @@ impl<'a> Subschemas<'a> {
                 } else if active.insert(key) {
                     stack.push(self.frame(edge.target, edge.hops));
                 } else {
-                    return Err(UnusableCause::TooLarge);
+                    return Err(UnusableCause::TooComplex);
                 }
             } else {
-                let frame = stack.pop().ok_or(UnusableCause::TooLarge)?;
+                let frame = stack.pop().ok_or(UnusableCause::TooComplex)?;
                 if frame.paths > SCHEMA_EVALUATION_PATHS_MAX || frame.chain > SCHEMA_REF_CHAIN_MAX {
-                    return Err(UnusableCause::TooLarge);
+                    return Err(UnusableCause::TooComplex);
                 }
                 let key: *const Map<String, Value> = frame.node;
                 active.remove(&key);
@@ -568,10 +529,8 @@ impl<'a> Subschemas<'a> {
             chain: 0,
         };
         for (value, hops) in subschemas_of(node).map(|v| (v, 0)).chain(
-            REF_KEYWORDS
-                .iter()
-                .filter_map(|keyword| node.get(*keyword))
-                .filter_map(|target| self.resolve(target))
+            node.get("$ref")
+                .and_then(|target| self.resolve(target))
                 .map(|target| (target, 1)),
         ) {
             match value {
@@ -620,48 +579,7 @@ fn array_index(token: &str) -> Option<usize> {
     if valid { token.parse().ok() } else { None }
 }
 
-/// Whether `value` nests at most `max_depth` arrays and objects deep. Walks
-/// without recursion, so a hostile depth cannot exhaust the stack.
-fn within_depth(value: &Value, max_depth: usize) -> bool {
-    let mut pending = vec![(value, 0_usize)];
-    while let Some((value, depth)) = pending.pop() {
-        let children: Box<dyn Iterator<Item = &Value>> = match value {
-            Value::Array(items) => Box::new(items.iter()),
-            Value::Object(members) => Box::new(members.values()),
-            _ => continue,
-        };
-        if depth >= max_depth {
-            return false;
-        }
-        pending.extend(children.map(|child| (child, depth + 1)));
-    }
-    true
-}
-
-/// Whether `value` serializes to at most `limit` bytes. Serialization stops
-/// at the limit, so an oversized schema is never written out in full.
-fn fits(value: &Value, limit: usize) -> bool {
-    struct Counter {
-        written: usize,
-        limit: usize,
-    }
-    impl io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.written = self.written.saturating_add(buf.len());
-            if self.written > self.limit {
-                Err(io::Error::other("over the limit"))
-            } else {
-                Ok(buf.len())
-            }
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    serde_json::to_writer(&mut Counter { written: 0, limit }, value).is_ok()
-}
-
-/// Refuses every retrieval: a served schema may not refer outside itself.
+/// Refuses every retrieval: a section schema may not refer outside itself.
 struct RefuseRetriever;
 
 impl Retrieve for RefuseRetriever {
@@ -673,11 +591,15 @@ impl Retrieve for RefuseRetriever {
     }
 }
 
-/// Compile a Draft 2020-12 schema with the linear-time `regex` engine and no
-/// external retrieval.
+/// Compile a Draft-07 schema with the linear-time `regex` engine under the
+/// regex limits, and no external retrieval.
 fn compile(schema: &Value) -> Result<Validator, jsonschema::ValidationError<'static>> {
-    jsonschema::draft202012::options()
-        .with_pattern_options(PatternOptions::regex())
+    jsonschema::draft7::options()
+        .with_pattern_options(
+            PatternOptions::regex()
+                .size_limit(SCHEMA_REGEX_SIZE_LIMIT)
+                .dfa_size_limit(SCHEMA_REGEX_DFA_SIZE_LIMIT),
+        )
         .with_retriever(RefuseRetriever)
         .build(schema)
 }
@@ -708,16 +630,16 @@ fn pointer_token(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
-/// The problems of `sections` against the prepared section schemas, at most
+/// The problems of `sections` against the compiled section schemas, at most
 /// `PROBLEMS_MAX`: missing keys and each section against its schema, then
 /// unknown keys.
 #[must_use]
-pub fn section_problems(prepared: &[PreparedSection], sections: &Value) -> Vec<Problem> {
+pub fn section_problems(compiled: &[Arc<CompiledSection>], sections: &Value) -> Vec<Problem> {
     let Some(members) = sections.as_object() else {
         return vec![Problem::new("/sections".to_owned(), "type")];
     };
     let mut problems = Vec::new();
-    for section in prepared {
+    for section in compiled {
         let budget = PROBLEMS_MAX.saturating_sub(problems.len());
         if budget == 0 {
             return problems;
@@ -734,7 +656,7 @@ pub fn section_problems(prepared: &[PreparedSection], sections: &Value) -> Vec<P
         if problems.len() >= PROBLEMS_MAX {
             break;
         }
-        if !prepared.iter().any(|s| &s.key == key) {
+        if !compiled.iter().any(|s| &s.key == key) {
             problems.push(Problem::new(
                 format!("/sections/{}", pointer_token(key)),
                 UNKNOWN_SECTION,
@@ -749,10 +671,10 @@ pub fn section_problems(prepared: &[PreparedSection], sections: &Value) -> Vec<P
 /// # Errors
 /// [`ValidationAborted`] when the validation task did not finish.
 pub async fn validate_sections(
-    prepared: Arc<[PreparedSection]>,
+    compiled: Arc<[Arc<CompiledSection>]>,
     sections: Value,
 ) -> Result<Vec<Problem>, ValidationAborted> {
-    tokio::task::spawn_blocking(move || section_problems(&prepared, &sections))
+    tokio::task::spawn_blocking(move || section_problems(&compiled, &sections))
         .await
         .map_err(|_| ValidationAborted)
 }

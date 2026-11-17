@@ -16,8 +16,9 @@ use crate::api::rest::health::StartupHealthcheck;
 use crate::config::ApplicationManagerConfig;
 use crate::domain::plugin_set::StartupState;
 use crate::domain::read_service::ReadService;
+use crate::domain::schema_validator::SchemaValidator;
 use crate::infra::startup;
-use crate::sdk::{ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1};
+use crate::sdk::{ApplicationManagerSectionPluginSpecV1, SECTION_BASE_TYPE};
 
 /// The Application Manager gear.
 #[toolkit::gear(
@@ -61,7 +62,7 @@ fn ensure_sdk_types_linked() -> anyhow::Result<()> {
 /// plugin spec schemas.
 fn ensure_sdk_types_registered(registered: &[serde_json::Value]) -> anyhow::Result<()> {
     for type_id in [
-        <ApplicationManagerSectionV1 as gts::GtsSchema>::TYPE_ID,
+        SECTION_BASE_TYPE,
         <ApplicationManagerSectionPluginSpecV1 as gts::GtsSchema>::TYPE_ID,
     ] {
         let want = format!("gts://{type_id}");
@@ -114,10 +115,20 @@ impl Gear for ApplicationManager {
         );
 
         let allowed = Arc::new(config.allowed_callers());
+        let validator = SchemaValidator::new(config.max_envelope_text_length).map_err(|e| {
+            anyhow!(
+                "{}: invalid_setting: max_envelope_text_length: {e}",
+                Self::MODULE_NAME
+            )
+        })?;
         let startup = Arc::new(StartupState::default());
         let runtime = Runtime {
             hub: ctx.client_hub(),
-            read: Arc::new(ReadService::new(allowed, Arc::clone(&startup))),
+            read: Arc::new(ReadService::new(
+                allowed,
+                Arc::clone(&startup),
+                Arc::new(validator),
+            )),
             startup,
         };
         self.runtime

@@ -6,6 +6,7 @@ use serde_json::json;
 use types_registry_sdk::testing::{MockTypesRegistryClient, internal, make_test_instance};
 
 use super::*;
+use crate::domain::schema_validator::section_problems;
 use crate::test_support::{
     PluginSpec, hub_with, hub_with_registry, instance_id, section_type, type_schema,
 };
@@ -73,14 +74,19 @@ async fn plugins_are_ordered_by_priority_with_their_derived_keys() {
     let first = &set.plugins()[0];
     assert_eq!(first.instance_id, instance_id("cf.test.a.plugin.v1"));
     assert_eq!(first.section_type, section_type("cf.test.a.section.v1.2"));
-    assert_eq!(first.schema["type"], "object");
+    assert_eq!(first.section.key(), "cf.test.a.section");
+    assert_eq!(first.section.section_type(), first.section_type);
+    assert_eq!(
+        first.section.schema()["$id"],
+        "urn:cf:application-manager:section:cf.test.a.section"
+    );
     for p in &plugins {
         assert_eq!(p.client.as_ref().unwrap().calls(), 0, "no plugin call");
     }
 }
 
 #[tokio::test]
-async fn the_kept_schema_inlines_the_base_type() {
+async fn the_compiled_schema_inlines_the_open_base_type() {
     let type_id = section_type("cf.test.a.section.v1");
     let mut spec = PluginSpec::new("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1");
     spec.section_type = Some(type_schema(
@@ -91,12 +97,44 @@ async fn the_kept_schema_inlines_the_base_type() {
         }),
     ));
     let set = discover(&hub_with(&[spec])).await.unwrap();
-    let schema = &set.plugins()[0].schema;
+    let sections = set.sections();
+    let schema = sections[0].schema();
     assert_eq!(schema["properties"]["roles"]["type"], "array");
     assert!(
         !schema.to_string().contains("\"$ref\""),
         "the parent is inlined: {schema}"
     );
+    // The open base admits the section's own members.
+    let key = "cf.test.a.section";
+    assert_eq!(
+        section_problems(&sections, &json!({ key: { "roles": ["admin"] } })),
+        []
+    );
+    assert_eq!(
+        section_problems(&sections, &json!({ key: { "roles": 1 } }))[0].rule,
+        "type"
+    );
+}
+
+#[tokio::test]
+async fn unusable_section_schema_fails() {
+    let type_id = section_type("cf.test.a.section.v1");
+    for schema in [
+        json!({ "properties": { "a": { "$ref": "https://example.com/s.json" } } }),
+        json!({ "type": "integerish" }),
+        json!({ "properties": { "next": { "$ref": "#" } } }),
+    ] {
+        let mut spec = PluginSpec::new("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1");
+        spec.section_type = Some(type_schema(&type_id, schema.clone()));
+        let failure = failure_of(&[spec]).await;
+        assert_eq!(
+            failure.reason,
+            StartupReason::SectionSchemaUnusable,
+            "{schema}"
+        );
+        assert_detail_names(&failure, &["cf.test.a.plugin.v1"]);
+        assert!(failure.detail.contains(&type_id), "{:?}", failure.detail);
+    }
 }
 
 #[tokio::test]
@@ -271,12 +309,29 @@ async fn checks_run_in_design_order() {
         StartupReason::SectionTypeUnresolved
     );
 
-    // Every shape is checked before any client is resolved.
+    // Every shape is checked before any schema is compiled.
+    let mut unusable = spec("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1");
+    unusable.section_type = Some(type_schema(
+        &section_type("cf.test.a.section.v1"),
+        json!({ "type": "integerish" }),
+    ));
+    let plugins = [unusable, invalid("cf.test.b.plugin.v1", 2)];
+    assert_eq!(reason_of(&plugins).await, StartupReason::InvalidSectionType);
+
+    // Every schema is compiled before any client is resolved.
+    let mut unusable = spec("cf.test.b.plugin.v1", 2, "cf.test.b.section.v1");
+    unusable.section_type = Some(type_schema(
+        &section_type("cf.test.b.section.v1"),
+        json!({ "type": "integerish" }),
+    ));
     let plugins = [
         no_client(spec("cf.test.a.plugin.v1", 1, "cf.test.a.section.v1")),
-        invalid("cf.test.b.plugin.v1", 2),
+        unusable,
     ];
-    assert_eq!(reason_of(&plugins).await, StartupReason::InvalidSectionType);
+    assert_eq!(
+        reason_of(&plugins).await,
+        StartupReason::SectionSchemaUnusable
+    );
 
     // Every client is resolved before keys and priorities are compared.
     let plugins = [
@@ -328,6 +383,10 @@ fn reasons_use_the_design_names() {
             "section_type_unresolved",
         ),
         (StartupReason::InvalidSectionType, "invalid_section_type"),
+        (
+            StartupReason::SectionSchemaUnusable,
+            "section_schema_unusable",
+        ),
         (
             StartupReason::PluginClientUnresolved,
             "plugin_client_unresolved",

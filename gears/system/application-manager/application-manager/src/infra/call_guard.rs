@@ -12,13 +12,14 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use application_manager_sdk::{CallerIdentity, SectionPluginError, SectionSchema};
+use application_manager_sdk::{CallerIdentity, Envelope};
 use async_trait::async_trait;
 use futures::FutureExt;
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
 use crate::domain::plugin_set::SectionPlugin;
-use crate::domain::ports::{CallFailure, PluginCalls};
+use crate::domain::ports::{CallFailure, CallResult, PluginCalls};
 
 /// Why a guarded call produced no plugin answer.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -104,14 +105,35 @@ impl From<GuardError> for CallFailure {
 
 #[async_trait]
 impl PluginCalls for CallGuard {
-    async fn schema(
+    async fn apply(
         &self,
         plugin: &SectionPlugin,
         caller: &CallerIdentity,
-    ) -> Result<Result<SectionSchema, SectionPluginError>, CallFailure> {
-        self.call(&plugin.instance_id, plugin.client.schema(caller))
-            .await
-            .map_err(CallFailure::from)
+        operation_id: Uuid,
+        envelope: &Envelope,
+        section: &serde_json::Value,
+    ) -> CallResult {
+        self.call(
+            &plugin.instance_id,
+            plugin.client.apply(caller, operation_id, envelope, section),
+        )
+        .await
+        .map_err(CallFailure::from)
+    }
+
+    async fn remove(
+        &self,
+        plugin: &SectionPlugin,
+        caller: &CallerIdentity,
+        operation_id: Uuid,
+        application_id: &str,
+    ) -> CallResult {
+        self.call(
+            &plugin.instance_id,
+            plugin.client.remove(caller, operation_id, application_id),
+        )
+        .await
+        .map_err(CallFailure::from)
     }
 }
 

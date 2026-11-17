@@ -17,15 +17,31 @@ use toolkit_gts::{gts_id, gts_type_schema};
 /// ```
 ///
 /// Two versions of one section type therefore share a key.
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = true,
-    gts_abstract = true,
-    type_id = gts_id!("cf.core.application_manager.section.v1~"),
-    description = "Application Manager section base type",
-    properties = "",
-)]
-pub struct ApplicationManagerSectionV1;
+///
+/// The base is an open object with no member of its own: the derived type
+/// inlines it under `allOf`, so a closed base would refuse every member a
+/// section declares. `#[gts_type_schema]` closes every base it generates, so
+/// the schema is written here and submitted to the link-time inventory.
+pub const SECTION_BASE_TYPE: &str = gts_id!("cf.core.application_manager.section.v1~");
+
+/// The schema of [`SECTION_BASE_TYPE`]: an abstract, open object.
+#[must_use]
+pub fn section_base_type_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$id": format!("gts://{SECTION_BASE_TYPE}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Application Manager section base type",
+        "type": "object",
+        "x-gts-abstract": true
+    })
+}
+
+toolkit_gts::inventory::submit! {
+    toolkit_gts::InventoryTypeSchema {
+        type_id: SECTION_BASE_TYPE,
+        schema_fn: || section_base_type_schema().to_string(),
+    }
+}
 
 /// GTS type definition for section plugin instances.
 ///

@@ -4,9 +4,10 @@
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-use application_manager_sdk::{ApplicationManagerSectionV1, SectionPluginClientV1};
-use gts::GtsSchema;
+use application_manager_sdk::{SECTION_BASE_TYPE, SectionPluginClientV1};
 use toolkit_macros::domain_model;
+
+use crate::domain::schema_validator::CompiledSection;
 
 /// The section key of `section_type`, or `None` when the type is not derived
 /// directly from the section base type as one segment
@@ -17,8 +18,9 @@ use toolkit_macros::domain_model;
 /// gives `acme.iam.access.roles`.
 #[must_use]
 pub fn section_key_of(section_type: &str) -> Option<String> {
-    let base = <ApplicationManagerSectionV1 as GtsSchema>::TYPE_ID;
-    let segment = section_type.strip_prefix(base)?.strip_suffix('~')?;
+    let segment = section_type
+        .strip_prefix(SECTION_BASE_TYPE)?
+        .strip_suffix('~')?;
     if segment.contains('~') {
         return None;
     }
@@ -58,9 +60,9 @@ pub struct SectionPlugin {
     pub instance_id: String,
     /// Its scoped `ClientHub` client.
     pub client: Arc<dyn SectionPluginClientV1>,
-    /// The section type's schema, as the types registry resolved it at
-    /// startup, with its parent inlined.
-    pub schema: serde_json::Value,
+    /// The section type's schema, composed under the key and compiled at
+    /// startup.
+    pub section: Arc<CompiledSection>,
 }
 
 impl fmt::Debug for SectionPlugin {
@@ -99,6 +101,21 @@ impl PluginSet {
     #[must_use]
     pub fn keys(&self) -> Vec<String> {
         self.plugins.iter().map(|p| p.key.clone()).collect()
+    }
+
+    /// The compiled section schemas in priority order.
+    #[must_use]
+    pub fn sections(&self) -> Vec<Arc<CompiledSection>> {
+        self.plugins
+            .iter()
+            .map(|p| Arc::clone(&p.section))
+            .collect()
+    }
+
+    /// The plugin owning `key`, if any.
+    #[must_use]
+    pub fn plugin(&self, key: &str) -> Option<&SectionPlugin> {
+        self.plugins.iter().find(|p| p.key == key)
     }
 }
 

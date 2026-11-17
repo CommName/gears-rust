@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use application_manager_sdk::{CallerIdentity, SectionSchema};
+use application_manager_sdk::{CallerIdentity, Envelope};
 use tokio::sync::oneshot;
 
 use super::*;
-use crate::test_support::{FakePlugin, KeyAnswer, SchemaAnswer, ctx, section};
+use crate::test_support::{Answer, FakePlugin, platform_ctx, section_plugin};
 
 const LIMIT: Duration = Duration::from_secs(10);
 const PLUGIN: &str = "plugin-a";
@@ -186,20 +186,68 @@ fn guard_errors_map_to_call_failures() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn schema_calls_go_through_the_guard() {
-    let caller = CallerIdentity::from_security_context(&ctx());
+async fn apply_and_remove_go_through_the_guard() {
+    let caller = CallerIdentity::from_platform_context(&platform_ctx("app-seeder"));
+    let envelope = Envelope {
+        id: "app".to_owned(),
+        version: "1".to_owned(),
+    };
+    let operation = Uuid::from_u128(9);
     let guard = CallGuard::new(LIMIT, 1);
-    let serving = FakePlugin::serving(
-        KeyAnswer::Key("unused"),
-        SchemaAnswer::serve(serde_json::json!({}), "7"),
-    );
-    let answer = guard.schema(&section("a", 1, &serving), &caller).await;
+
+    let rejecting = FakePlugin::answering(Answer::Rejected);
+    let plugin = section_plugin("a", 1, &rejecting);
+    let answer = guard
+        .apply(
+            &plugin,
+            &caller,
+            operation,
+            &envelope,
+            &serde_json::json!({}),
+        )
+        .await;
+    assert!(matches!(
+        answer,
+        Ok(Err(
+            application_manager_sdk::SectionPluginError::Rejected { .. }
+        ))
+    ));
     assert_eq!(
-        answer.unwrap().unwrap(),
-        SectionSchema::new(serde_json::json!({}), "7")
+        guard
+            .remove(&plugin, &caller, operation, "app")
+            .await
+            .ok()
+            .map(|r| r.is_err()),
+        Some(true)
+    );
+    let seen = rejecting.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            ("apply", operation, caller.clone()),
+            ("remove", operation, caller.clone())
+        ]
     );
 
-    let hanging = FakePlugin::serving(KeyAnswer::Key("unused"), SchemaAnswer::Hang);
-    let answer = guard.schema(&section("b", 2, &hanging), &caller).await;
+    let hanging = FakePlugin::answering(Answer::Hang);
+    let started = tokio::time::Instant::now();
+    let answer = guard
+        .remove(&section_plugin("b", 2, &hanging), &caller, operation, "app")
+        .await;
     assert_eq!(answer.unwrap_err(), CallFailure::TimedOut);
+    assert_eq!(started.elapsed(), LIMIT);
+
+    let panicking = FakePlugin::answering(Answer::Panic);
+    let answer = guard
+        .remove(
+            &section_plugin("c", 3, &panicking),
+            &caller,
+            operation,
+            "app",
+        )
+        .await;
+    assert_eq!(
+        answer.unwrap_err(),
+        CallFailure::Panicked("plugin panicked".to_owned())
+    );
 }

@@ -11,12 +11,24 @@ use crate::domain::actions::CallerAction;
 use crate::domain::allowed_callers::{AllowedCallers, identity_fields};
 use crate::domain::error::DomainError;
 use crate::domain::plugin_set::StartupState;
+use crate::domain::schema_validator::{CompiledSection, SchemaValidator};
 
-/// Serves the discovery reads.
+/// The combined schema of a whole manifest with every section type.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManifestSchema {
+    /// The envelope and one required section per key (Draft-07).
+    pub schema: serde_json::Value,
+    /// Each section key with its exact section type, in priority order.
+    pub sections: Vec<(String, String)>,
+}
+
+/// Serves the discovery reads, from memory.
 #[domain_model]
 pub struct ReadService {
     allowed: Arc<AllowedCallers>,
     startup: Arc<StartupState>,
+    validator: Arc<SchemaValidator>,
 }
 
 impl fmt::Debug for ReadService {
@@ -30,8 +42,16 @@ impl fmt::Debug for ReadService {
 impl ReadService {
     /// A read service over the startup result.
     #[must_use]
-    pub fn new(allowed: Arc<AllowedCallers>, startup: Arc<StartupState>) -> Self {
-        Self { allowed, startup }
+    pub fn new(
+        allowed: Arc<AllowedCallers>,
+        startup: Arc<StartupState>,
+        validator: Arc<SchemaValidator>,
+    ) -> Self {
+        Self {
+            allowed,
+            startup,
+            validator,
+        }
     }
 
     /// The section keys in priority order, from memory, when the allowed
@@ -47,6 +67,46 @@ impl ReadService {
         let set = self.startup.plugin_set().ok_or(DomainError::NotReady)?;
         self.check(ctx, CallerAction::ReadSchema)?;
         Ok(set.keys())
+    }
+
+    /// One section schema, composed under its key, with its section type,
+    /// when the allowed callers grant `read_schema`. Calls no section plugin.
+    ///
+    /// # Errors
+    /// [`DomainError::NotReady`] before startup ends, with no caller check;
+    /// [`DomainError::NotPermitted`] when the caller is not allowed;
+    /// [`DomainError::UnknownSectionKey`] when no plugin owns `key`.
+    pub fn section_schema(
+        &self,
+        ctx: &PlatformSecurityContext,
+        key: &str,
+    ) -> Result<Arc<CompiledSection>, DomainError> {
+        let set = self.startup.plugin_set().ok_or(DomainError::NotReady)?;
+        self.check(ctx, CallerAction::ReadSchema)?;
+        set.plugin(key)
+            .map(|p| Arc::clone(&p.section))
+            .ok_or(DomainError::UnknownSectionKey)
+    }
+
+    /// The combined schema with every section type, when the allowed callers
+    /// grant `read_schema`. Calls no section plugin.
+    ///
+    /// # Errors
+    /// As [`Self::list_section_keys`].
+    pub fn manifest_schema(
+        &self,
+        ctx: &PlatformSecurityContext,
+    ) -> Result<ManifestSchema, DomainError> {
+        let set = self.startup.plugin_set().ok_or(DomainError::NotReady)?;
+        self.check(ctx, CallerAction::ReadSchema)?;
+        let sections = set.sections();
+        Ok(ManifestSchema {
+            schema: self.validator.combined_schema(&sections),
+            sections: sections
+                .iter()
+                .map(|s| (s.key().to_owned(), s.section_type().to_owned()))
+                .collect(),
+        })
     }
 
     fn check(

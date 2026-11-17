@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use application_manager_sdk::{
-    ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1, CallerIdentity, Envelope,
+    ApplicationManagerSectionPluginSpecV1, CallerIdentity, Envelope, SECTION_BASE_TYPE,
     SectionPluginClientV1, SectionPluginError,
 };
 use async_trait::async_trait;
@@ -47,6 +47,7 @@ use uuid::Uuid;
 use crate::domain::actions::CallerAction;
 use crate::domain::allowed_callers::{AllowedCallers, CallerPattern};
 use crate::domain::plugin_set::SectionPlugin;
+use crate::domain::schema_validator::compile_section;
 
 /// The namespace of every test service account.
 pub const NAMESPACE: &str = "deploy";
@@ -72,19 +73,68 @@ pub fn allowed_callers(name: &str, actions: Vec<CallerAction>) -> AllowedCallers
     )])
 }
 
-/// A section plugin that counts every call.
-#[derive(Default)]
+/// How a [`FakePlugin`] answers `apply` and `remove`.
+#[derive(Clone, Debug)]
+pub enum Answer {
+    Ok,
+    Rejected,
+    NotPermitted,
+    Internal,
+    Panic,
+    Hang,
+}
+
+/// A section plugin that answers every call alike and records each call as
+/// `(call, operation id, caller)`.
 pub struct FakePlugin {
+    answer: Answer,
     pub calls: AtomicUsize,
+    pub seen: std::sync::Mutex<Vec<(&'static str, Uuid, CallerIdentity)>>,
 }
 
 impl FakePlugin {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::answering(Answer::Ok)
+    }
+
+    pub fn answering(answer: Answer) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            calls: AtomicUsize::new(0),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
     }
 
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    async fn answer(
+        &self,
+        call: &'static str,
+        caller: &CallerIdentity,
+        operation_id: Uuid,
+    ) -> Result<(), SectionPluginError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen
+            .lock()
+            .expect("lock")
+            .push((call, operation_id, caller.clone()));
+        match &self.answer {
+            Answer::Ok => Ok(()),
+            Answer::Rejected => Err(SectionPluginError::Rejected {
+                detail: "bad".to_owned(),
+                location: Some("/a".to_owned()),
+            }),
+            Answer::NotPermitted => Err(SectionPluginError::NotPermitted {
+                detail: "no".to_owned(),
+            }),
+            Answer::Internal => Err(SectionPluginError::Internal {
+                message: "broken".to_owned(),
+            }),
+            Answer::Panic => panic!("plugin panicked"),
+            Answer::Hang => std::future::pending().await,
+        }
     }
 }
 
@@ -92,41 +142,42 @@ impl FakePlugin {
 impl SectionPluginClientV1 for FakePlugin {
     async fn apply(
         &self,
-        _caller: &CallerIdentity,
-        _operation_id: Uuid,
+        caller: &CallerIdentity,
+        operation_id: Uuid,
         _envelope: &Envelope,
         _section: &Value,
     ) -> Result<(), SectionPluginError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        self.answer("apply", caller, operation_id).await
     }
 
     async fn remove(
         &self,
-        _caller: &CallerIdentity,
-        _operation_id: Uuid,
+        caller: &CallerIdentity,
+        operation_id: Uuid,
         _application_id: &str,
     ) -> Result<(), SectionPluginError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        self.answer("remove", caller, operation_id).await
     }
 }
 
 /// A [`SectionPlugin`] with section key `key`, as startup would build it.
 pub fn section_plugin(key: &str, priority: i16, client: &Arc<FakePlugin>) -> SectionPlugin {
+    let section_type = format!("{}{key}.v1~", base_type_id());
+    let section = compile_section(key, &section_type, &json!({ "type": "object" }))
+        .expect("an object schema compiles");
     SectionPlugin {
         key: key.to_owned(),
-        section_type: format!("{}{key}.v1~", base_type_id()),
+        section_type,
         priority,
         instance_id: format!("id-{key}"),
         client: client.clone(),
-        schema: json!({ "type": "object" }),
+        section: Arc::new(section),
     }
 }
 
 /// The GTS id of the section base type.
 pub fn base_type_id() -> &'static str {
-    <ApplicationManagerSectionV1 as GtsSchema>::TYPE_ID
+    SECTION_BASE_TYPE
 }
 
 /// The section type id derived from the base type by `segment`.
@@ -164,7 +215,7 @@ pub fn type_schema(type_id: &str, schema: Value) -> GtsTypeSchema {
     let base = Arc::new(
         GtsTypeSchema::try_new(
             GtsTypeId::new(base_type_id()),
-            json!({ "type": "object" }),
+            application_manager_sdk::section_base_type_schema(),
             None,
             None,
         )
