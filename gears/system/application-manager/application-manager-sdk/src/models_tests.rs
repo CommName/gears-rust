@@ -67,8 +67,3 @@ fn envelope_serializes_as_id_and_version() {
         json!({"id": "app", "version": "1.0"})
     );
 }
-
-ASDFADSF
-AFDSADF
-
-ASDFADS

@@ -1,10 +1,12 @@
 //! Models passed to section plugins.
 
 use serde::{Deserialize, Serialize};
+use toolkit_macros::domain_model;
 use toolkit_security::{PlatformIdentity, PlatformSecurityContext};
 
 /// The caller as a plugin sees it: the validated platform identity. It holds
 /// no credential.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerIdentity(PlatformIdentity);
 
@@ -23,6 +25,7 @@ impl CallerIdentity {
 }
 
 /// The manifest's `application` object; the content is opaque to the gear.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     /// Application id.
