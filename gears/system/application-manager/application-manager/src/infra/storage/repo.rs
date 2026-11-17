@@ -1,20 +1,25 @@
 //! Operation repository over `SeaORM`: every step and transaction of DESIGN
-//! 3.6, each bounded by `storage_call_timeout`.
+//! 3.6 and 3.7, each bounded by `storage_call_timeout`.
 //!
 //! # Security boundary
 //!
-//! Both tables are internal bookkeeping with no tenant column (ADR 0005), so
-//! their entities are `#[secure(unrestricted)]` and every statement goes
-//! through `secure()` with `AccessScope::allow_all()`. Raw SQL appears only in
-//! the migration.
+//! The three tables are internal bookkeeping with no tenant column (ADR
+//! 0004), so their entities are `#[secure(unrestricted)]` and every statement
+//! goes through `secure()` with `AccessScope::allow_all()`. Raw SQL appears
+//! only in the migration; the database clock is read through a secure
+//! projection ([`db_now`]).
 //!
-//! # Status guard (D9)
+//! # Database time and the status guard
 //!
-//! A write to an operation matches only a record whose status is `accepted`
-//! or `running` and whose `run_deadline` is after the call's `now`. The
-//! interruption step matches the opposite deadline. A guarded update that
-//! changes no row is [`StorageError::OperationFinal`]: the first final write
-//! wins, and a transaction that fails its guard has written nothing.
+//! Every call reads the database time once, first, and uses it for every
+//! guard and timestamp it writes (DESIGN 3.1 "Status guard"). A write to an
+//! operation matches only a record whose status is `accepted` or `running`
+//! and whose `run_deadline` is after that time; the expiry completion matches
+//! the opposite deadline. A guarded update that changes no row is
+//! [`StorageError::OperationFinal`]: the first final write wins, and a
+//! transaction that fails its guard has written nothing. A read-modify-write
+//! of the report locks its row first on `PostgreSQL` and `MySQL`; `SQLite`
+//! serialises writers.
 //!
 //! # Transactions and contention
 //!
@@ -38,14 +43,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use application_manager_sdk::{OutcomeReport, RequestCategory};
+use application_manager_sdk::{
+    OperationAction, OutcomeReport, RequestCategory, SectionOutcome, SectionOutcomeEntry,
+};
 use async_trait::async_trait;
-use sea_orm::sea_query::{Expr, Func, InsertStatement, SimpleExpr};
+use sea_orm::sea_query::{Expr, InsertStatement, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, Condition, ConnAcquireErr, DbBackend, DbErr,
-    EntityName, EntityTrait, Insert, Iterable, Order, QueryFilter, QueryTrait, SqlErr, Value,
+    EntityName, EntityTrait, FromQueryResult, Insert, Iterable, Order, QueryFilter, QuerySelect,
+    QueryTrait, SqlErr, Value,
 };
-use time::OffsetDateTime;
+use time::{OffsetDateTime, PrimitiveDateTime};
 use toolkit_db::secure::{
     DBRunner, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
@@ -54,13 +62,19 @@ use toolkit_db::{DBProvider, DbError, DbTx, contention::is_retryable_contention}
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use super::entity::{audit_event, operation};
+use super::entity::{application, history_event, operation};
 use super::mapping::{
-    RowError, enum_token, event_from_row, event_row, operation_from_row, operation_row,
-    report_json, status_token, stored_time, stored_value,
+    RowError, application_from_row, application_row, enum_token, event_from_row, event_row,
+    operation_from_row, operation_row, report_json, status_token, stored_time, stored_value,
 };
-use crate::domain::audit::{self, AuditEvent, AuditKind};
-use crate::domain::operation::{NewOperation, OpenOperation, Operation, OperationStatus};
+use crate::constants::{
+    APPLICATION_PAGE_MAX_LIMIT, HISTORY_PAGE_MAX_LIMIT, MAINTENANCE_BATCH_SIZE,
+};
+use crate::domain::history::{self, HistoryEvent, HistoryKind};
+use crate::domain::operation::{
+    Accepted, ApplicationRecord, CompletionReason, NewOperation, OpenOperation, Operation,
+    OperationStatus, complete_open_sections, expiry_category,
+};
 use crate::domain::ports::{BuildRefused, OperationRepository, StorageError};
 
 /// Outcomes of a transaction step that are not database failures. They travel
@@ -72,8 +86,6 @@ enum Step {
     IndexViolated,
     #[error("operation is final")]
     OperationFinal,
-    #[error("finished event does not belong to the operation")]
-    Inconsistent,
 }
 
 fn step(outcome: Step) -> DbError {
@@ -92,12 +104,6 @@ impl From<RowError> for DbError {
 /// bounded by `storage_call_timeout` whatever this is.
 const TX_ATTEMPTS: u32 = 10;
 
-/// The most records one `interrupt_expired_batch` or `purge_finished` call
-/// handles, whatever `limit` the caller passes. An implementation choice that
-/// keeps the id list of the delete statement under every backend's
-/// bind-parameter limit (`SQLite` allows 32766, `PostgreSQL` 65535).
-pub const MAX_BATCH_LIMIT: u64 = 1000;
-
 /// The [`StorageError`] of a failed storage step. A failure that is not a step
 /// outcome logs its fixed-vocabulary class and the repository method, never the
 /// driver's message.
@@ -106,7 +112,6 @@ fn classify(backend: DbBackend, call: &'static str, error: &DbError) -> StorageE
         match inner.downcast_ref::<Step>() {
             Some(Step::IndexViolated) => return StorageError::IndexViolated,
             Some(Step::OperationFinal) => return StorageError::OperationFinal,
-            Some(Step::Inconsistent) => return StorageError::Inconsistent,
             None => {}
         }
     }
@@ -180,7 +185,7 @@ impl SeaOrmOperationRepository {
     }
 
     /// Run one storage call under `storage_call_timeout`. The single place
-    /// the bound is applied (D8). A dropped call rolls its transaction back.
+    /// the bound is applied. A dropped call rolls its transaction back.
     async fn bounded<T>(
         &self,
         call: &'static str,
@@ -233,11 +238,8 @@ fn is_open() -> Condition {
     Condition::all().add(operation::Column::Status.is_in(OPEN_STATUSES))
 }
 
-fn is_final() -> Condition {
-    Condition::all().add(operation::Column::Status.is_in([
-        status_token(OperationStatus::Completed),
-        status_token(OperationStatus::Interrupted),
-    ]))
+fn is_completed() -> Condition {
+    Condition::all().add(operation::Column::Status.eq(status_token(OperationStatus::Completed)))
 }
 
 /// The value `backend` binds for the timestamp `at`.
@@ -253,11 +255,64 @@ fn writable(backend: DbBackend, operation_id: Uuid, now: OffsetDateTime) -> Cond
         .add(operation::Column::RunDeadline.gt(time_value(backend, now)))
 }
 
-/// Open and past its run window at `now`: what the interruption matches.
+/// Open and past its run window at `now`: what the expiry completion matches.
 fn expired(backend: DbBackend, now: OffsetDateTime) -> Condition {
     Condition::all()
         .add(is_open())
         .add(operation::Column::RunDeadline.lte(time_value(backend, now)))
+}
+
+/// The database clock as text, `YYYY-MM-DD HH:MM:SS.fff[fff]` in UTC.
+fn clock_sql(backend: DbBackend) -> Result<&'static str, DbError> {
+    match backend {
+        DbBackend::Postgres => Ok("to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')"),
+        DbBackend::MySql => Ok("DATE_FORMAT(UTC_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f')"),
+        DbBackend::Sqlite => Ok("strftime('%Y-%m-%d %H:%M:%f', 'now')"),
+        other => Err(DbError::Other(anyhow::anyhow!(
+            "unsupported database backend {other:?}"
+        ))),
+    }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ClockRow {
+    now: String,
+}
+
+/// The database's current time, read once per storage call (DESIGN 3.1
+/// "Status guard"). An aggregate over `operations` always returns one row,
+/// so the clock is read through the secure layer with no raw statement. On
+/// `PostgreSQL` it is the transaction's start time, the same for every
+/// statement of the call.
+async fn db_now(runner: &impl DBRunner, backend: DbBackend) -> Result<OffsetDateTime, DbError> {
+    let clock = clock_sql(backend)?;
+    let rows = operation::Entity::find()
+        .secure()
+        .scope_with(&scope())
+        .project_all(runner, |select| {
+            select
+                .select_only()
+                .column_as(Expr::cust("COUNT(*)"), "rows")
+                .column_as(Expr::cust(clock), "now")
+                .into_model::<ClockRow>()
+        })
+        .await?;
+    let text = rows.into_iter().next().ok_or(RowError)?.now;
+    let format = time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]"
+    );
+    let at = PrimitiveDateTime::parse(&text, format)
+        .map_err(|_| RowError)?
+        .assume_utc();
+    Ok(stored_time(backend, at))
+}
+
+/// `at + window`, or a row error when it leaves the time range.
+fn plus(at: OffsetDateTime, window: Duration) -> Result<OffsetDateTime, DbError> {
+    time::Duration::try_from(window)
+        .ok()
+        .and_then(|window| at.checked_add(window))
+        .ok_or_else(|| DbError::from(RowError))
 }
 
 /// The insert of `row`, every value bound as [`stored_value`] gives it for
@@ -288,12 +343,14 @@ where
     insert
 }
 
+/// Insert `event`, written at `now`.
 async fn insert_event(
     runner: &impl DBRunner,
     backend: DbBackend,
-    event: &AuditEvent,
+    event: &HistoryEvent,
+    now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    insert_of(backend, event_row(backend, event)?)
+    insert_of(backend, event_row(backend, event, now)?)
         .secure()
         .scope_unchecked(&scope())?
         .exec(runner)
@@ -313,6 +370,25 @@ async fn find_operation(
         .await?)
 }
 
+/// [`find_operation`] for a read-modify-write: the row is locked on
+/// `PostgreSQL` and `MySQL` until the transaction ends.
+async fn find_for_update(
+    runner: &impl DBRunner,
+    backend: DbBackend,
+    condition: Condition,
+) -> Result<Option<operation::Model>, DbError> {
+    let select = operation::Entity::find()
+        .secure()
+        .scope_with(&scope())
+        .filter(condition);
+    let select = if backend == DbBackend::Sqlite {
+        select
+    } else {
+        select.lock_exclusive()
+    };
+    Ok(select.one(runner).await?)
+}
+
 /// A guarded update: changes the record `condition` matches, or is
 /// [`Step::OperationFinal`] when it matches none.
 async fn update_operation(
@@ -320,18 +396,6 @@ async fn update_operation(
     condition: Condition,
     changes: Vec<(operation::Column, SimpleExpr)>,
 ) -> Result<(), DbError> {
-    if update_if_matched(runner, condition, changes).await? {
-        Ok(())
-    } else {
-        Err(step(Step::OperationFinal))
-    }
-}
-
-async fn update_if_matched(
-    runner: &impl DBRunner,
-    condition: Condition,
-    changes: Vec<(operation::Column, SimpleExpr)>,
-) -> Result<bool, DbError> {
     let mut update = operation::Entity::update_many();
     for (column, value) in changes {
         update = update.col_expr(column, value);
@@ -342,100 +406,79 @@ async fn update_if_matched(
         .scope_with(&scope())
         .exec(runner)
         .await?;
-    Ok(result.rows_affected > 0)
-}
-
-/// The interruption step: when the record is open and past its deadline, mark
-/// it `interrupted`, keep its report with `interrupted = true`, and insert the
-/// finished event under the record's `finished_event_id`.
-///
-/// The guarded update of the status comes first: it claims the record, and on
-/// `PostgreSQL` and `MySQL` it locks the row, so the report read next is the
-/// last one committed and no concurrent report write can slip in before this
-/// transaction ends (`SQLite` serialises writers).
-async fn interrupt_step(
-    runner: &impl DBRunner,
-    backend: DbBackend,
-    operation_id: Uuid,
-    now: OffsetDateTime,
-) -> Result<bool, DbError> {
-    let guard = Condition::all()
-        .add(operation::Column::OperationId.eq(operation_id))
-        .add(expired(backend, now));
-    let claim = vec![
-        (
-            operation::Column::Status,
-            Expr::value(status_token(OperationStatus::Interrupted)),
-        ),
-        (
-            operation::Column::FinishedAt,
-            Expr::value(time_value(backend, now)),
-        ),
-    ];
-    if !update_if_matched(runner, guard, claim).await? {
-        return Ok(false);
+    if result.rows_affected > 0 {
+        Ok(())
+    } else {
+        Err(step(Step::OperationFinal))
     }
-    let by_id = Condition::all().add(operation::Column::OperationId.eq(operation_id));
-    let row = find_operation(runner, by_id.clone())
-        .await?
-        .ok_or_else(|| DbError::Sea(DbErr::RecordNotFound("operation".to_owned())))?;
-    let mut record = operation_from_row(row)?;
-    record.report.interrupted = true;
-    record.report.category = None;
-    let report = vec![(
-        operation::Column::Report,
-        Expr::value(report_json(&record.report)?),
-    )];
-    update_operation(runner, by_id, report).await?;
-
-    let finished = AuditEvent {
-        event_id: record.finished_event_id,
-        kind: AuditKind::Finished,
-        correlation_id: record.operation_id,
-        action: record.action,
-        written_at: now,
-        content: audit::finished(&record.report),
-    };
-    insert_event(runner, backend, &finished).await?;
-    Ok(true)
 }
 
-async fn accept_step(
+/// Upsert the application record of a seed that finished while `running`.
+async fn upsert_application(
     runner: &impl DBRunner,
     backend: DbBackend,
-    new: &NewOperation,
-    accepted: &AuditEvent,
-    now: OffsetDateTime,
+    record: &ApplicationRecord,
 ) -> Result<(), DbError> {
-    // An expired open operation of the application does not block acceptance.
-    let blocking = Condition::all()
-        .add(operation::Column::ApplicationId.eq(new.application_id.as_str()))
-        .add(expired(backend, now));
-    if let Some(row) = find_operation(runner, blocking).await? {
-        interrupt_step(runner, backend, row.operation_id, now).await?;
-    }
-    insert_of(backend, operation_row(backend, new)?)
+    let existing = application::Entity::find()
         .secure()
-        .scope_unchecked(&scope())?
+        .scope_with(&scope())
+        .filter(
+            Condition::all()
+                .add(application::Column::ApplicationId.eq(record.application_id.as_str())),
+        )
+        .one(runner)
+        .await?;
+    if existing.is_none() {
+        insert_of(backend, application_row(backend, record)?)
+            .secure()
+            .scope_unchecked(&scope())?
+            .exec(runner)
+            .await?;
+        return Ok(());
+    }
+    application::Entity::update_many()
+        .col_expr(
+            application::Column::Version,
+            Expr::value(record.version.clone()),
+        )
+        .col_expr(
+            application::Column::OperationId,
+            Expr::value(record.operation_id),
+        )
+        .col_expr(
+            application::Column::Category,
+            Expr::value(enum_token(&record.category)?),
+        )
+        .col_expr(
+            application::Column::FinishedAt,
+            Expr::value(time_value(backend, record.finished_at)),
+        )
+        .filter(
+            Condition::all()
+                .add(application::Column::ApplicationId.eq(record.application_id.as_str())),
+        )
+        .secure()
+        .scope_with(&scope())
         .exec(runner)
-        .await
-        .map_err(|error| {
-            if error.is_unique_violation() {
-                step(Step::IndexViolated)
-            } else {
-                DbError::from(error)
-            }
-        })?;
-    insert_event(runner, backend, accepted).await
+        .await?;
+    Ok(())
 }
 
-/// Record a completed operation: check the finished event against the record,
-/// the guarded update, then the finished event.
-///
-/// The stored report carries `category` and `interrupted = false` whatever the
-/// caller's copy says, so the column and the report never disagree. A finished
-/// event that does not belong to the record (its id, correlation, action or
-/// kind) is [`Step::Inconsistent`] and nothing is written.
+async fn delete_application(runner: &impl DBRunner, application_id: &str) -> Result<(), DbError> {
+    application::Entity::delete_many()
+        .filter(Condition::all().add(application::Column::ApplicationId.eq(application_id)))
+        .secure()
+        .scope_with(&scope())
+        .exec(runner)
+        .await?;
+    Ok(())
+}
+
+/// Complete the open record `row`, already read under `guard` in this
+/// transaction: the guarded update to `completed` with `report` (whose
+/// category is `category`) at `now`, the finished event under the record's
+/// `finished_event_id`, and the application record: upserted for a seed that
+/// was `running`, deleted for an uninstall that succeeded.
 #[expect(
     clippy::too_many_arguments,
     reason = "the backend travels with `now` to bind it as the backend stores it"
@@ -443,27 +486,16 @@ async fn accept_step(
 async fn complete_step(
     runner: &impl DBRunner,
     backend: DbBackend,
-    operation_id: Uuid,
-    mut changes: Vec<(operation::Column, SimpleExpr)>,
-    report: &OutcomeReport,
+    row: &operation::Model,
+    guard: Condition,
+    mut report: OutcomeReport,
     category: RequestCategory,
-    finished: &AuditEvent,
+    reason: Option<CompletionReason>,
     now: OffsetDateTime,
 ) -> Result<(), DbError> {
-    let Some(row) = find_operation(runner, writable(backend, operation_id, now)).await? else {
-        return Err(step(Step::OperationFinal));
-    };
-    let belongs = finished.event_id == row.finished_event_id
-        && finished.correlation_id == operation_id
-        && finished.kind == AuditKind::Finished
-        && enum_token(&finished.action)? == row.action;
-    if !belongs {
-        return Err(step(Step::Inconsistent));
-    }
-    let mut stored = report.clone();
-    stored.category = Some(category);
-    stored.interrupted = false;
-    changes.extend([
+    let record = operation_from_row(row.clone())?;
+    report.category = Some(category);
+    let changes = vec![
         (
             operation::Column::Status,
             Expr::value(status_token(OperationStatus::Completed)),
@@ -478,11 +510,119 @@ async fn complete_step(
         ),
         (
             operation::Column::Report,
-            Expr::value(report_json(&stored)?),
+            Expr::value(report_json(&report)?),
         ),
-    ]);
-    update_operation(runner, writable(backend, operation_id, now), changes).await?;
-    insert_event(runner, backend, finished).await
+    ];
+    // The status read under the lock must still hold.
+    let guard = guard.add(operation::Column::Status.eq(row.status.as_str()));
+    update_operation(runner, guard, changes).await?;
+
+    let finished = HistoryEvent {
+        event_id: record.finished_event_id,
+        kind: HistoryKind::Finished,
+        correlation_id: record.operation_id,
+        action: record.action,
+        written_at: now,
+        content: history::finished(&report, reason),
+    };
+    insert_event(runner, backend, &finished, now).await?;
+
+    let was_running = record.status == OperationStatus::Running;
+    match record.action {
+        OperationAction::Seed if was_running => {
+            let application = ApplicationRecord {
+                application_id: record.application_id.clone(),
+                version: report.application.version.clone().unwrap_or_default(),
+                operation_id: record.operation_id,
+                category,
+                finished_at: now,
+            };
+            upsert_application(runner, backend, &application).await
+        }
+        OperationAction::Uninstall if category == RequestCategory::Succeeded => {
+            delete_application(runner, &record.application_id).await
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The expiry completion of `operation_id` when it is open and its run
+/// deadline is at or before `now`. Returns whether it completed it.
+async fn expire_step(
+    runner: &impl DBRunner,
+    backend: DbBackend,
+    operation_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<bool, DbError> {
+    let guard = Condition::all()
+        .add(operation::Column::OperationId.eq(operation_id))
+        .add(expired(backend, now));
+    let Some(row) = find_for_update(runner, backend, guard.clone()).await? else {
+        return Ok(false);
+    };
+    let record = operation_from_row(row.clone())?;
+    let mut report = record.report;
+    complete_open_sections(&mut report, record.status == OperationStatus::Running);
+    let category = expiry_category(&report.sections);
+    complete_step(
+        runner,
+        backend,
+        &row,
+        guard,
+        report,
+        category,
+        Some(CompletionReason::Expired),
+        now,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// The open record `operation_id`, locked, when a write may still change it at
+/// `now`; [`Step::OperationFinal`] otherwise.
+async fn writable_row(
+    runner: &impl DBRunner,
+    backend: DbBackend,
+    operation_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<operation::Model, DbError> {
+    find_for_update(runner, backend, writable(backend, operation_id, now))
+        .await?
+        .ok_or_else(|| step(Step::OperationFinal))
+}
+
+async fn accept_step(
+    runner: &impl DBRunner,
+    backend: DbBackend,
+    new: &NewOperation,
+    accepted: &HistoryEvent,
+) -> Result<Accepted, DbError> {
+    let now = db_now(runner, backend).await?;
+    // An expired open operation of the application does not block acceptance.
+    let blocking = Condition::all()
+        .add(operation::Column::ApplicationId.eq(new.application_id.as_str()))
+        .add(expired(backend, now));
+    if let Some(row) = find_operation(runner, blocking).await? {
+        expire_step(runner, backend, row.operation_id, now).await?;
+    }
+    let run_deadline = stored_time(backend, plus(now, new.run_window)?);
+    insert_of(backend, operation_row(backend, new, now, run_deadline)?)
+        .secure()
+        .scope_unchecked(&scope())?
+        .exec(runner)
+        .await
+        .map_err(|error| {
+            if error.is_unique_violation() {
+                step(Step::IndexViolated)
+            } else {
+                DbError::from(error)
+            }
+        })?;
+    insert_event(runner, backend, accepted, now).await?;
+    Ok(Accepted {
+        accepted_at: now,
+        run_deadline,
+    })
 }
 
 #[async_trait]
@@ -490,11 +630,10 @@ impl OperationRepository for SeaOrmOperationRepository {
     async fn open_operation(
         &self,
         application_id: &str,
-        now: OffsetDateTime,
     ) -> Result<Option<OpenOperation>, StorageError> {
-        let now = stored_time(self.backend, now);
         self.bounded("open_operation", async {
             let conn = self.db.conn()?;
+            let now = db_now(&conn, self.backend).await?;
             let open = Condition::all()
                 .add(operation::Column::ApplicationId.eq(application_id))
                 .add(is_open());
@@ -509,13 +648,12 @@ impl OperationRepository for SeaOrmOperationRepository {
     async fn accept(
         &self,
         new: NewOperation,
-        accepted: AuditEvent,
-        now: OffsetDateTime,
-    ) -> Result<(), StorageError> {
-        let (backend, now) = (self.backend, stored_time(self.backend, now));
+        accepted: HistoryEvent,
+    ) -> Result<Accepted, StorageError> {
+        let backend = self.backend;
         self.transact("accept", move |tx| {
             let (new, accepted) = (new.clone(), accepted.clone());
-            Box::pin(async move { accept_step(tx, backend, &new, &accepted, now).await })
+            Box::pin(async move { accept_step(tx, backend, &new, &accepted).await })
         })
         .await
     }
@@ -526,7 +664,8 @@ impl OperationRepository for SeaOrmOperationRepository {
         build_refused: BuildRefused,
     ) -> Result<Uuid, StorageError> {
         let application_id = application_id.to_owned();
-        let build_refused: Arc<dyn Fn(Uuid) -> AuditEvent + Send + Sync> = Arc::from(build_refused);
+        let build_refused: Arc<dyn Fn(Uuid) -> HistoryEvent + Send + Sync> =
+            Arc::from(build_refused);
         let backend = self.backend;
         let winner = self
             .transact("refuse_after_lost_race", move |tx| {
@@ -535,11 +674,12 @@ impl OperationRepository for SeaOrmOperationRepository {
                     .add(is_open());
                 let build_refused = Arc::clone(&build_refused);
                 Box::pin(async move {
+                    let now = db_now(tx, backend).await?;
                     let Some(winner) = find_operation(tx, open).await? else {
                         return Ok(None);
                     };
                     let refused = build_refused(winner.operation_id);
-                    insert_event(tx, backend, &refused).await?;
+                    insert_event(tx, backend, &refused, now).await?;
                     Ok(Some(winner.operation_id))
                 })
             })
@@ -548,11 +688,14 @@ impl OperationRepository for SeaOrmOperationRepository {
         winner.ok_or(StorageError::Unavailable)
     }
 
-    async fn record_refused(&self, event: AuditEvent) -> Result<(), StorageError> {
+    async fn record_refused(&self, event: HistoryEvent) -> Result<(), StorageError> {
         let backend = self.backend;
         self.transact("record_refused", move |tx| {
             let event = event.clone();
-            Box::pin(async move { insert_event(tx, backend, &event).await })
+            Box::pin(async move {
+                let now = db_now(tx, backend).await?;
+                insert_event(tx, backend, &event, now).await
+            })
         })
         .await
     }
@@ -560,39 +703,82 @@ impl OperationRepository for SeaOrmOperationRepository {
     async fn mark_running(
         &self,
         operation_id: Uuid,
-        now: OffsetDateTime,
-    ) -> Result<(), StorageError> {
-        let now = stored_time(self.backend, now);
-        self.bounded("mark_running", async {
-            let conn = self.db.conn()?;
-            let guard = writable(self.backend, operation_id, now)
-                .add(operation::Column::Status.eq(status_token(OperationStatus::Accepted)));
-            let changes = vec![
-                (
-                    operation::Column::Status,
-                    Expr::value(status_token(OperationStatus::Running)),
-                ),
-                (
-                    operation::Column::StartedAt,
-                    Expr::value(time_value(self.backend, now)),
-                ),
-            ];
-            update_operation(&conn, guard, changes).await
+        sections: &[(String, Option<String>)],
+    ) -> Result<Duration, StorageError> {
+        let backend = self.backend;
+        let sections = sections.to_vec();
+        self.transact("mark_running", move |tx| {
+            let sections = sections.clone();
+            Box::pin(async move {
+                let now = db_now(tx, backend).await?;
+                let guard = writable(backend, operation_id, now)
+                    .add(operation::Column::Status.eq(status_token(OperationStatus::Accepted)));
+                let row = find_for_update(tx, backend, guard.clone())
+                    .await?
+                    .ok_or_else(|| step(Step::OperationFinal))?;
+                let mut report = operation_from_row(row.clone())?.report;
+                report.sections = sections
+                    .into_iter()
+                    .map(|(key, section_type)| SectionOutcomeEntry {
+                        key,
+                        section_type,
+                        outcome: None,
+                        detail: None,
+                        location: None,
+                    })
+                    .collect();
+                let changes = vec![
+                    (
+                        operation::Column::Status,
+                        Expr::value(status_token(OperationStatus::Running)),
+                    ),
+                    (
+                        operation::Column::StartedAt,
+                        Expr::value(time_value(backend, now)),
+                    ),
+                    (
+                        operation::Column::Report,
+                        Expr::value(report_json(&report)?),
+                    ),
+                ];
+                update_operation(tx, guard, changes).await?;
+                let left = row.run_deadline - now;
+                Ok(Duration::try_from(left).unwrap_or(Duration::ZERO))
+            })
         })
         .await
     }
 
-    async fn record_report(
+    async fn record_section_outcome(
         &self,
         operation_id: Uuid,
-        report: &OutcomeReport,
-        now: OffsetDateTime,
+        key: &str,
+        outcome: SectionOutcome,
+        detail: Option<String>,
+        location: Option<String>,
     ) -> Result<(), StorageError> {
-        let now = stored_time(self.backend, now);
-        self.bounded("record_report", async {
-            let conn = self.db.conn()?;
-            let changes = vec![(operation::Column::Report, Expr::value(report_json(report)?))];
-            update_operation(&conn, writable(self.backend, operation_id, now), changes).await
+        let backend = self.backend;
+        let key = key.to_owned();
+        self.transact("record_section_outcome", move |tx| {
+            let (key, detail, location) = (key.clone(), detail.clone(), location.clone());
+            Box::pin(async move {
+                let now = db_now(tx, backend).await?;
+                let row = writable_row(tx, backend, operation_id, now).await?;
+                let mut report = operation_from_row(row)?.report;
+                let entry = report
+                    .sections
+                    .iter_mut()
+                    .find(|entry| entry.key == key)
+                    .ok_or_else(|| step(Step::OperationFinal))?;
+                entry.outcome = Some(outcome);
+                entry.detail = detail;
+                entry.location = location;
+                let changes = vec![(
+                    operation::Column::Report,
+                    Expr::value(report_json(&report)?),
+                )];
+                update_operation(tx, writable(backend, operation_id, now), changes).await
+            })
         })
         .await
     }
@@ -602,55 +788,38 @@ impl OperationRepository for SeaOrmOperationRepository {
         operation_id: Uuid,
         report: &OutcomeReport,
         category: RequestCategory,
-        finished: AuditEvent,
-        now: OffsetDateTime,
     ) -> Result<(), StorageError> {
-        let (backend, now) = (self.backend, stored_time(self.backend, now));
+        let backend = self.backend;
         let report = report.clone();
         self.transact("finish", move |tx| {
-            let (report, finished) = (report.clone(), finished.clone());
+            let report = report.clone();
             Box::pin(async move {
-                complete_step(
-                    tx,
-                    backend,
-                    operation_id,
-                    Vec::new(),
-                    &report,
-                    category,
-                    &finished,
-                    now,
-                )
-                .await
+                let now = db_now(tx, backend).await?;
+                let row = writable_row(tx, backend, operation_id, now).await?;
+                let guard = writable(backend, operation_id, now);
+                complete_step(tx, backend, &row, guard, report, category, None, now).await
             })
         })
         .await
     }
 
-    async fn complete_by_supervisor(
-        &self,
-        operation_id: Uuid,
-        report: &OutcomeReport,
-        finished: AuditEvent,
-        now: OffsetDateTime,
-    ) -> Result<(), StorageError> {
-        let (backend, now) = (self.backend, stored_time(self.backend, now));
-        let report = report.clone();
+    async fn complete_by_supervisor(&self, operation_id: Uuid) -> Result<(), StorageError> {
+        let backend = self.backend;
         self.transact("complete_by_supervisor", move |tx| {
-            let (report, finished) = (report.clone(), finished.clone());
             Box::pin(async move {
-                // `started_at` is set only when mark running never ran.
-                let started_at = Func::coalesce([
-                    Expr::col(operation::Column::StartedAt),
-                    Expr::value(time_value(backend, now)),
-                ]);
+                let now = db_now(tx, backend).await?;
+                let row = writable_row(tx, backend, operation_id, now).await?;
+                let mut report = operation_from_row(row.clone())?.report;
+                complete_open_sections(&mut report, false);
+                let guard = writable(backend, operation_id, now);
                 complete_step(
                     tx,
                     backend,
-                    operation_id,
-                    vec![(operation::Column::StartedAt, started_at.into())],
-                    &report,
+                    &row,
+                    guard,
+                    report,
                     RequestCategory::InternalFailure,
-                    &finished,
+                    None,
                     now,
                 )
                 .await
@@ -659,31 +828,26 @@ impl OperationRepository for SeaOrmOperationRepository {
         .await
     }
 
-    async fn interrupt_if_expired(
-        &self,
-        operation_id: Uuid,
-        now: OffsetDateTime,
-    ) -> Result<bool, StorageError> {
-        let (backend, now) = (self.backend, stored_time(self.backend, now));
-        self.transact("interrupt_if_expired", move |tx| {
-            Box::pin(async move { interrupt_step(tx, backend, operation_id, now).await })
+    async fn expire_if_expired(&self, operation_id: Uuid) -> Result<bool, StorageError> {
+        let backend = self.backend;
+        self.transact("expire_if_expired", move |tx| {
+            Box::pin(async move {
+                let now = db_now(tx, backend).await?;
+                expire_step(tx, backend, operation_id, now).await
+            })
         })
         .await
     }
 
-    /// Each record goes through [`Self::interrupt_if_expired`], so each
-    /// storage access has its own `storage_call_timeout`. A record that cannot
-    /// be interrupted is logged by operation id and skipped; the rest go on.
-    async fn interrupt_expired_batch(
-        &self,
-        now: OffsetDateTime,
-        limit: u64,
-    ) -> Result<u64, StorageError> {
-        let now = stored_time(self.backend, now);
-        let limit = limit.min(MAX_BATCH_LIMIT);
+    /// Each record goes through [`Self::expire_if_expired`], so each storage
+    /// access has its own `storage_call_timeout`. A record that cannot be
+    /// completed is logged by operation id and skipped; the rest go on.
+    async fn expire_batch(&self, limit: u64) -> Result<u64, StorageError> {
+        let limit = limit.min(MAINTENANCE_BATCH_SIZE);
         let due: Vec<Uuid> = self
-            .bounded("interrupt_expired_batch", async {
+            .bounded("expire_batch", async {
                 let conn = self.db.conn()?;
+                let now = db_now(&conn, self.backend).await?;
                 let rows = operation::Entity::find()
                     .secure()
                     .scope_with(&scope())
@@ -696,17 +860,17 @@ impl OperationRepository for SeaOrmOperationRepository {
                 Ok(rows.into_iter().map(|row| row.operation_id).collect())
             })
             .await?;
-        let mut interrupted = 0_u64;
+        let mut completed = 0_u64;
         let mut failed = 0_usize;
         for operation_id in &due {
-            match self.interrupt_if_expired(*operation_id, now).await {
-                Ok(true) => interrupted += 1,
+            match self.expire_if_expired(*operation_id).await {
+                Ok(true) => completed += 1,
                 Ok(false) => {}
                 Err(_) => {
                     failed += 1;
                     tracing::warn!(
                         %operation_id,
-                        "application-manager: expired operation not interrupted"
+                        "application-manager: expired operation not completed"
                     );
                 }
             }
@@ -714,21 +878,24 @@ impl OperationRepository for SeaOrmOperationRepository {
         if failed > 0 && failed == due.len() {
             return Err(StorageError::Unavailable);
         }
-        Ok(interrupted)
+        Ok(completed)
     }
 
-    async fn purge_finished(
-        &self,
-        before: OffsetDateTime,
-        limit: u64,
-    ) -> Result<u64, StorageError> {
-        let before = stored_time(self.backend, before);
-        let limit = limit.min(MAX_BATCH_LIMIT);
-        self.bounded("purge_finished", async {
+    async fn purge(&self, retention: Duration, limit: u64) -> Result<u64, StorageError> {
+        let limit = limit.min(MAINTENANCE_BATCH_SIZE);
+        self.bounded("purge", async {
             let conn = self.db.conn()?;
-            let old = Condition::all()
-                .add(is_final())
-                .add(operation::Column::FinishedAt.lt(time_value(self.backend, before)));
+            let now = db_now(&conn, self.backend).await?;
+            // `finished_at + retention <= now`, as `finished_at <= now - retention`.
+            let Some(cutoff) = time::Duration::try_from(retention)
+                .ok()
+                .and_then(|retention| now.checked_sub(retention))
+            else {
+                return Ok(0);
+            };
+            let cutoff = stored_time(self.backend, cutoff);
+            let old = is_completed()
+                .add(operation::Column::FinishedAt.lte(time_value(self.backend, cutoff)));
             let ids: Vec<Uuid> = operation::Entity::find()
                 .secure()
                 .scope_with(&scope())
@@ -746,11 +913,7 @@ impl OperationRepository for SeaOrmOperationRepository {
             }
             // The status filter repeats: an open record is never deleted.
             let deleted = operation::Entity::delete_many()
-                .filter(
-                    Condition::all()
-                        .add(operation::Column::OperationId.is_in(ids))
-                        .add(is_final()),
-                )
+                .filter(is_completed().add(operation::Column::OperationId.is_in(ids)))
                 .secure()
                 .scope_with(&scope())
                 .exec(&conn)
@@ -760,15 +923,12 @@ impl OperationRepository for SeaOrmOperationRepository {
         .await
     }
 
-    async fn read_operation(
-        &self,
-        operation_id: Uuid,
-        now: OffsetDateTime,
-    ) -> Result<Option<Operation>, StorageError> {
-        let (backend, now) = (self.backend, stored_time(self.backend, now));
+    async fn read_operation(&self, operation_id: Uuid) -> Result<Option<Operation>, StorageError> {
+        let backend = self.backend;
         self.transact("read_operation", move |tx| {
             Box::pin(async move {
-                interrupt_step(tx, backend, operation_id, now).await?;
+                let now = db_now(tx, backend).await?;
+                expire_step(tx, backend, operation_id, now).await?;
                 let by_id = Condition::all().add(operation::Column::OperationId.eq(operation_id));
                 Ok(find_operation(tx, by_id)
                     .await?
@@ -779,22 +939,65 @@ impl OperationRepository for SeaOrmOperationRepository {
         .await
     }
 
-    async fn audit_events(&self, correlation_id: Uuid) -> Result<Vec<AuditEvent>, StorageError> {
-        self.bounded("audit_events", async {
+    async fn history_page(
+        &self,
+        correlation_ids: Option<Vec<Uuid>>,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<HistoryEvent>, StorageError> {
+        let limit = limit.min(HISTORY_PAGE_MAX_LIMIT);
+        self.bounded("history_page", async {
             let conn = self.db.conn()?;
-            let rows = audit_event::Entity::find()
+            let mut filter = Condition::all();
+            if let Some(ids) = correlation_ids {
+                filter = filter.add(history_event::Column::CorrelationId.is_in(ids));
+            }
+            if let Some(after) = after {
+                filter = filter.add(history_event::Column::EventId.gt(after));
+            }
+            let rows = history_event::Entity::find()
                 .secure()
                 .scope_with(&scope())
-                .filter(Condition::all().add(audit_event::Column::CorrelationId.eq(correlation_id)))
-                // Write time first: a request's events read in the order they
-                // were written; the time-ordered event id breaks a tie.
-                .order_by(audit_event::Column::WrittenAt, Order::Asc)
-                .order_by(audit_event::Column::EventId, Order::Asc)
+                .filter(filter)
+                .order_by(history_event::Column::EventId, Order::Asc)
+                .limit(limit)
                 .all(&conn)
                 .await?;
             Ok(rows
                 .into_iter()
                 .map(event_from_row)
+                .collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    async fn applications_page(
+        &self,
+        application_ids: Option<Vec<String>>,
+        after: Option<String>,
+        limit: u64,
+    ) -> Result<Vec<ApplicationRecord>, StorageError> {
+        let limit = limit.min(APPLICATION_PAGE_MAX_LIMIT);
+        self.bounded("applications_page", async {
+            let conn = self.db.conn()?;
+            let mut filter = Condition::all();
+            if let Some(ids) = application_ids {
+                filter = filter.add(application::Column::ApplicationId.is_in(ids));
+            }
+            if let Some(after) = after {
+                filter = filter.add(application::Column::ApplicationId.gt(after));
+            }
+            let rows = application::Entity::find()
+                .secure()
+                .scope_with(&scope())
+                .filter(filter)
+                .order_by(application::Column::ApplicationId, Order::Asc)
+                .limit(limit)
+                .all(&conn)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(application_from_row)
                 .collect::<Result<Vec<_>, _>>()?)
         })
         .await

@@ -10,8 +10,8 @@
 #[tokio::test]
 async fn yaml_application_manager_block_passes_gear_init() {
     use std::sync::Arc;
-    use toolkit::Gear;
     use toolkit::bootstrap::AppConfig;
+    use toolkit::{ConfigProvider, Gear};
 
     let file = "config/e2e-local.yaml";
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

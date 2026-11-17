@@ -15,13 +15,12 @@ use crate::api::rest;
 use crate::api::rest::health::StartupHealthcheck;
 use crate::config::ApplicationManagerConfig;
 use crate::domain::plugin_set::StartupState;
-use crate::domain::ports::{OperationRepository, PluginCalls};
+use crate::domain::ports::OperationRepository;
 use crate::domain::read_service::ReadService;
 use crate::domain::schema_validator::SchemaValidator;
 use crate::infra::startup;
-use crate::sdk::{ApplicationManagerSectionPluginSpecV1, SECTION_BASE_TYPE};
-use crate::sdk::{ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1};
 use crate::infra::storage::SeaOrmOperationRepository;
+use crate::sdk::{ApplicationManagerSectionPluginSpecV1, OUTCOME_REPORT_TYPE, SECTION_BASE_TYPE};
 
 /// The Application Manager gear.
 #[toolkit::gear(
@@ -41,8 +40,6 @@ struct Runtime {
     startup: Arc<StartupState>,
     #[expect(dead_code, reason = "the request orchestrator uses it in PR 5")]
     operations: Arc<dyn OperationRepository>,
-    run_window_margin: Duration,
-    storage_call_timeout: Duration,
 }
 
 impl ApplicationManager {
@@ -65,11 +62,12 @@ fn ensure_sdk_types_linked() -> anyhow::Result<()> {
     ensure_sdk_types_registered(&registered)
 }
 
-/// Fail unless `registered` holds the section base type and the section
-/// plugin spec schemas.
+/// Fail unless `registered` holds the section base type, the outcome report
+/// type, and the section plugin spec schemas.
 fn ensure_sdk_types_registered(registered: &[serde_json::Value]) -> anyhow::Result<()> {
     for type_id in [
         SECTION_BASE_TYPE,
+        OUTCOME_REPORT_TYPE,
         <ApplicationManagerSectionPluginSpecV1 as gts::GtsSchema>::TYPE_ID,
     ] {
         let want = format!("gts://{type_id}");
@@ -133,16 +131,6 @@ impl Gear for ApplicationManager {
             )
         })?;
         let startup = Arc::new(StartupState::default());
-        let guard = Arc::new(CallGuard::new(
-            config.plugin_call_timeout,
-            config.plugin_max_in_flight,
-        ));
-        let read = ReadService::new(
-            access,
-            Arc::clone(&startup),
-            SectionPluginRouter::new(Arc::clone(&guard) as Arc<dyn PluginCalls>),
-            Arc::new(validator),
-        );
         let operations = Arc::new(SeaOrmOperationRepository::new(
             Arc::new(db),
             config.storage_call_timeout,
@@ -156,8 +144,6 @@ impl Gear for ApplicationManager {
             )),
             startup,
             operations,
-            run_window_margin: config.run_window_margin,
-            storage_call_timeout: config.storage_call_timeout,
         };
         self.runtime
             .set(runtime)
@@ -167,7 +153,7 @@ impl Gear for ApplicationManager {
 }
 
 impl DatabaseCapability for ApplicationManager {
-    /// The `operations` and `audit_ledger` migrations.
+    /// The `operations`, `operation_history` and `applications` migrations.
     fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
         use sea_orm_migration::MigratorTrait;
         crate::infra::storage::Migrator::migrations()

@@ -83,15 +83,16 @@ fn sample_report() -> crate::models::OutcomeReport {
         operation_id: uuid::Uuid::from_u128(9),
         action: OperationAction::Seed,
         category: Some(RequestCategory::InvalidManifest),
-        interrupted: false,
         application: ReportApplication {
             id: "acme.app".to_owned(),
             version: Some("1.0.0".to_owned()),
         },
         sections: vec![SectionOutcomeEntry {
             key: "billing".to_owned(),
-            outcome: SectionOutcome::Rejected,
-            schema_version: Some("2".to_owned()),
+            section_type: Some(
+                "gts.cf.core.application_manager.section.v1~acme.billing.plan.v1~".to_owned(),
+            ),
+            outcome: Some(SectionOutcome::Rejected),
             detail: Some("no".to_owned()),
             location: Some("/plan".to_owned()),
         }],
@@ -101,9 +102,8 @@ fn sample_report() -> crate::models::OutcomeReport {
             message: "missing".to_owned(),
         }],
         unavailable: vec![UnavailableItem {
-            dependency: Dependency::SectionSchema,
-            key: Some("billing".to_owned()),
-            reason: UnavailableReasonCode::Unusable,
+            dependency: Dependency::OperationStorage,
+            reason: UnavailableReasonCode::TimedOut,
         }],
     }
 }
@@ -131,9 +131,15 @@ fn outcome_report_schema_accepts_a_sample_report() {
 
     let mut open = sample_report();
     open.category = None;
-    open.interrupted = true;
+    open.sections[0].outcome = None;
+    open.sections[0].section_type = None;
     let open = serde_json::to_value(open).unwrap();
     assert!(validator.is_valid(&open), "{open}");
+
+    let mut lost = sample_report();
+    lost.sections[0].outcome = Some(crate::models::SectionOutcome::Lost);
+    let lost = serde_json::to_value(lost).unwrap();
+    assert!(validator.is_valid(&lost), "{lost}");
 }
 
 #[test]

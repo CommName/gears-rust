@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use toolkit_macros::domain_model;
 use toolkit_security::{PlatformIdentity, PlatformSecurityContext};
+use uuid::Uuid;
 
 /// The caller as a plugin sees it: the validated platform identity. It holds
 /// no credential.
@@ -87,8 +88,13 @@ pub enum SectionOutcome {
     TimedOut,
     /// Refused by the in-flight cap.
     NotSent,
-    /// The request task failed before the call.
+    /// Not called: the request task failed or stopped before the call, the
+    /// call no longer fit before the run deadline, or an earlier
+    /// section-outcome write failed.
     NotDispatched,
+    /// The plugin may have been called when the request task stopped; its
+    /// effect is unknown.
+    Lost,
 }
 
 /// A dependency that could not answer.
@@ -97,12 +103,8 @@ pub enum SectionOutcome {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Dependency {
-    /// Platform access control.
-    AccessControl,
     /// Operation storage.
     OperationStorage,
-    /// A section schema.
-    SectionSchema,
     /// The gear itself.
     ApplicationManager,
 }
@@ -117,10 +119,6 @@ pub enum UnavailableReasonCode {
     Unreachable,
     /// No answer in time.
     TimedOut,
-    /// Served but unusable.
-    Unusable,
-    /// Refused by the in-flight cap.
-    NotSent,
     /// Startup has not finished.
     NotReady,
     /// At the request-task cap.
@@ -139,17 +137,19 @@ pub struct ReportApplication {
     pub version: Option<String>,
 }
 
-/// The recorded outcome of one section plugin.
+/// One section plugin of a running operation, in priority order.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SectionOutcomeEntry {
     /// Section key.
     pub key: String,
-    /// The outcome.
-    pub outcome: SectionOutcome,
-    /// Schema version of a validated seed section.
+    /// The exact GTS id of the section type of a seed section, written by
+    /// mark running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<String>,
+    pub section_type: Option<String>,
+    /// The outcome, once recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<SectionOutcome>,
     /// Plugin detail of a `rejected` or `not_permitted` outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -176,9 +176,6 @@ pub struct ReportProblem {
 pub struct UnavailableItem {
     /// The dependency.
     pub dependency: Dependency,
-    /// Section key, for a section schema.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
     /// Why it is unavailable.
     pub reason: UnavailableReasonCode,
 }
@@ -192,14 +189,12 @@ pub struct OutcomeReport {
     pub operation_id: Uuid,
     /// `seed` or `uninstall`.
     pub action: OperationAction,
-    /// Category of a completed operation; absent while open and when interrupted.
+    /// Category of a completed operation; absent while open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<RequestCategory>,
-    /// True when the operation ended at its run deadline.
-    pub interrupted: bool,
     /// The application.
     pub application: ReportApplication,
-    /// Per plugin with a recorded outcome, in priority order.
+    /// Per plugin once the operation is running, in priority order.
     pub sections: Vec<SectionOutcomeEntry>,
     /// Section validation problems.
     pub problems: Vec<ReportProblem>,

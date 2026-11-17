@@ -297,12 +297,15 @@ fn sdk_type_missing_from_inventory_fails() {
     let spec = json!({
         "$id": "gts://gts.cf.toolkit.plugins.plugin.v1~cf.core.application_manager_section.plugin.v1~"
     });
+    let report = json!({ "$id": "gts://gts.cf.core.application_manager.outcome_report.v1~" });
     let other = json!({ "$id": "gts://gts.cf.other.type.v1~" });
     for registered in [
         vec![],
         vec![other, json!({})],
         vec![section.clone()],
         vec![spec.clone()],
+        vec![section.clone(), spec.clone()],
+        vec![report.clone(), spec.clone()],
     ] {
         let err = ensure_sdk_types_registered(&registered).unwrap_err();
         assert!(
@@ -310,7 +313,7 @@ fn sdk_type_missing_from_inventory_fails() {
             "{err:#}"
         );
     }
-    ensure_sdk_types_registered(&[section, spec]).unwrap();
+    ensure_sdk_types_registered(&[section, report, spec]).unwrap();
 }
 
 #[tokio::test]
@@ -331,69 +334,6 @@ async fn healthcheck_follows_startup() {
 
     gear.start(CancellationToken::new()).await.unwrap();
     assert_eq!(check.check().await.status, HealthcheckStatus::Healthy);
-}
-
-/// A started gear whose plugin set is one fake plugin `a`, with a permitting
-/// PDP.
-async fn started_with_plugin_a(overrides: &Value) -> ApplicationManager {
-    let plugins = [PluginSpec::new(
-        "cf.test.a.section.v1",
-        1,
-        KeyAnswer::Key("a"),
-    )];
-    let hub = hub_with(&plugins);
-    let pdp: Arc<dyn AuthZResolverApi> = FakeAuthZ::new(Pdp::Permit);
-    hub.register::<dyn AuthZResolverApi>(pdp);
-    let gear = initialized(overrides, hub).await;
-    gear.start(CancellationToken::new()).await.unwrap();
-    gear
-}
-
-#[tokio::test]
-async fn schema_reads_serve_the_started_plugin_set() {
-    let gear = started_with_plugin_a(&json!({ "max_envelope_text_length": 64 })).await;
-    let read = &gear.runtime.get().unwrap().read;
-    let single = read.section_schema(&ctx(), "a").await.unwrap();
-    assert_eq!(single.schema_version, "1");
-    assert_eq!(
-        single.schema,
-        json!({ "$id": "urn:cf:application-manager:section:a" })
-    );
-    let combined = read.manifest_schema(&ctx()).await.unwrap();
-    assert_eq!(combined.sections.len(), 1);
-    assert_eq!(
-        combined.schema["properties"]["sections"]["required"],
-        json!(["a"])
-    );
-    assert_eq!(
-        combined.schema["properties"]["application"]["properties"]["id"]["maxLength"], 16,
-        "max_envelope_text_length (64 bytes) reaches the envelope schema as 16 characters"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn startup_and_schema_reads_share_one_call_guard() {
-    let gear = started_with_plugin_a(&json!({ "plugin_max_in_flight": 1 })).await;
-    let runtime = gear.runtime.get().unwrap();
-    let (release, wait) = tokio::sync::oneshot::channel::<()>();
-    let id = instance_id("cf.test.a.section.v1");
-    let held = runtime.guard.call(&id, async move { wait.await.unwrap() });
-    let read = async {
-        let refused = runtime.read.manifest_schema(&ctx()).await;
-        release.send(()).unwrap();
-        refused
-    };
-    let (held, refused) = tokio::join!(held, read);
-    assert_eq!(held, Ok(()));
-    assert_eq!(
-        refused,
-        Err(DomainError::SchemaUnavailable {
-            items: vec![UnavailableSchema {
-                key: "a".to_owned(),
-                reason: UnavailableReason::NotSent,
-            }],
-        })
-    );
 }
 
 #[tokio::test]

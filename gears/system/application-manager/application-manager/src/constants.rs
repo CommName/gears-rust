@@ -50,6 +50,20 @@ pub const PROBLEMS_MAX: usize = 100;
 /// name a value; 1024 is the implementation's choice.
 pub const PROBLEM_LOCATION_MAX_BYTES: usize = 1024;
 
+/// Most expired operations one sweep completes, and most completed records
+/// one purge deletes (DESIGN 4.2). DESIGN names the constant without a value;
+/// 100 is the implementation's choice, well under every backend's
+/// bind-parameter limit.
+pub const MAINTENANCE_BATCH_SIZE: u64 = 100;
+
+/// Largest and default page of the history read (DESIGN 3.3, 4.2). DESIGN
+/// names the constant without a value; 100 is the implementation's choice.
+pub const HISTORY_PAGE_MAX_LIMIT: u64 = 100;
+
+/// Largest and default page of the application list (DESIGN 3.3, 4.2). DESIGN
+/// names the constant without a value; 100 is the implementation's choice.
+pub const APPLICATION_PAGE_MAX_LIMIT: u64 = 100;
+
 /// `text` cut to at most `max_bytes` bytes, on a character boundary.
 #[must_use]
 pub fn cut(text: &str, max_bytes: usize) -> &str {

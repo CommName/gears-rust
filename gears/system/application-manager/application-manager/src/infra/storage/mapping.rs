@@ -11,9 +11,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use time::{OffsetDateTime, UtcOffset};
 
-use super::entity::{audit_event, operation};
-use crate::domain::audit::{AuditEvent, AuditKind};
-use crate::domain::operation::{NewOperation, Operation, OperationStatus};
+use super::entity::{application, history_event, operation};
+use crate::domain::history::{HistoryEvent, HistoryKind};
+use crate::domain::operation::{ApplicationRecord, NewOperation, Operation, OperationStatus};
 
 /// A stored row does not map to a domain value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -61,7 +61,6 @@ pub const fn status_token(status: OperationStatus) -> &'static str {
         OperationStatus::Accepted => "accepted",
         OperationStatus::Running => "running",
         OperationStatus::Completed => "completed",
-        OperationStatus::Interrupted => "interrupted",
     }
 }
 
@@ -70,24 +69,23 @@ fn parse_status(token: &str) -> Result<OperationStatus, RowError> {
         "accepted" => Ok(OperationStatus::Accepted),
         "running" => Ok(OperationStatus::Running),
         "completed" => Ok(OperationStatus::Completed),
-        "interrupted" => Ok(OperationStatus::Interrupted),
         _ => Err(RowError),
     }
 }
 
-const fn kind_token(kind: AuditKind) -> &'static str {
+const fn kind_token(kind: HistoryKind) -> &'static str {
     match kind {
-        AuditKind::Accepted => "accepted",
-        AuditKind::Finished => "finished",
-        AuditKind::Refused => "refused",
+        HistoryKind::Accepted => "accepted",
+        HistoryKind::Finished => "finished",
+        HistoryKind::Refused => "refused",
     }
 }
 
-fn parse_kind(token: &str) -> Result<AuditKind, RowError> {
+fn parse_kind(token: &str) -> Result<HistoryKind, RowError> {
     match token {
-        "accepted" => Ok(AuditKind::Accepted),
-        "finished" => Ok(AuditKind::Finished),
-        "refused" => Ok(AuditKind::Refused),
+        "accepted" => Ok(HistoryKind::Accepted),
+        "finished" => Ok(HistoryKind::Finished),
+        "refused" => Ok(HistoryKind::Refused),
         _ => Err(RowError),
     }
 }
@@ -108,9 +106,13 @@ pub fn report_json(report: &OutcomeReport) -> Result<serde_json::Value, RowError
     serde_json::to_value(report).map_err(|_| RowError)
 }
 
+/// The row the acceptance transaction inserts for `new`, accepted at
+/// `accepted_at` with the run deadline `run_deadline`, both by database time.
 pub fn operation_row(
     backend: DbBackend,
     new: &NewOperation,
+    accepted_at: OffsetDateTime,
+    run_deadline: OffsetDateTime,
 ) -> Result<operation::ActiveModel, RowError> {
     Ok(operation::ActiveModel {
         operation_id: Set(new.operation_id),
@@ -119,10 +121,10 @@ pub fn operation_row(
         status: Set(status_token(OperationStatus::Accepted).to_owned()),
         category: Set(None),
         report: Set(report_json(&new.report)?),
-        accepted_at: Set(stored_time(backend, new.accepted_at)),
+        accepted_at: Set(stored_time(backend, accepted_at)),
         started_at: Set(None),
         finished_at: Set(None),
-        run_deadline: Set(stored_time(backend, new.run_deadline)),
+        run_deadline: Set(stored_time(backend, run_deadline)),
         finished_event_id: Set(new.finished_event_id),
     })
 }
@@ -147,27 +149,52 @@ pub fn operation_from_row(row: operation::Model) -> Result<Operation, RowError> 
     })
 }
 
+/// The row of `event`, written at `written_at` by database time.
 pub fn event_row(
     backend: DbBackend,
-    event: &AuditEvent,
-) -> Result<audit_event::ActiveModel, RowError> {
-    Ok(audit_event::ActiveModel {
+    event: &HistoryEvent,
+    written_at: OffsetDateTime,
+) -> Result<history_event::ActiveModel, RowError> {
+    Ok(history_event::ActiveModel {
         event_id: Set(event.event_id),
         kind: Set(kind_token(event.kind).to_owned()),
         correlation_id: Set(event.correlation_id),
         action: Set(enum_token(&event.action)?),
-        written_at: Set(stored_time(backend, event.written_at)),
+        written_at: Set(stored_time(backend, written_at)),
         content: Set(event.content.clone()),
     })
 }
 
-pub fn event_from_row(row: audit_event::Model) -> Result<AuditEvent, RowError> {
-    Ok(AuditEvent {
+pub fn event_from_row(row: history_event::Model) -> Result<HistoryEvent, RowError> {
+    Ok(HistoryEvent {
         event_id: row.event_id,
         kind: parse_kind(&row.kind)?,
         correlation_id: row.correlation_id,
         action: parse_enum::<OperationAction>(&row.action)?,
         written_at: row.written_at,
         content: row.content,
+    })
+}
+
+pub fn application_row(
+    backend: DbBackend,
+    record: &ApplicationRecord,
+) -> Result<application::ActiveModel, RowError> {
+    Ok(application::ActiveModel {
+        application_id: Set(record.application_id.clone()),
+        version: Set(record.version.clone()),
+        operation_id: Set(record.operation_id),
+        category: Set(enum_token(&record.category)?),
+        finished_at: Set(stored_time(backend, record.finished_at)),
+    })
+}
+
+pub fn application_from_row(row: application::Model) -> Result<ApplicationRecord, RowError> {
+    Ok(ApplicationRecord {
+        application_id: row.application_id,
+        version: row.version,
+        operation_id: row.operation_id,
+        category: parse_enum::<RequestCategory>(&row.category)?,
+        finished_at: row.finished_at,
     })
 }

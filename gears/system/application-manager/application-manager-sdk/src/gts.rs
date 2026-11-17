@@ -1,9 +1,9 @@
 //! GTS declarations for the Application Manager SDK.
 
 use toolkit::gts::PluginV1;
+use toolkit_gts::{gts_id, gts_type_schema};
 
 use crate::models::OutcomeReport;
-use toolkit_gts::{gts_id, gts_type_schema};
 
 /// Abstract base of every section type.
 ///

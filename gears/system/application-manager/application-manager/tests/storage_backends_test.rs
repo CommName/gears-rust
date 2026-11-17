@@ -1,7 +1,8 @@
 //! Real PostgreSQL and MySQL runs of the Application Manager storage: the
 //! migration up/down/up, the open-operation index under a concurrent race,
-//! binary no-pad collation of application ids, case-sensitive enum tokens, the
-//! final-write guard, and an interruption racing a report write.
+//! binary no-pad collation and the byte limit of application ids,
+//! case-sensitive enum tokens, the final-write guard with the application
+//! record, and concurrent expiry completions of one operation.
 //!
 //! SQLite runs in the default suite (`repo_tests.rs`). These need a Docker
 //! daemon, so they sit behind `--features integration`. Without
@@ -25,13 +26,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use application_manager::domain::audit::{AuditEvent, AuditKind};
+use application_manager::domain::history::{HistoryEvent, HistoryKind};
 use application_manager::domain::operation::{NewOperation, OperationStatus};
 use application_manager::domain::ports::{OperationRepository, StorageError};
 use application_manager::infra::storage::{Migrator, SeaOrmOperationRepository};
 use application_manager::sdk::{
     OperationAction, OutcomeReport, ReportApplication, RequestCategory, SectionOutcome,
-    SectionOutcomeEntry,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
@@ -39,13 +39,13 @@ use serde_json::json;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use time::OffsetDateTime;
-use time::macros::datetime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
-const T0: OffsetDateTime = datetime!(2026-10-22 10:00:00 UTC);
-const TABLES: [&str; 2] = ["operations", "audit_ledger"];
+const TABLES: [&str; 3] = ["operations", "operation_history", "applications"];
+/// A run window no test outlives.
+const OPEN: Duration = Duration::from_secs(3600);
 
 /// Whether a missing or broken Docker must fail the run rather than skip it.
 fn require_docker() -> bool {
@@ -189,16 +189,11 @@ fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
-fn secs(n: i64) -> time::Duration {
-    time::Duration::seconds(n)
-}
-
 fn report(n: u128, app: &str) -> OutcomeReport {
     OutcomeReport {
         operation_id: id(n),
         action: OperationAction::Seed,
         category: None,
-        interrupted: false,
         application: ReportApplication {
             id: app.to_owned(),
             version: Some("1.0.0".to_owned()),
@@ -209,40 +204,55 @@ fn report(n: u128, app: &str) -> OutcomeReport {
     }
 }
 
-fn new_op(n: u128, app: &str) -> NewOperation {
+fn new_op(n: u128, app: &str, window: Duration) -> NewOperation {
     NewOperation {
         operation_id: id(n),
         application_id: app.to_owned(),
         action: OperationAction::Seed,
-        accepted_at: T0,
-        run_deadline: T0 + secs(60),
-        finished_event_id: id(n + 0x1000),
+        run_window: window,
+        finished_event_id: id(n + 0x2000),
         report: report(n, app),
     }
 }
 
-fn event(event_id: u128, kind: AuditKind, correlation: u128) -> AuditEvent {
-    AuditEvent {
+fn event(event_id: u128, kind: HistoryKind, correlation: u128) -> HistoryEvent {
+    HistoryEvent {
         event_id: id(event_id),
         kind,
         correlation_id: id(correlation),
         action: OperationAction::Seed,
-        written_at: T0,
+        // Ignored on insert: the repository writes the database time.
+        written_at: OffsetDateTime::UNIX_EPOCH,
         content: json!({ "marker": "x" }),
     }
 }
 
-async fn accept(repo: &SeaOrmOperationRepository, n: u128, app: &str) -> Result<(), StorageError> {
+async fn accept_within(
+    repo: &SeaOrmOperationRepository,
+    n: u128,
+    app: &str,
+    window: Duration,
+) -> Result<(), StorageError> {
     repo.accept(
-        new_op(n, app),
-        event(n + 0x2000, AuditKind::Accepted, n),
-        T0,
+        new_op(n, app, window),
+        event(n + 0x1000, HistoryKind::Accepted, n),
     )
     .await
+    .map(|_| ())
+}
+
+async fn accept(repo: &SeaOrmOperationRepository, n: u128, app: &str) -> Result<(), StorageError> {
+    accept_within(repo, n, app, OPEN).await
+}
+
+async fn history(repo: &SeaOrmOperationRepository, n: u128) -> Vec<HistoryEvent> {
+    repo.history_page(Some(vec![id(n)]), None, 100)
+        .await
+        .unwrap()
 }
 
 /// Eight concurrent acceptances for one application: one winner, the rest
-/// lose on the unique index, and only the winner's event is in the ledger.
+/// lose on the unique index, and only the winner's event is in the operation history.
 async fn assert_index_race(repo: &Arc<SeaOrmOperationRepository>, base: u128, app: &str) {
     let mut tasks = Vec::new();
     for n in 1..=8_u128 {
@@ -261,13 +271,13 @@ async fn assert_index_race(repo: &Arc<SeaOrmOperationRepository>, base: u128, ap
         }
     }
     assert_eq!(won.len(), 1, "exactly one winner: {won:?}");
-    let open = repo.open_operation(app, T0).await.unwrap().unwrap();
+    let open = repo.open_operation(app).await.unwrap().unwrap();
     assert_eq!(open.operation_id, id(won[0]));
-    let mut ledger = 0;
+    let mut events = 0;
     for n in 1..=8_u128 {
-        ledger += repo.audit_events(id(base + n)).await.unwrap().len();
+        events += history(repo, base + n).await.len();
     }
-    assert_eq!(ledger, 1, "a lost acceptance leaves no accepted event");
+    assert_eq!(events, 1, "a lost acceptance leaves no accepted event");
 }
 
 /// Application ids compare exactly: case and trailing space distinguish them,
@@ -284,7 +294,7 @@ async fn assert_binary_collation(repo: &SeaOrmOperationRepository, base: u128) {
     );
     for (n, app) in [(1, "a"), (2, "A"), (3, "a ")] {
         assert_eq!(
-            repo.open_operation(app, T0)
+            repo.open_operation(app)
                 .await
                 .unwrap()
                 .unwrap()
@@ -293,32 +303,27 @@ async fn assert_binary_collation(repo: &SeaOrmOperationRepository, base: u128) {
             "{app:?}"
         );
     }
-    assert_eq!(repo.open_operation("a  ", T0).await, Ok(None));
+    assert_eq!(repo.open_operation("a  ").await, Ok(None));
+    // 128 two-byte characters: within 255 characters, over 255 bytes.
+    assert_eq!(
+        accept(repo, base + 5, &"\u{e9}".repeat(128)).await,
+        Err(StorageError::Unavailable),
+        "the byte limit"
+    );
+    accept(repo, base + 6, &"\u{e9}".repeat(127))
+        .await
+        .expect("254 bytes fit");
 }
 
-/// The first final write wins, sequentially and under a race, and a final
-/// record frees its application.
-async fn assert_final_write_guard(repo: &Arc<SeaOrmOperationRepository>, base: u128, app: &str) {
-    let op = base + 1;
-    accept(repo, op, app).await.unwrap();
-    repo.mark_running(id(op), T0 + secs(1)).await.unwrap();
-
+/// Eight concurrent final writes of operation `op`; returns how many won.
+async fn race_finish(repo: &Arc<SeaOrmOperationRepository>, op: u128, app: &str) -> usize {
     let mut tasks = Vec::new();
     for _ in 0..8 {
         let repo = Arc::clone(repo);
         let app = app.to_owned();
         tasks.push(tokio::spawn(async move {
-            // Every racer carries the record's own finished event id.
-            let mut finished = event(op + 0x1000, AuditKind::Finished, op);
-            finished.written_at = T0 + secs(10);
-            repo.finish(
-                id(op),
-                &report(op, &app),
-                RequestCategory::Succeeded,
-                finished,
-                T0 + secs(10),
-            )
-            .await
+            repo.finish(id(op), &report(op, &app), RequestCategory::Succeeded)
+                .await
         }));
     }
     let mut won = 0;
@@ -329,106 +334,96 @@ async fn assert_final_write_guard(repo: &Arc<SeaOrmOperationRepository>, base: u
             Err(other) => panic!("unexpected {other:?}"),
         }
     }
-    assert_eq!(won, 1, "exactly one final write wins");
+    won
+}
 
-    let read = repo
-        .read_operation(id(op), T0 + secs(11))
-        .await
-        .unwrap()
-        .unwrap();
+/// Operation `op` of `app` completed as succeeded with one finished event and
+/// one application record, and no later write changes it.
+async fn assert_completed_once(repo: &Arc<SeaOrmOperationRepository>, op: u128, app: &str) {
+    let read = repo.read_operation(id(op)).await.unwrap().unwrap();
     assert_eq!(read.status, OperationStatus::Completed);
     assert_eq!(read.category, Some(RequestCategory::Succeeded));
     assert_eq!(
-        repo.audit_events(id(op)).await.unwrap().len(),
+        history(repo, op).await.len(),
         2,
         "the accepted event and exactly one finished event"
     );
-    // A late interruption and a late report are refused.
+    let records = repo
+        .applications_page(Some(vec![app.to_owned()]), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].operation_id, id(op));
+    assert_eq!(records[0].finished_at, read.finished_at.unwrap());
+    assert_eq!(repo.expire_if_expired(id(op)).await, Ok(false));
     assert_eq!(
-        repo.interrupt_if_expired(id(op), T0 + secs(100)).await,
-        Ok(false)
-    );
-    assert_eq!(
-        repo.record_report(id(op), &report(op, app), T0 + secs(12))
+        repo.record_section_outcome(id(op), "a", SectionOutcome::Rejected, None, None)
             .await,
         Err(StorageError::OperationFinal)
     );
+}
+
+/// The first final write wins under a race, writes the application record
+/// once, and frees the application.
+async fn assert_final_write_guard(repo: &Arc<SeaOrmOperationRepository>, base: u128, app: &str) {
+    let op = base + 1;
+    accept(repo, op, app).await.unwrap();
+    let left = repo
+        .mark_running(id(op), &[("a".to_owned(), Some("gts.t.a.v1~".to_owned()))])
+        .await
+        .unwrap();
+    assert!(left > Duration::from_secs(3500), "{left:?}");
+    repo.record_section_outcome(id(op), "a", SectionOutcome::Succeeded, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        race_finish(repo, op, app).await,
+        1,
+        "exactly one final write wins"
+    );
+
+    assert_completed_once(repo, op, app).await;
     // The final record frees the application.
     accept(repo, base + 2, app)
         .await
         .expect("a final record is not open");
 }
 
-/// An interruption and a report write race for one expired record. Either the
-/// report write commits first and the interrupted record and its finished event
-/// both carry the new section, or the interruption wins and the report write is
-/// `OperationFinal`. The stored report and the event never disagree, and a
-/// committed report write is never lost.
-async fn assert_interruption_keeps_a_concurrent_report(
-    repo: &Arc<SeaOrmOperationRepository>,
-    base: u128,
-) {
-    let mut report_first = 0;
-    for round in 0..24_u128 {
+/// Expiry completions race for one expired operation, from the sweeper and
+/// the operation read: exactly one completes it, with one finished event.
+async fn assert_one_expiry_completion(repo: &Arc<SeaOrmOperationRepository>, base: u128) {
+    for round in 0..8_u128 {
         let n = base + round;
-        let app = format!("interrupt.race.{round}");
-        accept(repo, n, &app).await.unwrap();
-        repo.mark_running(id(n), T0 + secs(1)).await.unwrap();
-
-        let mut late = report(n, &app);
-        late.sections.push(SectionOutcomeEntry {
-            key: "late".to_owned(),
-            outcome: SectionOutcome::Succeeded,
-            schema_version: Some("1".to_owned()),
-            detail: None,
-            location: None,
-        });
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let writer = {
-            let (repo, barrier) = (Arc::clone(repo), Arc::clone(&barrier));
-            tokio::spawn(async move {
-                barrier.wait().await;
-                repo.record_report(id(n), &late, T0 + secs(10)).await
-            })
-        };
-        let interrupter = {
-            let (repo, barrier) = (Arc::clone(repo), barrier);
-            tokio::spawn(async move {
-                barrier.wait().await;
-                repo.interrupt_if_expired(id(n), T0 + secs(100)).await
-            })
-        };
-        let written = writer.await.unwrap();
-        assert_eq!(interrupter.await.unwrap(), Ok(true), "round {round}");
-        let expected = match written {
-            Ok(()) => {
-                report_first += 1;
-                1
-            }
-            Err(StorageError::OperationFinal) => 0,
-            Err(other) => panic!("unexpected {other:?}"),
-        };
-
-        let op = repo
-            .read_operation(id(n), T0 + secs(101))
+        accept_within(repo, n, &format!("expiry.race.{round}"), Duration::ZERO)
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(op.status, OperationStatus::Interrupted);
-        assert!(op.report.interrupted);
-        assert_eq!(op.report.sections.len(), expected, "round {round}: report");
-        let events = repo.audit_events(id(n)).await.unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let (repo, barrier) = (Arc::clone(repo), Arc::clone(&barrier));
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                repo.expire_if_expired(id(n)).await
+            }));
+        }
+        let mut completed = 0;
+        for task in tasks {
+            if task.await.unwrap() == Ok(true) {
+                completed += 1;
+            }
+        }
+        assert_eq!(completed, 1, "round {round}");
+        let events = history(repo, n).await;
         let finished: Vec<_> = events
             .iter()
-            .filter(|e| e.kind == AuditKind::Finished)
+            .filter(|e| e.kind == HistoryKind::Finished)
             .collect();
         assert_eq!(finished.len(), 1, "round {round}");
-        let sections = finished[0].content["result"]["sections"]
-            .as_array()
-            .expect("sections array");
-        assert_eq!(sections.len(), expected, "round {round}: finished event");
+        assert_eq!(finished[0].content["result"]["reason"], json!("expired"));
+        let op = repo.read_operation(id(n)).await.unwrap().unwrap();
+        assert_eq!(op.category, Some(RequestCategory::InternalFailure));
     }
-    eprintln!("report committed before the interruption in {report_first} of 24 rounds");
 }
 
 /// The enum token columns compare as bytes: `'ACCEPTED'` is not `'accepted'`,
@@ -459,7 +454,7 @@ async fn run_suite(backend: Backend) {
     assert_index_race(&repo, 0x100, "race.app").await;
     assert_binary_collation(&repo, 0x200).await;
     assert_final_write_guard(&repo, 0x300, "guard.app").await;
-    assert_interruption_keeps_a_concurrent_report(&repo, 0x400).await;
+    assert_one_expiry_completion(&repo, 0x400).await;
     if backend.name == "mysql" {
         assert_enum_tokens_are_case_sensitive(&backend).await;
     }

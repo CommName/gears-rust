@@ -13,7 +13,7 @@ const IDENTIFIER_MAX_BYTES: usize = 63;
 const OPEN_INDEX: &str = "ux_operations_open_application";
 const STATUS_DEADLINE_INDEX: &str = "idx_operations_status_deadline";
 const FINISHED_AT_INDEX: &str = "idx_operations_finished_at";
-const CORRELATION_INDEX: &str = "idx_audit_ledger_correlation_id";
+const CORRELATION_INDEX: &str = "idx_operation_history_correlation_id";
 
 fn lists() -> [(&'static str, &'static [&'static str]); 3] {
     [
@@ -50,10 +50,10 @@ fn create_table(statements: &[&'static str], table: &str) -> &'static str {
 }
 
 #[test]
-fn every_backend_creates_both_tables() {
+fn every_backend_creates_the_three_tables() {
     for (name, statements) in lists() {
         let sql = joined(statements);
-        for table in ["operations", "audit_ledger"] {
+        for table in ["operations", "operation_history", "applications"] {
             let create = norm(&format!("CREATE TABLE IF NOT EXISTS {table} ("));
             assert!(sql.contains(&create), "{name} does not create {table}");
         }
@@ -63,7 +63,10 @@ fn every_backend_creates_both_tables() {
 #[test]
 fn every_table_has_a_primary_key_on_its_id() {
     for (name, statements) in lists() {
-        for (table, id) in [("operations", "operation_id"), ("audit_ledger", "event_id")] {
+        for (table, id) in [
+            ("operations", "operation_id"),
+            ("operation_history", "event_id"),
+        ] {
             let create = norm(create_table(statements, table));
             assert!(create.contains(id), "{name} {table}: no {id}");
             assert!(
@@ -81,7 +84,9 @@ fn every_backend_has_the_three_secondary_indexes() {
             "CREATE INDEX IF NOT EXISTS {STATUS_DEADLINE_INDEX} ON operations(status,run_deadline)"
         ),
         format!("CREATE INDEX IF NOT EXISTS {FINISHED_AT_INDEX} ON operations(finished_at)"),
-        format!("CREATE INDEX IF NOT EXISTS {CORRELATION_INDEX} ON audit_ledger(correlation_id)"),
+        format!(
+            "CREATE INDEX IF NOT EXISTS {CORRELATION_INDEX} ON operation_history(correlation_id)"
+        ),
     ];
     for (name, statements) in [
         ("postgres", PG_UP_STATEMENTS),
@@ -93,7 +98,7 @@ fn every_backend_has_the_three_secondary_indexes() {
         }
     }
     let operations = norm(create_table(MYSQL_UP_STATEMENTS, "operations"));
-    let ledger = norm(create_table(MYSQL_UP_STATEMENTS, "audit_ledger"));
+    let history = norm(create_table(MYSQL_UP_STATEMENTS, "operation_history"));
     for want in [
         format!("KEY {STATUS_DEADLINE_INDEX}(status,run_deadline)"),
         format!("KEY {FINISHED_AT_INDEX}(finished_at)"),
@@ -105,8 +110,8 @@ fn every_backend_has_the_three_secondary_indexes() {
     }
     let want = format!("KEY {CORRELATION_INDEX}(correlation_id)");
     assert!(
-        ledger.contains(&norm(&want)),
-        "mysql audit_ledger: missing `{want}`"
+        history.contains(&norm(&want)),
+        "mysql operation_history: missing `{want}`"
     );
 }
 
@@ -210,13 +215,13 @@ fn enum_token_columns_use_the_same_binary_collation_as_the_application_id() {
     ];
     for (name, statements, collation, [short, long]) in collations {
         let operations = norm(create_table(statements, "operations"));
-        let ledger = norm(create_table(statements, "audit_ledger"));
+        let history = norm(create_table(statements, "operation_history"));
         for (table, column, ty) in [
             (&operations, "action", short),
             (&operations, "status", short),
             (&operations, "category", long),
-            (&ledger, "kind", short),
-            (&ledger, "action", short),
+            (&history, "kind", short),
+            (&history, "action", short),
         ] {
             let want = norm(&format!("{column} {ty} {collation}"));
             assert!(table.contains(&want), "{name}: missing `{want}`");
@@ -276,7 +281,7 @@ fn uuid_timestamp_and_json_columns_use_the_d5_mapping() {
             ],
         ),
     ];
-    for (name, statements, operations_columns, ledger_columns) in want {
+    for (name, statements, operations_columns, history_columns) in want {
         let operations = norm(create_table(statements, "operations"));
         for column in operations_columns {
             assert!(
@@ -284,11 +289,11 @@ fn uuid_timestamp_and_json_columns_use_the_d5_mapping() {
                 "{name} operations: `{column}`"
             );
         }
-        let ledger = norm(create_table(statements, "audit_ledger"));
-        for column in ledger_columns {
+        let history = norm(create_table(statements, "operation_history"));
+        for column in history_columns {
             assert!(
-                ledger.contains(&norm(column)),
-                "{name} audit_ledger: `{column}`"
+                history.contains(&norm(column)),
+                "{name} operation_history: `{column}`"
             );
         }
     }
@@ -297,12 +302,12 @@ fn uuid_timestamp_and_json_columns_use_the_d5_mapping() {
 #[test]
 fn sqlite_uuid_columns_check_for_16_bytes() {
     let operations = norm(create_table(SQLITE_UP_STATEMENTS, "operations"));
-    let ledger = norm(create_table(SQLITE_UP_STATEMENTS, "audit_ledger"));
+    let history = norm(create_table(SQLITE_UP_STATEMENTS, "operation_history"));
     for (table, column) in [
         (&operations, "operation_id"),
         (&operations, "finished_event_id"),
-        (&ledger, "event_id"),
-        (&ledger, "correlation_id"),
+        (&history, "event_id"),
+        (&history, "correlation_id"),
     ] {
         assert!(
             table.contains(&norm(&format!("length({column}) = 16"))),
@@ -315,15 +320,21 @@ fn sqlite_uuid_columns_check_for_16_bytes() {
 fn enum_columns_are_text_with_check_constraints() {
     for (name, statements) in lists() {
         let operations = norm(create_table(statements, "operations"));
-        let ledger = norm(create_table(statements, "audit_ledger"));
+        let history = norm(create_table(statements, "operation_history"));
+        let applications = norm(create_table(statements, "applications"));
         for (table, check) in [
             (&operations, "action IN ('seed','uninstall')"),
+            (&operations, "status IN ('accepted','running','completed')"),
             (
                 &operations,
-                "status IN ('accepted','running','completed','interrupted')",
+                "category IS NULL OR category IN ('succeeded','invalid_manifest','plugin_rejected','not_permitted','internal_failure')",
             ),
-            (&ledger, "action IN ('seed','uninstall')"),
-            (&ledger, "kind IN ('accepted','finished','refused')"),
+            (
+                &applications,
+                "category IN ('succeeded','invalid_manifest','plugin_rejected','not_permitted','internal_failure')",
+            ),
+            (&history, "action IN ('seed','uninstall')"),
+            (&history, "kind IN ('accepted','finished','refused')"),
         ] {
             assert!(
                 table.contains(&norm(&format!("CHECK({check})"))),
@@ -357,12 +368,63 @@ fn nullable_columns_are_exactly_the_design_ones() {
 }
 
 #[test]
-fn audit_ledger_has_no_foreign_key_to_operations() {
-    // A purged operation must not take its events with it.
+fn history_and_applications_have_no_foreign_key_to_operations() {
+    // A purged operation must not take its events or its application record
+    // with it.
     for (name, statements) in lists() {
-        let ledger = norm(create_table(statements, "audit_ledger")).to_ascii_uppercase();
-        assert!(!ledger.contains("REFERENCES"), "{name}");
-        assert!(!ledger.contains("FOREIGN KEY"), "{name}");
+        for table in ["operation_history", "applications"] {
+            let sql = norm(create_table(statements, table)).to_ascii_uppercase();
+            assert!(!sql.contains("REFERENCES"), "{name} {table}");
+            assert!(!sql.contains("FOREIGN KEY"), "{name} {table}");
+        }
+    }
+}
+
+#[test]
+fn application_ids_and_versions_are_limited_in_bytes() {
+    for (name, statements, bytes) in [
+        ("postgres", PG_UP_STATEMENTS, "octet_length"),
+        ("mysql", MYSQL_UP_STATEMENTS, "octet_length"),
+        ("sqlite", SQLITE_UP_STATEMENTS, "length(CAST"),
+    ] {
+        let operations = norm(create_table(statements, "operations"));
+        let applications = norm(create_table(statements, "applications"));
+        for (table, column) in [
+            (&operations, "application_id"),
+            (&applications, "application_id"),
+            (&applications, "version"),
+        ] {
+            let check = norm(&format!("{bytes}({column}"));
+            assert!(table.contains(&check), "{name}: {column} byte limit");
+        }
+        assert!(operations.contains("<= 255"), "{name}");
+    }
+}
+
+#[test]
+fn applications_columns_are_the_design_ones_and_not_null() {
+    for (name, statements) in lists() {
+        let applications = norm(create_table(statements, "applications"));
+        for column in [
+            "application_id",
+            "version",
+            "operation_id",
+            "category",
+            "finished_at",
+        ] {
+            // The column's declaration runs from its name to the next comma.
+            let start = ["(", ","]
+                .iter()
+                .filter_map(|lead| applications.find(&format!("{lead}{column} ")))
+                .min()
+                .unwrap_or_else(|| panic!("{name}: applications.{column}"));
+            let rest = &applications[start + 1..];
+            let declared = &rest[..rest.find(',').unwrap_or(rest.len())];
+            assert!(
+                declared.contains("NOT NULL"),
+                "{name}: applications.{column}"
+            );
+        }
     }
 }
 
@@ -407,17 +469,21 @@ fn indexes_follow_their_tables() {
                 < position(&format!("INDEX IF NOT EXISTS {OPEN_INDEX}"))
         );
         assert!(
-            position("CREATE TABLE IF NOT EXISTS audit_ledger(")
+            position("CREATE TABLE IF NOT EXISTS operation_history(")
                 < position(&format!("INDEX IF NOT EXISTS {CORRELATION_INDEX}"))
         );
     }
 }
 
 #[test]
-fn down_drops_both_tables() {
+fn down_drops_the_three_tables() {
     let sql = joined(DOWN_STATEMENTS);
     assert!(sql.contains("DROP TABLE IF EXISTS operations"), "{sql}");
-    assert!(sql.contains("DROP TABLE IF EXISTS audit_ledger"), "{sql}");
+    assert!(sql.contains("DROP TABLE IF EXISTS applications"), "{sql}");
+    assert!(
+        sql.contains("DROP TABLE IF EXISTS operation_history"),
+        "{sql}"
+    );
 }
 
 #[test]

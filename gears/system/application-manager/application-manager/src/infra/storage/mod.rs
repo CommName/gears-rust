@@ -1,5 +1,5 @@
-//! Operation storage: the `operations` table and the insert-only
-//! `audit_ledger` (DESIGN 3.7).
+//! Operation storage: the `operations` table, the insert-only
+//! `operation_history`, and `applications` (DESIGN 3.7).
 
 pub mod entity;
 mod mapping;

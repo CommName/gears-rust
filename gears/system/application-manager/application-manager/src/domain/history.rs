@@ -1,4 +1,5 @@
-//! Audit events and their content (DESIGN 3.1 "Audit event content").
+//! Operation history events and their content (DESIGN 3.1 "History event
+//! content").
 //!
 //! Ledger rows carry no manifest content: no section body, no problem
 //! location or message, and no plugin detail.
@@ -14,79 +15,91 @@ use time::format_description::well_known::Rfc3339;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
-/// The kind of an audit event.
+use crate::domain::operation::CompletionReason;
+
+/// The kind of an history event.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuditKind {
+pub enum HistoryKind {
     /// An accepted request.
     Accepted,
-    /// A finished operation, including an interrupted one.
+    /// A finished operation, including an expiry or supervisor completion.
     Finished,
     /// A refused request.
     Refused,
 }
 
-/// One ledger row (`audit_ledger` table, DESIGN 3.7).
+/// One history row (`operation_history` table, DESIGN 3.7).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
-pub struct AuditEvent {
+pub struct HistoryEvent {
     /// Time-ordered event id, assigned at receive.
     pub event_id: Uuid,
     /// The kind.
-    pub kind: AuditKind,
+    pub kind: HistoryKind,
     /// The operation id of an accepted request, else the request id.
     pub correlation_id: Uuid,
     /// `seed` or `uninstall`.
     pub action: OperationAction,
-    /// Write time.
+    /// Write time: the database time of the transaction that writes the
+    /// event. The repository sets it on insert; a value built before the
+    /// write is ignored.
     pub written_at: OffsetDateTime,
     /// The content built by [`accepted`], [`finished`] or [`refused`].
     pub content: Value,
 }
 
-/// The application of an event: as sent when within the limits, else its
+/// One envelope text of an event: as sent when within the limits, else its
 /// byte length and SHA-256 digest.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApplicationRef {
-    /// Id, and version for a seed, within the limits.
-    Within {
-        /// Application id.
-        id: String,
-        /// Application version; none for uninstall.
-        version: Option<String>,
-    },
-    /// An id or version outside the limits.
+pub enum BoundedText {
+    /// The text, within the limits.
+    Within(String),
+    /// A text outside the limits.
     Digest {
-        /// Byte length of the id.
-        id_bytes: usize,
-        /// Lower-case hex SHA-256 of the id.
-        id_sha256: String,
-        /// Byte length of the version, when there is one.
-        version_bytes: Option<usize>,
-        /// Lower-case hex SHA-256 of the version, when there is one.
-        version_sha256: Option<String>,
+        /// Byte length of the text.
+        bytes: usize,
+        /// Lower-case hex SHA-256 of the text.
+        sha256: String,
     },
 }
 
+impl BoundedText {
+    /// [`BoundedText::Within`] when `text` is at most `max_bytes` bytes,
+    /// otherwise [`BoundedText::Digest`].
+    #[must_use]
+    pub fn of(text: &str, max_bytes: usize) -> Self {
+        if text.len() <= max_bytes {
+            Self::Within(text.to_owned())
+        } else {
+            Self::Digest {
+                bytes: text.len(),
+                sha256: sha256_hex(text),
+            }
+        }
+    }
+}
+
+/// The application of an event. Each of the id and the version is kept as
+/// sent when within the limits, else as its byte length and SHA-256 digest.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationRef {
+    /// Application id.
+    pub id: BoundedText,
+    /// Application version; none for uninstall.
+    pub version: Option<BoundedText>,
+}
+
 impl ApplicationRef {
-    /// [`ApplicationRef::Within`] when the id and the version (when present)
-    /// are at most `max_bytes` bytes; otherwise [`ApplicationRef::Digest`] of
-    /// both.
+    /// The id and the version (when present), each bounded at `max_bytes`
+    /// bytes on its own.
     #[must_use]
     pub fn bounded(id: &str, version: Option<&str>, max_bytes: usize) -> Self {
-        let within = id.len() <= max_bytes && version.is_none_or(|v| v.len() <= max_bytes);
-        if within {
-            return Self::Within {
-                id: id.to_owned(),
-                version: version.map(str::to_owned),
-            };
-        }
-        Self::Digest {
-            id_bytes: id.len(),
-            id_sha256: sha256_hex(id),
-            version_bytes: version.map(str::len),
-            version_sha256: version.map(sha256_hex),
+        Self {
+            id: BoundedText::of(id, max_bytes),
+            version: version.map(|v| BoundedText::of(v, max_bytes)),
         }
     }
 }
@@ -128,34 +141,26 @@ fn sha256_hex(text: &str) -> String {
     })
 }
 
-fn application_json(application: &ApplicationRef) -> Value {
-    match application {
-        ApplicationRef::Within { id, version } => {
-            let mut object = Map::new();
-            object.insert("id".to_owned(), json!(id));
-            if let Some(version) = version {
-                object.insert("version".to_owned(), json!(version));
-            }
-            Value::Object(object)
+/// Insert `text` as `name`, or as `name_bytes` and `name_sha256`.
+fn insert_text(object: &mut Map<String, Value>, name: &str, text: &BoundedText) {
+    match text {
+        BoundedText::Within(text) => {
+            object.insert(name.to_owned(), json!(text));
         }
-        ApplicationRef::Digest {
-            id_bytes,
-            id_sha256,
-            version_bytes,
-            version_sha256,
-        } => {
-            let mut object = Map::new();
-            object.insert("id_bytes".to_owned(), json!(id_bytes));
-            object.insert("id_sha256".to_owned(), json!(id_sha256));
-            if let Some(bytes) = version_bytes {
-                object.insert("version_bytes".to_owned(), json!(bytes));
-            }
-            if let Some(digest) = version_sha256 {
-                object.insert("version_sha256".to_owned(), json!(digest));
-            }
-            Value::Object(object)
+        BoundedText::Digest { bytes, sha256 } => {
+            object.insert(format!("{name}_bytes"), json!(bytes));
+            object.insert(format!("{name}_sha256"), json!(sha256));
         }
     }
+}
+
+fn application_json(application: &ApplicationRef) -> Value {
+    let mut object = Map::new();
+    insert_text(&mut object, "id", &application.id);
+    if let Some(version) = &application.version {
+        insert_text(&mut object, "version", version);
+    }
+    Value::Object(object)
 }
 
 fn section_keys_json(section_keys: &SectionKeys) -> Value {
@@ -182,17 +187,19 @@ fn rule_tokens(problems: &[ReportProblem]) -> Vec<&str> {
         .collect()
 }
 
-/// A section outcome as the ledger records it: key, outcome and schema
-/// version. The plugin's detail and location are not recorded.
+/// A section outcome as the operation history records it: key, section type
+/// and outcome. The plugin's detail and location are not recorded.
 fn section_json(entry: &application_manager_sdk::SectionOutcomeEntry) -> Value {
     let mut object = Map::new();
     object.insert("key".to_owned(), json!(entry.key));
-    object.insert(
-        "outcome".to_owned(),
-        serde_json::to_value(entry.outcome).unwrap_or(Value::Null),
-    );
-    if let Some(version) = &entry.schema_version {
-        object.insert("schema_version".to_owned(), json!(version));
+    if let Some(section_type) = &entry.section_type {
+        object.insert("section_type".to_owned(), json!(section_type));
+    }
+    if let Some(outcome) = entry.outcome {
+        object.insert(
+            "outcome".to_owned(),
+            serde_json::to_value(outcome).unwrap_or(Value::Null),
+        );
     }
     Value::Object(object)
 }
@@ -220,12 +227,14 @@ pub fn accepted(
     Value::Object(content)
 }
 
-/// Content of a finished event: `application` and `result`.
+/// Content of a finished event: `application` and `result`, with the reason
+/// `expired` for an expiry completion.
 #[must_use]
-pub fn finished(report: &OutcomeReport) -> Value {
-    let application = ApplicationRef::Within {
-        id: report.application.id.clone(),
-        version: report.application.version.clone(),
+pub fn finished(report: &OutcomeReport, reason: Option<CompletionReason>) -> Value {
+    // An accepted application was within the limits.
+    let application = ApplicationRef {
+        id: BoundedText::Within(report.application.id.clone()),
+        version: report.application.version.clone().map(BoundedText::Within),
     };
     let mut result = Map::new();
     if let Some(category) = report.category {
@@ -234,7 +243,9 @@ pub fn finished(report: &OutcomeReport) -> Value {
             serde_json::to_value(category).unwrap_or(Value::Null),
         );
     }
-    result.insert("interrupted".to_owned(), json!(report.interrupted));
+    if let Some(CompletionReason::Expired) = reason {
+        result.insert("reason".to_owned(), json!("expired"));
+    }
     result.insert("problem_count".to_owned(), json!(report.problems.len()));
     result.insert("rules".to_owned(), json!(rule_tokens(&report.problems)));
     result.insert(
@@ -291,5 +302,5 @@ pub fn refused(
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[path = "audit_tests.rs"]
+#[path = "history_tests.rs"]
 mod tests;

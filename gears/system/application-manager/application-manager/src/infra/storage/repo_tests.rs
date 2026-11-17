@@ -1,6 +1,8 @@
 //! SQLite-backed tests of [`SeaOrmOperationRepository`]: the real `SeaORM`
 //! paths against an in-memory database built from the gear's own migration.
-//! Every call passes its own `now`, so deadlines are exact and no test sleeps.
+//! Every call reads the database clock, so a test sets deadlines through the
+//! run window: an operation accepted with [`OPEN`] stays open for the test,
+//! one accepted with a zero window is expired at once. No test sleeps.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::sync::Arc;
@@ -8,25 +10,26 @@ use std::time::Duration;
 
 use application_manager_sdk::{
     OperationAction, OutcomeReport, ReportApplication, RequestCategory, SectionOutcome,
-    SectionOutcomeEntry,
 };
 use sea_orm::{ConnectionTrait, Database};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use time::OffsetDateTime;
-use time::macros::datetime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use tracing_test::traced_test;
 use uuid::Uuid;
 
 use super::*;
-use crate::domain::audit::AuditKind;
+use crate::domain::history::HistoryKind;
 use crate::domain::operation::OperationStatus;
 use crate::infra::storage::Migrator;
 
-const T0: OffsetDateTime = datetime!(2026-10-22 10:00:00 UTC);
 const APP: &str = "acme.app";
+/// A run window no test outlives.
+const OPEN: Duration = Duration::from_secs(3600);
+/// A run window that is over as soon as the operation is accepted.
+const EXPIRED: Duration = Duration::ZERO;
 
 struct Fixture {
     db: Arc<DBProvider<DbError>>,
@@ -118,19 +121,14 @@ fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
-fn secs(n: i64) -> time::Duration {
-    time::Duration::seconds(n)
-}
-
-fn report(op: u128, app: &str) -> OutcomeReport {
+fn report(op: u128, app: &str, action: OperationAction) -> OutcomeReport {
     OutcomeReport {
         operation_id: id(op),
-        action: OperationAction::Seed,
+        action,
         category: None,
-        interrupted: false,
         application: ReportApplication {
             id: app.to_owned(),
-            version: Some("1.0.0".to_owned()),
+            version: (action == OperationAction::Seed).then(|| "1.0.0".to_owned()),
         },
         sections: vec![],
         problems: vec![],
@@ -138,1027 +136,957 @@ fn report(op: u128, app: &str) -> OutcomeReport {
     }
 }
 
-fn with_section(mut report: OutcomeReport, key: &str) -> OutcomeReport {
-    report.sections.push(SectionOutcomeEntry {
-        key: key.to_owned(),
-        outcome: SectionOutcome::Succeeded,
-        schema_version: Some("1".to_owned()),
-        detail: None,
-        location: None,
-    });
-    report
-}
-
-/// Operation `n` of `app`, accepted at `T0`, due `deadline_secs` after `T0`.
-/// Its accepted event id is `n + 0x2000`, its finished event id `n + 0x1000`.
-fn new_op(n: u128, app: &str, deadline_secs: i64) -> NewOperation {
+/// Operation `n` of `app` with run window `window`. Its accepted event id is
+/// `n + 0x1000`, its finished event id `n + 0x2000`: both are assigned at
+/// receive, in that order.
+fn new_op(n: u128, app: &str, action: OperationAction, window: Duration) -> NewOperation {
     NewOperation {
         operation_id: id(n),
         application_id: app.to_owned(),
-        action: OperationAction::Seed,
-        accepted_at: T0,
-        run_deadline: T0 + secs(deadline_secs),
-        finished_event_id: id(n + 0x1000),
-        report: report(n, app),
+        action,
+        run_window: window,
+        finished_event_id: id(n + 0x2000),
+        report: report(n, app, action),
     }
 }
 
-fn accepted_event(n: u128) -> AuditEvent {
-    AuditEvent {
-        event_id: id(n + 0x2000),
-        kind: AuditKind::Accepted,
-        correlation_id: id(n),
-        action: OperationAction::Seed,
-        written_at: T0,
-        content: json!({ "marker": "accepted" }),
-    }
-}
-
-fn finished_event(n: u128) -> AuditEvent {
-    AuditEvent {
-        event_id: id(n + 0x1000),
-        kind: AuditKind::Finished,
-        correlation_id: id(n),
-        action: OperationAction::Seed,
-        written_at: T0 + secs(30),
-        content: json!({ "marker": "finished" }),
-    }
-}
-
-fn refused_event(event: u128, correlation: u128) -> AuditEvent {
-    AuditEvent {
+fn event(event: u128, kind: HistoryKind, correlation: u128) -> HistoryEvent {
+    HistoryEvent {
         event_id: id(event),
-        kind: AuditKind::Refused,
+        kind,
         correlation_id: id(correlation),
         action: OperationAction::Seed,
-        written_at: T0,
-        content: json!({ "marker": "refused" }),
+        // Ignored on insert: the repository writes the database time.
+        written_at: OffsetDateTime::UNIX_EPOCH,
+        content: json!({ "marker": event }),
     }
 }
 
-async fn accept(f: &Fixture, n: u128, app: &str, deadline_secs: i64) {
-    f.repo
-        .accept(new_op(n, app, deadline_secs), accepted_event(n), T0)
-        .await
-        .expect("accept");
+fn accepted_event(n: u128) -> HistoryEvent {
+    event(n + 0x1000, HistoryKind::Accepted, n)
 }
 
-async fn read(f: &Fixture, n: u128, now: OffsetDateTime) -> Operation {
+async fn accept_as(
+    f: &Fixture,
+    n: u128,
+    app: &str,
+    action: OperationAction,
+    window: Duration,
+) -> Accepted {
     f.repo
-        .read_operation(id(n), now)
+        .accept(new_op(n, app, action, window), accepted_event(n))
+        .await
+        .expect("accept")
+}
+
+async fn accept(f: &Fixture, n: u128, app: &str, window: Duration) -> Accepted {
+    accept_as(f, n, app, OperationAction::Seed, window).await
+}
+
+/// Accept seed `n` of `app` and mark it running with sections `keys`.
+async fn running(f: &Fixture, n: u128, app: &str, keys: &[&str]) {
+    accept(f, n, app, OPEN).await;
+    let sections: Vec<_> = keys
+        .iter()
+        .map(|k| ((*k).to_owned(), Some(format!("gts.test.{k}.v1~"))))
+        .collect();
+    f.repo
+        .mark_running(id(n), &sections)
+        .await
+        .expect("mark running");
+}
+
+async fn read(f: &Fixture, n: u128) -> Operation {
+    f.repo
+        .read_operation(id(n))
         .await
         .expect("read")
         .expect("operation exists")
 }
 
-async fn events(f: &Fixture, n: u128) -> Vec<AuditEvent> {
-    f.repo.audit_events(id(n)).await.expect("events")
+async fn events(f: &Fixture, n: u128) -> Vec<HistoryEvent> {
+    f.repo
+        .history_page(Some(vec![id(n)]), None, HISTORY_PAGE_MAX_LIMIT)
+        .await
+        .expect("events")
+}
+
+async fn applications(f: &Fixture) -> Vec<ApplicationRecord> {
+    f.repo
+        .applications_page(None, None, APPLICATION_PAGE_MAX_LIMIT)
+        .await
+        .expect("applications")
+}
+
+fn outcomes(op: &Operation) -> Vec<Option<SectionOutcome>> {
+    op.report.sections.iter().map(|s| s.outcome).collect()
+}
+
+fn kinds(events: &[HistoryEvent]) -> Vec<HistoryKind> {
+    events.iter().map(|e| e.kind).collect()
+}
+
+/// `a` and `b` within `slack` of each other.
+fn near(a: OffsetDateTime, b: OffsetDateTime, slack: time::Duration) -> bool {
+    (a - b).abs() <= slack
+}
+
+// ---- the database clock ----
+
+#[tokio::test]
+async fn the_database_clock_is_read_as_utc_close_to_the_system_clock() {
+    let f = setup().await;
+    let conn = f.db.conn().unwrap();
+    let now = db_now(&conn, DbBackend::Sqlite).await.unwrap();
+    assert_eq!(now.offset(), time::UtcOffset::UTC);
+    assert!(near(
+        now,
+        OffsetDateTime::now_utc(),
+        time::Duration::seconds(5)
+    ));
 }
 
 // ---- accept ----
 
 #[tokio::test]
-async fn accept_inserts_the_operation_and_the_accepted_event_together() {
+async fn accept_inserts_the_operation_and_the_accepted_event_at_database_time() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-
-    let op = read(&f, 1, T0 + secs(1)).await;
-    assert_eq!(op.operation_id, id(1));
-    assert_eq!(op.application_id, APP);
-    assert_eq!(op.action, OperationAction::Seed);
+    let accepted = accept(&f, 1, APP, Duration::from_secs(90)).await;
+    assert_eq!(
+        accepted.run_deadline,
+        accepted.accepted_at + time::Duration::seconds(90)
+    );
+    assert!(near(
+        accepted.accepted_at,
+        OffsetDateTime::now_utc(),
+        time::Duration::seconds(5)
+    ));
+    let op = read(&f, 1).await;
     assert_eq!(op.status, OperationStatus::Accepted);
     assert_eq!(op.category, None);
-    assert_eq!(op.report, report(1, APP));
-    assert_eq!(op.accepted_at, T0);
+    assert_eq!(op.accepted_at, accepted.accepted_at);
+    assert_eq!(op.run_deadline, accepted.run_deadline);
     assert_eq!(op.started_at, None);
-    assert_eq!(op.finished_at, None);
-    assert_eq!(op.run_deadline, T0 + secs(60));
-    assert_eq!(op.finished_event_id, id(0x1001));
-    assert_eq!(events(&f, 1).await, [accepted_event(1)]);
+    assert_eq!(op.finished_event_id, id(0x2001));
+    assert_eq!(op.report, report(1, APP, OperationAction::Seed));
+    let written = events(&f, 1).await;
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].event_id, id(0x1001));
+    assert_eq!(written[0].written_at, accepted.accepted_at);
 }
 
 #[tokio::test]
-async fn accept_stores_an_uninstall() {
+async fn a_second_accept_while_one_is_open_is_index_violated_and_writes_nothing() {
     let f = setup().await;
-    let mut new = new_op(1, APP, 60);
-    new.action = OperationAction::Uninstall;
-    let mut event = accepted_event(1);
-    event.action = OperationAction::Uninstall;
-    f.repo.accept(new, event.clone(), T0).await.unwrap();
-    assert_eq!(read(&f, 1, T0).await.action, OperationAction::Uninstall);
-    assert_eq!(events(&f, 1).await, [event]);
-}
-
-#[tokio::test]
-async fn second_accept_for_the_same_application_while_open_is_index_violated() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let second = f
-        .repo
-        .accept(new_op(2, APP, 60), accepted_event(2), T0 + secs(1))
-        .await;
-    assert_eq!(second, Err(StorageError::IndexViolated));
-}
-
-#[tokio::test]
-async fn a_failed_accept_inserts_nothing() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let second = f
-        .repo
-        .accept(new_op(2, APP, 60), accepted_event(2), T0 + secs(1))
-        .await;
-    assert!(second.is_err());
-    assert_eq!(f.repo.read_operation(id(2), T0).await, Ok(None));
-    assert_eq!(events(&f, 2).await, []);
-    // The winner is untouched.
+    accept(&f, 1, APP, OPEN).await;
     assert_eq!(
-        read(&f, 1, T0 + secs(1)).await.status,
-        OperationStatus::Accepted
+        f.repo
+            .accept(
+                new_op(2, APP, OperationAction::Seed, OPEN),
+                accepted_event(2)
+            )
+            .await,
+        Err(StorageError::IndexViolated)
     );
-    assert_eq!(events(&f, 1).await, [accepted_event(1)]);
+    assert_eq!(f.repo.read_operation(id(2)).await, Ok(None));
+    assert_eq!(events(&f, 2).await, []);
+    // Another application is not blocked.
+    accept(&f, 3, "other.app", OPEN).await;
+}
+
+#[tokio::test]
+async fn accept_completes_an_expired_open_operation_first() {
+    let f = setup().await;
+    accept(&f, 1, APP, EXPIRED).await;
+    accept(&f, 2, APP, OPEN).await;
+    let first = read(&f, 1).await;
+    assert_eq!(first.status, OperationStatus::Completed);
+    assert_eq!(first.category, Some(RequestCategory::InternalFailure));
+    let finished = events(&f, 1).await;
+    assert_eq!(
+        kinds(&finished),
+        [HistoryKind::Accepted, HistoryKind::Finished]
+    );
+    assert_eq!(finished[1].content["result"]["reason"], json!("expired"));
+    assert_eq!(
+        f.repo
+            .open_operation(APP)
+            .await
+            .unwrap()
+            .unwrap()
+            .operation_id,
+        id(2)
+    );
 }
 
 #[tokio::test]
 async fn a_failing_event_insert_rolls_the_operation_back() {
     let f = setup().await;
-    accept(&f, 1, "other.app", 60).await;
-    // The accepted event reuses an existing event id, so its insert fails
-    // after the operation insert succeeded.
+    accept(&f, 1, "other.app", OPEN).await;
+    // The accepted event id of operation 1 is taken.
     let mut clash = accepted_event(2);
-    clash.event_id = id(0x2001);
-    let result = f.repo.accept(new_op(2, APP, 60), clash, T0).await;
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(f.repo.read_operation(id(2), T0).await, Ok(None));
-    assert_eq!(f.repo.open_operation(APP, T0).await, Ok(None));
-}
-
-#[tokio::test]
-async fn accept_for_another_application_succeeds_while_one_is_open() {
-    let f = setup().await;
-    accept(&f, 1, "one.app", 60).await;
-    accept(&f, 2, "two.app", 60).await;
-    assert_eq!(read(&f, 2, T0).await.application_id, "two.app");
-}
-
-#[tokio::test]
-async fn accept_over_an_unexpired_open_operation_leaves_it_alone() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let now = T0 + secs(59);
-    let second = f
-        .repo
-        .accept(new_op(2, APP, 120), accepted_event(2), now)
-        .await;
-    assert_eq!(second, Err(StorageError::IndexViolated));
-    assert_eq!(read(&f, 1, now).await.status, OperationStatus::Accepted);
-    assert_eq!(events(&f, 1).await.len(), 1, "no finished event");
-}
-
-#[tokio::test]
-async fn accept_over_an_expired_open_operation_interrupts_it_then_succeeds() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let now = T0 + secs(61);
-    f.repo
-        .accept(new_op(2, APP, 120), accepted_event(2), now)
-        .await
-        .expect("an expired open operation does not block acceptance");
-
-    let old = read(&f, 1, now).await;
-    assert_eq!(old.status, OperationStatus::Interrupted);
-    assert_eq!(old.category, None);
-    assert_eq!(old.finished_at, Some(now));
-    assert!(old.report.interrupted);
-    assert_eq!(old.report.category, None);
-
-    let old_events = events(&f, 1).await;
-    assert_eq!(old_events.len(), 2);
-    let finished = &old_events[1];
-    assert_eq!(finished.kind, AuditKind::Finished);
-    assert_eq!(
-        finished.event_id,
-        id(0x1001),
-        "the record's finished event id"
-    );
-    assert_eq!(finished.correlation_id, id(1));
-    assert_eq!(finished.written_at, now);
-    assert_eq!(finished.content["result"]["interrupted"], json!(true));
-    assert!(finished.content["result"].get("category").is_none());
-
-    assert_eq!(read(&f, 2, now).await.status, OperationStatus::Accepted);
+    clash.event_id = id(0x1001);
     assert_eq!(
         f.repo
-            .open_operation(APP, now)
-            .await
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        id(2)
+            .accept(new_op(2, APP, OperationAction::Seed, OPEN), clash)
+            .await,
+        Err(StorageError::Unavailable)
     );
+    assert_eq!(f.repo.read_operation(id(2)).await, Ok(None));
+    assert_eq!(f.repo.open_operation(APP).await, Ok(None));
 }
 
 // ---- open_operation ----
 
 #[tokio::test]
-async fn open_operation_is_none_without_an_open_record() {
+async fn open_operation_reports_the_open_record_and_its_expiry() {
     let f = setup().await;
-    assert_eq!(f.repo.open_operation(APP, T0).await, Ok(None));
-}
-
-#[tokio::test]
-async fn open_operation_reports_expiry_at_the_deadline() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let open = |now| {
-        let repo = Arc::clone(&f.repo);
-        async move { repo.open_operation(APP, now).await.unwrap().unwrap() }
-    };
-    let before = open(T0 + secs(59)).await;
+    assert_eq!(f.repo.open_operation(APP).await, Ok(None));
+    accept(&f, 1, APP, OPEN).await;
     assert_eq!(
-        before,
-        OpenOperation {
-            operation_id: id(1),
-            expired: false
-        }
-    );
-    let at = open(T0 + secs(60)).await;
-    assert!(at.expired, "run_deadline <= now");
-    let after = open(T0 + secs(61)).await;
-    assert!(after.expired);
-}
-
-#[tokio::test]
-async fn open_operation_sees_a_running_record() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo.mark_running(id(1), T0 + secs(1)).await.unwrap();
-    assert_eq!(
-        f.repo.open_operation(APP, T0 + secs(2)).await,
+        f.repo.open_operation(APP).await,
         Ok(Some(OpenOperation {
             operation_id: id(1),
             expired: false
         }))
     );
+    accept(&f, 2, "late.app", EXPIRED).await;
+    assert_eq!(
+        f.repo.open_operation("late.app").await,
+        Ok(Some(OpenOperation {
+            operation_id: id(2),
+            expired: true
+        }))
+    );
 }
 
 #[tokio::test]
-async fn open_operation_ignores_final_records() {
+async fn open_operation_ignores_completed_records() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(30),
-        )
-        .await
-        .unwrap();
-    assert_eq!(f.repo.open_operation(APP, T0 + secs(31)).await, Ok(None));
-    // And acceptance for the application is free again.
-    f.repo
-        .accept(new_op(2, APP, 60), accepted_event(2), T0 + secs(31))
-        .await
-        .unwrap();
+    accept(&f, 1, APP, OPEN).await;
+    f.repo.complete_by_supervisor(id(1)).await.unwrap();
+    assert_eq!(f.repo.open_operation(APP).await, Ok(None));
 }
 
 #[tokio::test]
 async fn application_ids_compare_exactly() {
     let f = setup().await;
-    accept(&f, 1, "a", 60).await;
-    // Binary, no-pad collation: case and trailing space distinguish ids.
-    accept(&f, 2, "A", 60).await;
-    accept(&f, 3, "a ", 60).await;
+    accept(&f, 1, "a", OPEN).await;
+    accept(&f, 2, "A", OPEN).await;
+    accept(&f, 3, "a ", OPEN).await;
+    for (app, n) in [("a", 1), ("A", 2), ("a ", 3)] {
+        assert_eq!(
+            f.repo
+                .open_operation(app)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation_id,
+            id(n),
+            "{app:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_application_id_over_the_byte_limit_is_refused_by_the_schema() {
+    let f = setup().await;
+    // 128 two-byte characters: within 255 characters, over 255 bytes.
+    let wide = "\u{e9}".repeat(128);
     assert_eq!(
         f.repo
-            .open_operation("a", T0)
-            .await
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        id(1)
+            .accept(
+                new_op(1, &wide, OperationAction::Seed, OPEN),
+                accepted_event(1)
+            )
+            .await,
+        Err(StorageError::Unavailable)
     );
-    assert_eq!(
-        f.repo
-            .open_operation("A", T0)
-            .await
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        id(2)
-    );
-    assert_eq!(
-        f.repo
-            .open_operation("a ", T0)
-            .await
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        id(3)
-    );
-    assert_eq!(f.repo.open_operation("b", T0).await, Ok(None));
+    let at_limit = "\u{e9}".repeat(127);
+    accept(&f, 2, &at_limit, OPEN).await;
 }
 
 // ---- lost race and refusal ----
 
 #[tokio::test]
-async fn lost_race_reads_the_winner_and_records_a_refused_event_naming_it() {
+async fn a_lost_race_records_a_refused_event_naming_the_winner() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
+    accept(&f, 1, APP, OPEN).await;
     let winner = f
         .repo
         .refuse_after_lost_race(
             APP,
             Box::new(|winner| {
-                let mut event = refused_event(0x9001, 0x9000);
-                event.content = json!({ "busy_operation_id": winner.to_string() });
-                event
+                let mut refused = event(0x9001, HistoryKind::Refused, 0x9000);
+                refused.content = json!({ "busy": winner.to_string() });
+                refused
             }),
         )
-        .await
-        .unwrap();
-    assert_eq!(winner, id(1));
+        .await;
+    assert_eq!(winner, Ok(id(1)));
     let refused = events(&f, 0x9000).await;
     assert_eq!(refused.len(), 1);
-    assert_eq!(refused[0].kind, AuditKind::Refused);
-    assert_eq!(
-        refused[0].content,
-        json!({ "busy_operation_id": id(1).to_string() })
-    );
+    assert_eq!(refused[0].content, json!({ "busy": id(1).to_string() }));
 }
 
 #[tokio::test]
-async fn lost_race_without_an_open_winner_is_unavailable_and_inserts_nothing() {
+async fn a_lost_race_without_an_open_winner_is_unavailable_and_writes_nothing() {
     let f = setup().await;
-    let result = f
-        .repo
-        .refuse_after_lost_race(APP, Box::new(|_| refused_event(0x9001, 0x9000)))
-        .await;
-    assert_eq!(result, Err(StorageError::Unavailable));
+    assert_eq!(
+        f.repo
+            .refuse_after_lost_race(
+                APP,
+                Box::new(|_| event(0x9001, HistoryKind::Refused, 0x9000))
+            )
+            .await,
+        Err(StorageError::Unavailable)
+    );
     assert_eq!(events(&f, 0x9000).await, []);
 }
 
 #[tokio::test]
-async fn record_refused_inserts_one_event_and_no_operation() {
+async fn record_refused_writes_one_event_at_database_time() {
     let f = setup().await;
-    let event = refused_event(0x9001, 0x9000);
-    f.repo.record_refused(event.clone()).await.unwrap();
-    assert_eq!(events(&f, 0x9000).await, [event]);
-    assert_eq!(f.repo.read_operation(id(0x9000), T0).await, Ok(None));
-    assert_eq!(f.repo.open_operation(APP, T0).await, Ok(None));
-}
-
-// ---- guarded writes ----
-
-#[tokio::test]
-async fn mark_running_moves_accepted_to_running_and_sets_started_at() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let now = T0 + secs(5);
-    f.repo.mark_running(id(1), now).await.unwrap();
-    let op = read(&f, 1, now).await;
-    assert_eq!(op.status, OperationStatus::Running);
-    assert_eq!(op.started_at, Some(now));
-    assert_eq!(op.finished_at, None);
-}
-
-#[tokio::test]
-async fn mark_running_after_the_deadline_is_operation_final() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    assert_eq!(
-        f.repo.mark_running(id(1), T0 + secs(60)).await,
-        Err(StorageError::OperationFinal)
-    );
-    assert_eq!(
-        read(&f, 1, T0 + secs(59)).await.status,
-        OperationStatus::Accepted
-    );
-}
-
-#[tokio::test]
-async fn mark_running_on_an_unknown_operation_is_operation_final() {
-    let f = setup().await;
-    assert_eq!(
-        f.repo.mark_running(id(404), T0).await,
-        Err(StorageError::OperationFinal)
-    );
-}
-
-#[tokio::test]
-async fn record_report_replaces_the_report() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo.mark_running(id(1), T0 + secs(1)).await.unwrap();
-    let updated = with_section(report(1, APP), "billing");
     f.repo
-        .record_report(id(1), &updated, T0 + secs(2))
+        .record_refused(event(0x9001, HistoryKind::Refused, 0x9000))
         .await
         .unwrap();
-    let op = read(&f, 1, T0 + secs(3)).await;
-    assert_eq!(op.report, updated);
-    assert_eq!(op.status, OperationStatus::Running);
+    let refused = events(&f, 0x9000).await;
+    assert_eq!(kinds(&refused), [HistoryKind::Refused]);
+    assert!(near(
+        refused[0].written_at,
+        OffsetDateTime::now_utc(),
+        time::Duration::seconds(5)
+    ));
 }
 
-#[tokio::test]
-async fn record_report_after_the_deadline_is_operation_final() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let updated = with_section(report(1, APP), "billing");
-    assert_eq!(
-        f.repo.record_report(id(1), &updated, T0 + secs(60)).await,
-        Err(StorageError::OperationFinal)
-    );
-    assert_eq!(read(&f, 1, T0 + secs(59)).await.report, report(1, APP));
-}
+// ---- mark running and section outcomes ----
 
 #[tokio::test]
-async fn record_report_after_a_final_write_is_operation_final() {
+async fn mark_running_writes_the_section_types_and_returns_the_time_left() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo
-        .finish(
+    accept(&f, 1, APP, Duration::from_secs(600)).await;
+    let left = f
+        .repo
+        .mark_running(
             id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(10),
+            &[
+                ("billing".to_owned(), Some("gts.t.billing.v1~".to_owned())),
+                ("crm".to_owned(), None),
+            ],
         )
         .await
         .unwrap();
-    let late = with_section(report(1, APP), "billing");
-    assert_eq!(
-        f.repo.record_report(id(1), &late, T0 + secs(11)).await,
-        Err(StorageError::OperationFinal)
+    assert!(
+        left <= Duration::from_secs(600) && left > Duration::from_secs(590),
+        "{left:?}"
     );
+    let op = read(&f, 1).await;
+    assert_eq!(op.status, OperationStatus::Running);
+    assert!(op.started_at.is_some());
+    let sections: Vec<_> = op
+        .report
+        .sections
+        .iter()
+        .map(|s| (s.key.as_str(), s.section_type.as_deref(), s.outcome))
+        .collect();
     assert_eq!(
-        read(&f, 1, T0 + secs(12)).await.report,
-        OutcomeReport {
-            category: Some(RequestCategory::Succeeded),
-            ..report(1, APP)
-        }
+        sections,
+        [
+            ("billing", Some("gts.t.billing.v1~"), None),
+            ("crm", None, None)
+        ]
     );
 }
 
 #[tokio::test]
-async fn mark_running_after_a_final_write_is_operation_final() {
+async fn mark_running_is_guarded() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
+    assert_eq!(
+        f.repo.mark_running(id(9), &[]).await,
+        Err(StorageError::OperationFinal),
+        "unknown"
+    );
+    accept(&f, 1, APP, EXPIRED).await;
+    assert_eq!(
+        f.repo.mark_running(id(1), &[]).await,
+        Err(StorageError::OperationFinal),
+        "expired"
+    );
+    running(&f, 2, "other.app", &[]).await;
+    assert_eq!(
+        f.repo.mark_running(id(2), &[]).await,
+        Err(StorageError::OperationFinal),
+        "already running"
+    );
+}
+
+#[tokio::test]
+async fn a_section_outcome_changes_only_its_own_entry() {
+    let f = setup().await;
+    running(&f, 1, APP, &["a", "b"]).await;
     f.repo
-        .finish(
+        .record_section_outcome(
             id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(10),
+            "b",
+            SectionOutcome::Rejected,
+            Some("too small".to_owned()),
+            Some("/plan".to_owned()),
         )
         .await
         .unwrap();
+    let op = read(&f, 1).await;
+    assert_eq!(outcomes(&op), [None, Some(SectionOutcome::Rejected)]);
+    assert_eq!(op.report.sections[1].detail.as_deref(), Some("too small"));
+    assert_eq!(op.report.sections[1].location.as_deref(), Some("/plan"));
     assert_eq!(
-        f.repo.mark_running(id(1), T0 + secs(11)).await,
-        Err(StorageError::OperationFinal)
+        op.report.sections[0].section_type.as_deref(),
+        Some("gts.test.a.v1~")
+    );
+    assert_eq!(
+        f.repo
+            .record_section_outcome(id(1), "nope", SectionOutcome::Succeeded, None, None)
+            .await,
+        Err(StorageError::OperationFinal),
+        "no entry for the key"
+    );
+    f.repo.complete_by_supervisor(id(1)).await.unwrap();
+    assert_eq!(
+        f.repo
+            .record_section_outcome(id(1), "a", SectionOutcome::Succeeded, None, None)
+            .await,
+        Err(StorageError::OperationFinal),
+        "after a final write"
     );
 }
 
 // ---- finish ----
 
-#[tokio::test]
-async fn finish_completes_the_operation_and_inserts_the_finished_event() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo.mark_running(id(1), T0 + secs(1)).await.unwrap();
-    let done = with_section(report(1, APP), "billing");
-    let now = T0 + secs(30);
-    f.repo
-        .finish(
-            id(1),
-            &done,
-            RequestCategory::Succeeded,
-            finished_event(1),
-            now,
-        )
-        .await
-        .unwrap();
-
-    let op = read(&f, 1, now).await;
-    assert_eq!(op.status, OperationStatus::Completed);
-    assert_eq!(op.category, Some(RequestCategory::Succeeded));
-    assert_eq!(op.finished_at, Some(now));
-    assert_eq!(op.started_at, Some(T0 + secs(1)));
-    // The stored report carries the derived category.
-    assert_eq!(op.report.category, Some(RequestCategory::Succeeded));
-    assert_eq!(
-        op.report,
-        OutcomeReport {
-            category: Some(RequestCategory::Succeeded),
-            ..done
-        }
-    );
-    assert_eq!(events(&f, 1).await, [accepted_event(1), finished_event(1)]);
+fn final_report(n: u128, app: &str, action: OperationAction) -> OutcomeReport {
+    report(n, app, action)
 }
 
 #[tokio::test]
-async fn finish_from_accepted_is_allowed() {
+async fn finish_completes_a_running_seed_and_upserts_its_application() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
+    running(&f, 1, APP, &["a"]).await;
+    f.repo
+        .record_section_outcome(id(1), "a", SectionOutcome::Succeeded, None, None)
+        .await
+        .unwrap();
+    let report = read(&f, 1).await.report;
+    f.repo
+        .finish(id(1), &report, RequestCategory::Succeeded)
+        .await
+        .unwrap();
+    let op = read(&f, 1).await;
+    assert_eq!(op.status, OperationStatus::Completed);
+    assert_eq!(op.category, Some(RequestCategory::Succeeded));
+    assert_eq!(op.report.category, Some(RequestCategory::Succeeded));
+    let finished_at = op.finished_at.unwrap();
+    let written = events(&f, 1).await;
+    assert_eq!(
+        kinds(&written),
+        [HistoryKind::Accepted, HistoryKind::Finished]
+    );
+    assert_eq!(written[1].event_id, id(0x2001));
+    assert_eq!(written[1].written_at, finished_at);
+    assert_eq!(written[1].content["result"]["category"], json!("succeeded"));
+    assert!(written[1].content["result"].get("reason").is_none());
+    assert_eq!(
+        applications(&f).await,
+        [ApplicationRecord {
+            application_id: APP.to_owned(),
+            version: "1.0.0".to_owned(),
+            operation_id: id(1),
+            category: RequestCategory::Succeeded,
+            finished_at,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_reseed_replaces_the_application_record() {
+    let f = setup().await;
+    running(&f, 1, APP, &[]).await;
     f.repo
         .finish(
             id(1),
-            &report(1, APP),
-            RequestCategory::TemporarilyUnavailable,
-            finished_event(1),
-            T0 + secs(2),
+            &final_report(1, APP, OperationAction::Seed),
+            RequestCategory::Succeeded,
         )
         .await
         .unwrap();
-    let op = read(&f, 1, T0 + secs(3)).await;
-    assert_eq!(op.status, OperationStatus::Completed);
-    assert_eq!(op.category, Some(RequestCategory::TemporarilyUnavailable));
+    running(&f, 2, APP, &[]).await;
+    let mut second = final_report(2, APP, OperationAction::Seed);
+    second.application.version = Some("2.0.0".to_owned());
+    f.repo
+        .finish(id(2), &second, RequestCategory::PluginRejected)
+        .await
+        .unwrap();
+    let records = applications(&f).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].version, "2.0.0");
+    assert_eq!(records[0].operation_id, id(2));
+    assert_eq!(records[0].category, RequestCategory::PluginRejected);
+}
+
+#[tokio::test]
+async fn a_seed_completed_from_accepted_writes_no_application_record() {
+    let f = setup().await;
+    accept(&f, 1, APP, OPEN).await;
+    f.repo
+        .finish(
+            id(1),
+            &final_report(1, APP, OperationAction::Seed),
+            RequestCategory::InvalidManifest,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        read(&f, 1).await.category,
+        Some(RequestCategory::InvalidManifest)
+    );
+    assert_eq!(applications(&f).await, []);
+}
+
+#[tokio::test]
+async fn a_succeeded_uninstall_deletes_the_application_record_and_a_failed_one_keeps_it() {
+    let f = setup().await;
+    running(&f, 1, APP, &[]).await;
+    f.repo
+        .finish(
+            id(1),
+            &final_report(1, APP, OperationAction::Seed),
+            RequestCategory::Succeeded,
+        )
+        .await
+        .unwrap();
+
+    accept_as(&f, 2, APP, OperationAction::Uninstall, OPEN).await;
+    f.repo
+        .mark_running(id(2), &[("a".to_owned(), None)])
+        .await
+        .unwrap();
+    f.repo
+        .finish(
+            id(2),
+            &final_report(2, APP, OperationAction::Uninstall),
+            RequestCategory::InternalFailure,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        applications(&f).await.len(),
+        1,
+        "a failed uninstall keeps it"
+    );
+
+    accept_as(&f, 3, APP, OperationAction::Uninstall, OPEN).await;
+    f.repo
+        .finish(
+            id(3),
+            &final_report(3, APP, OperationAction::Uninstall),
+            RequestCategory::Succeeded,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        applications(&f).await,
+        [],
+        "a succeeded uninstall deletes it"
+    );
 }
 
 #[tokio::test]
 async fn the_first_final_write_wins() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
+    running(&f, 1, APP, &[]).await;
+    let report = final_report(1, APP, OperationAction::Seed);
     f.repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(10),
-        )
+        .finish(id(1), &report, RequestCategory::Succeeded)
         .await
         .unwrap();
-
-    let mut second = finished_event(1);
-    second.event_id = id(0x7777);
-    let result = f
-        .repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::InternalFailure,
-            second,
-            T0 + secs(11),
-        )
-        .await;
-    assert_eq!(result, Err(StorageError::OperationFinal));
-
-    let op = read(&f, 1, T0 + secs(12)).await;
-    assert_eq!(op.category, Some(RequestCategory::Succeeded));
-    assert_eq!(op.finished_at, Some(T0 + secs(10)));
-    assert_eq!(events(&f, 1).await.len(), 2, "no extra event");
+    assert_eq!(
+        f.repo
+            .finish(id(1), &report, RequestCategory::InternalFailure)
+            .await,
+        Err(StorageError::OperationFinal)
+    );
+    assert_eq!(
+        f.repo.complete_by_supervisor(id(1)).await,
+        Err(StorageError::OperationFinal)
+    );
+    assert_eq!(f.repo.expire_if_expired(id(1)).await, Ok(false));
+    assert_eq!(read(&f, 1).await.category, Some(RequestCategory::Succeeded));
+    assert_eq!(events(&f, 1).await.len(), 2, "one finished event");
 }
 
 #[tokio::test]
-async fn finish_after_the_deadline_is_operation_final_with_no_event() {
+async fn finish_after_the_run_deadline_is_operation_final_and_writes_nothing() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let result = f
-        .repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(60),
-        )
-        .await;
-    assert_eq!(result, Err(StorageError::OperationFinal));
-    assert_eq!(events(&f, 1).await, [accepted_event(1)]);
+    accept(&f, 1, APP, EXPIRED).await;
     assert_eq!(
-        read(&f, 1, T0 + secs(59)).await.status,
-        OperationStatus::Accepted
+        f.repo
+            .finish(
+                id(1),
+                &final_report(1, APP, OperationAction::Seed),
+                RequestCategory::Succeeded
+            )
+            .await,
+        Err(StorageError::OperationFinal)
     );
-}
-
-#[tokio::test]
-async fn finish_after_an_interruption_is_operation_final() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(61)).await,
-        Ok(true)
-    );
-    let result = f
-        .repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(62),
-        )
-        .await;
-    assert_eq!(result, Err(StorageError::OperationFinal));
-    assert_eq!(
-        events(&f, 1).await.len(),
-        2,
-        "accepted and the interruption's finished event"
-    );
-    assert_eq!(
-        read(&f, 1, T0 + secs(63)).await.status,
-        OperationStatus::Interrupted
-    );
-}
-
-#[tokio::test]
-async fn a_failing_finished_event_insert_rolls_the_update_back() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let mut clash = finished_event(1);
-    clash.event_id = id(0x2001); // the accepted event's id
-    let result = f
-        .repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            clash,
-            T0 + secs(10),
-        )
-        .await;
-    assert!(result.is_err(), "{result:?}");
-    let op = read(&f, 1, T0 + secs(11)).await;
-    assert_eq!(op.status, OperationStatus::Accepted);
-    assert_eq!(op.category, None);
-    assert_eq!(op.finished_at, None);
+    assert_eq!(events(&f, 1).await.len(), 1);
+    assert_eq!(applications(&f).await, []);
 }
 
 // ---- supervisor completion ----
 
-fn failed_report(n: u128) -> OutcomeReport {
-    let mut report = report(n, APP);
-    report.category = Some(RequestCategory::InternalFailure);
-    report.sections.push(SectionOutcomeEntry {
-        key: "billing".to_owned(),
-        outcome: SectionOutcome::NotDispatched,
-        schema_version: None,
-        detail: None,
-        location: None,
-    });
-    report
-}
-
 #[tokio::test]
-async fn supervisor_completion_from_accepted_sets_started_at_and_internal_failure() {
+async fn supervisor_completion_from_accepted_is_internal_failure_without_a_record() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let now = T0 + secs(20);
-    f.repo
-        .complete_by_supervisor(id(1), &failed_report(1), finished_event(1), now)
-        .await
-        .unwrap();
-    let op = read(&f, 1, now).await;
+    accept(&f, 1, APP, OPEN).await;
+    f.repo.complete_by_supervisor(id(1)).await.unwrap();
+    let op = read(&f, 1).await;
     assert_eq!(op.status, OperationStatus::Completed);
     assert_eq!(op.category, Some(RequestCategory::InternalFailure));
-    assert_eq!(op.started_at, Some(now), "set because it was null");
-    assert_eq!(op.finished_at, Some(now));
-    assert_eq!(op.report, failed_report(1));
-    assert_eq!(events(&f, 1).await, [accepted_event(1), finished_event(1)]);
-}
-
-#[tokio::test]
-async fn supervisor_completion_keeps_an_existing_started_at() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo.mark_running(id(1), T0 + secs(5)).await.unwrap();
-    f.repo
-        .complete_by_supervisor(id(1), &failed_report(1), finished_event(1), T0 + secs(20))
-        .await
-        .unwrap();
-    let op = read(&f, 1, T0 + secs(21)).await;
-    assert_eq!(op.started_at, Some(T0 + secs(5)));
-    assert_eq!(op.finished_at, Some(T0 + secs(20)));
-}
-
-#[tokio::test]
-async fn supervisor_completion_after_a_final_write_is_operation_final() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(10),
-        )
-        .await
-        .unwrap();
-    let mut second = finished_event(1);
-    second.event_id = id(0x7777);
-    let result = f
-        .repo
-        .complete_by_supervisor(id(1), &failed_report(1), second, T0 + secs(11))
-        .await;
-    assert_eq!(result, Err(StorageError::OperationFinal));
+    assert_eq!(op.started_at, None, "only mark running sets it");
+    assert_eq!(applications(&f).await, []);
     assert_eq!(
-        read(&f, 1, T0 + secs(12)).await.category,
-        Some(RequestCategory::Succeeded)
+        kinds(&events(&f, 1).await),
+        [HistoryKind::Accepted, HistoryKind::Finished]
+    );
+}
+
+#[tokio::test]
+async fn supervisor_completion_from_running_marks_the_rest_not_dispatched() {
+    let f = setup().await;
+    running(&f, 1, APP, &["a", "b", "c"]).await;
+    f.repo
+        .record_section_outcome(id(1), "a", SectionOutcome::Succeeded, None, None)
+        .await
+        .unwrap();
+    f.repo.complete_by_supervisor(id(1)).await.unwrap();
+    let op = read(&f, 1).await;
+    assert_eq!(
+        outcomes(&op),
+        [
+            Some(SectionOutcome::Succeeded),
+            Some(SectionOutcome::NotDispatched),
+            Some(SectionOutcome::NotDispatched)
+        ]
+    );
+    assert_eq!(op.category, Some(RequestCategory::InternalFailure));
+    assert_eq!(
+        applications(&f).await.len(),
+        1,
+        "a running seed writes its record"
+    );
+}
+
+// ---- expiry completion ----
+
+#[tokio::test]
+async fn expiry_leaves_an_unexpired_operation_alone() {
+    let f = setup().await;
+    accept(&f, 1, APP, OPEN).await;
+    assert_eq!(f.repo.expire_if_expired(id(1)).await, Ok(false));
+    assert_eq!(f.repo.expire_if_expired(id(9)).await, Ok(false), "unknown");
+    assert_eq!(read(&f, 1).await.status, OperationStatus::Accepted);
+}
+
+/// A running seed with sections `a`, `b`, `c`, `a` succeeded, whose run
+/// deadline is over.
+async fn expired_running_seed(f: &Fixture, n: u128) {
+    accept(f, n, APP, EXPIRED).await;
+    // Mark running is guarded by the deadline, so the running state is
+    // written behind the repository's back.
+    let mut options = sea_orm::ConnectOptions::new(f.dsn.clone());
+    options.max_connections(1);
+    let conn = Database::connect(options).await.expect("second connection");
+    let sections = json!([
+        { "key": "a", "section_type": "gts.test.a.v1~", "outcome": "succeeded" },
+        { "key": "b", "section_type": "gts.test.b.v1~" },
+        { "key": "c", "section_type": "gts.test.c.v1~" }
+    ]);
+    let mut stored = serde_json::to_value(report(n, APP, OperationAction::Seed)).unwrap();
+    stored["sections"] = sections;
+    conn.execute_unprepared(&format!(
+        "UPDATE operations SET status = 'running', report = '{stored}' WHERE operation_id = x'{n:032x}'"
+    ))
+    .await
+    .expect("mark running by hand");
+}
+
+#[tokio::test]
+async fn expiry_of_a_running_seed_loses_the_first_open_section_and_writes_the_record() {
+    let f = setup().await;
+    expired_running_seed(&f, 1).await;
+    assert_eq!(f.repo.expire_if_expired(id(1)).await, Ok(true));
+    let op = read(&f, 1).await;
+    assert_eq!(op.status, OperationStatus::Completed);
+    assert_eq!(
+        outcomes(&op),
+        [
+            Some(SectionOutcome::Succeeded),
+            Some(SectionOutcome::Lost),
+            Some(SectionOutcome::NotDispatched)
+        ]
+    );
+    assert_eq!(op.category, Some(RequestCategory::InternalFailure));
+    let written = events(&f, 1).await;
+    assert_eq!(written[1].content["result"]["reason"], json!("expired"));
+    assert_eq!(
+        written[1].content["result"]["sections"][1]["outcome"],
+        json!("lost")
+    );
+    assert_eq!(applications(&f).await.len(), 1);
+    assert_eq!(
+        f.repo.expire_if_expired(id(1)).await,
+        Ok(false),
+        "runs once"
     );
     assert_eq!(events(&f, 1).await.len(), 2);
 }
 
-// ---- interruption ----
-
 #[tokio::test]
-async fn interrupt_if_expired_does_not_touch_a_record_that_is_not_expired() {
+async fn expiry_of_an_accepted_seed_is_internal_failure_without_a_record() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(59)).await,
-        Ok(false)
-    );
-    assert_eq!(
-        read(&f, 1, T0 + secs(59)).await.status,
-        OperationStatus::Accepted
-    );
-    assert_eq!(events(&f, 1).await.len(), 1);
+    accept(&f, 1, APP, EXPIRED).await;
+    assert_eq!(f.repo.expire_if_expired(id(1)).await, Ok(true));
+    let op = read(&f, 1).await;
+    assert_eq!(op.category, Some(RequestCategory::InternalFailure));
+    assert_eq!(applications(&f).await, []);
 }
 
 #[tokio::test]
-async fn interrupt_if_expired_keeps_the_section_outcomes_so_far() {
+async fn read_operation_runs_the_expiry_completion_first() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo.mark_running(id(1), T0 + secs(1)).await.unwrap();
-    let partial = with_section(report(1, APP), "billing");
-    f.repo
-        .record_report(id(1), &partial, T0 + secs(2))
-        .await
-        .unwrap();
-
-    let now = T0 + secs(60);
-    assert_eq!(f.repo.interrupt_if_expired(id(1), now).await, Ok(true));
-    let op = read(&f, 1, now).await;
-    assert_eq!(op.status, OperationStatus::Interrupted);
-    assert_eq!(op.category, None);
-    assert_eq!(op.finished_at, Some(now));
-    assert_eq!(op.report.sections, partial.sections);
-    assert!(op.report.interrupted);
-    assert_eq!(op.report.category, None);
-
-    let finished = events(&f, 1).await.pop().unwrap();
-    assert_eq!(finished.kind, AuditKind::Finished);
-    assert_eq!(finished.event_id, id(0x1001));
-    assert_eq!(finished.content["result"]["interrupted"], json!(true));
-    assert_eq!(
-        finished.content["result"]["sections"],
-        json!([{ "key": "billing", "outcome": "succeeded", "schema_version": "1" }])
-    );
+    assert_eq!(f.repo.read_operation(id(9)).await, Ok(None));
+    accept(&f, 1, APP, EXPIRED).await;
+    assert_eq!(read(&f, 1).await.status, OperationStatus::Completed);
+    accept(&f, 2, "other.app", OPEN).await;
+    assert_eq!(read(&f, 2).await.status, OperationStatus::Accepted);
 }
 
 #[tokio::test]
-async fn interrupt_if_expired_runs_once() {
+async fn the_expiry_batch_goes_oldest_deadline_first_within_its_limit() {
     let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(61)).await,
-        Ok(true)
-    );
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(62)).await,
-        Ok(false)
-    );
-    assert_eq!(events(&f, 1).await.len(), 2, "one finished event");
-    assert_eq!(
-        read(&f, 1, T0 + secs(63)).await.finished_at,
-        Some(T0 + secs(61))
-    );
+    assert_eq!(f.repo.expire_batch(10).await, Ok(0));
+    for n in 1..=3_u128 {
+        accept(&f, n, &format!("app.{n}"), EXPIRED).await;
+    }
+    accept(&f, 4, "open.app", OPEN).await;
+    assert_eq!(f.repo.expire_batch(2).await, Ok(2));
+    assert_eq!(f.repo.expire_batch(10).await, Ok(1));
+    assert_eq!(read(&f, 4).await.status, OperationStatus::Accepted);
 }
 
-#[tokio::test]
-async fn interrupt_if_expired_leaves_a_completed_record() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    f.repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(10),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(100)).await,
-        Ok(false)
-    );
-    assert_eq!(
-        read(&f, 1, T0 + secs(100)).await.status,
-        OperationStatus::Completed
-    );
-}
-
-#[tokio::test]
-async fn interrupt_if_expired_on_an_unknown_operation_is_false() {
-    let f = setup().await;
-    assert_eq!(f.repo.interrupt_if_expired(id(404), T0).await, Ok(false));
-}
-
-#[tokio::test]
-async fn batch_interruption_respects_the_limit_and_goes_oldest_deadline_first() {
-    let f = setup().await;
-    accept(&f, 1, "one.app", 10).await;
-    accept(&f, 2, "two.app", 20).await;
-    accept(&f, 3, "three.app", 30).await;
-    accept(&f, 4, "four.app", 1000).await;
-    let now = T0 + secs(100);
-
-    assert_eq!(f.repo.interrupt_expired_batch(now, 2).await, Ok(2));
-    assert_eq!(read(&f, 1, T0).await.status, OperationStatus::Interrupted);
-    assert_eq!(read(&f, 2, T0).await.status, OperationStatus::Interrupted);
-    assert_eq!(read(&f, 3, T0).await.status, OperationStatus::Accepted);
-
-    assert_eq!(f.repo.interrupt_expired_batch(now, 2).await, Ok(1));
-    assert_eq!(f.repo.interrupt_expired_batch(now, 2).await, Ok(0));
-    assert_eq!(
-        read(&f, 4, T0).await.status,
-        OperationStatus::Accepted,
-        "not expired"
-    );
-    for n in [1, 2, 3] {
-        assert_eq!(events(&f, n).await.len(), 2, "accepted and finished of {n}");
+/// Store a category token the migration's `CHECK` would refuse, on a separate
+/// single-connection pool with `CHECK` enforcement off, so a row that does not
+/// map back exists.
+async fn corrupt_category(f: &Fixture, operation: u128) {
+    let mut options = sea_orm::ConnectOptions::new(f.dsn.clone());
+    options.max_connections(1);
+    let conn = Database::connect(options).await.expect("second connection");
+    for sql in [
+        "PRAGMA ignore_check_constraints = ON".to_owned(),
+        format!(
+            "UPDATE operations SET category = 'bogus' WHERE operation_id = x'{operation:032x}'"
+        ),
+    ] {
+        conn.execute_unprepared(&sql).await.expect("corrupt row");
     }
 }
 
 #[tokio::test]
-async fn batch_interruption_covers_running_records() {
+async fn the_expiry_batch_goes_past_a_record_that_does_not_map() {
     let f = setup().await;
-    accept(&f, 1, APP, 10).await;
-    f.repo.mark_running(id(1), T0 + secs(1)).await.unwrap();
+    accept(&f, 1, "bad.app", EXPIRED).await;
+    accept(&f, 2, "good.app", EXPIRED).await;
+    corrupt_category(&f, 1).await;
+    assert_eq!(f.repo.expire_batch(10).await, Ok(1));
+    assert_eq!(read(&f, 2).await.status, OperationStatus::Completed);
+    assert_eq!(events(&f, 1).await.len(), 1, "the bad record is untouched");
+}
+
+#[tokio::test]
+async fn the_expiry_batch_fails_when_every_attempted_record_fails() {
+    let f = setup().await;
+    accept(&f, 1, "bad.app", EXPIRED).await;
+    corrupt_category(&f, 1).await;
     assert_eq!(
-        f.repo.interrupt_expired_batch(T0 + secs(10), 5).await,
-        Ok(1)
+        f.repo.expire_batch(10).await,
+        Err(StorageError::Unavailable)
     );
+}
+
+#[tokio::test]
+async fn a_batch_never_handles_more_than_the_maintenance_batch_size() {
+    let f = setup().await;
+    let total = MAINTENANCE_BATCH_SIZE + 5;
+    for n in 1..=u128::from(total) {
+        accept(&f, n, &format!("app.{n}"), EXPIRED).await;
+    }
     assert_eq!(
-        read(&f, 1, T0 + secs(11)).await.status,
-        OperationStatus::Interrupted
+        f.repo.expire_batch(u64::MAX).await,
+        Ok(MAINTENANCE_BATCH_SIZE)
     );
+    assert_eq!(f.repo.expire_batch(u64::MAX).await, Ok(5));
+    assert_eq!(
+        f.repo.purge(Duration::ZERO, u64::MAX).await,
+        Ok(MAINTENANCE_BATCH_SIZE)
+    );
+    assert_eq!(f.repo.purge(Duration::ZERO, u64::MAX).await, Ok(5));
 }
 
 // ---- purge ----
 
 #[tokio::test]
-async fn purge_removes_only_final_records_older_than_the_cutoff_and_not_the_ledger() {
+async fn purge_removes_completed_records_past_retention_only() {
     let f = setup().await;
-    accept(&f, 1, "a.app", 3600).await; // completed at +60s
-    accept(&f, 2, "b.app", 3600).await; // completed at +120s
-    accept(&f, 3, "c.app", 3600).await; // stays open
-    accept(&f, 4, "d.app", 10).await; // interrupted at +180s
-    for (n, at) in [(1, 60), (2, 120)] {
-        f.repo
-            .finish(
-                id(n),
-                &report(n, "x"),
-                RequestCategory::Succeeded,
-                finished_event(n),
-                T0 + secs(at),
-            )
-            .await
-            .unwrap();
-    }
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(4), T0 + secs(180)).await,
-        Ok(true)
-    );
-
-    let removed = f.repo.purge_finished(T0 + secs(150), 100).await.unwrap();
-    assert_eq!(removed, 2);
-
-    let now = T0 + secs(200);
-    assert_eq!(f.repo.read_operation(id(1), now).await, Ok(None));
-    assert_eq!(f.repo.read_operation(id(2), now).await, Ok(None));
-    assert_eq!(
-        read(&f, 3, now).await.status,
-        OperationStatus::Accepted,
-        "open: never purged"
-    );
-    assert_eq!(
-        read(&f, 4, now).await.status,
-        OperationStatus::Interrupted,
-        "newer than the cutoff"
-    );
-
-    // The ledger is untouched.
-    assert_eq!(events(&f, 1).await, [accepted_event(1), finished_event(1)]);
-    assert_eq!(events(&f, 2).await, [accepted_event(2), finished_event(2)]);
-    assert_eq!(events(&f, 3).await.len(), 1);
-    assert_eq!(events(&f, 4).await.len(), 2);
-}
-
-#[tokio::test]
-async fn purge_never_removes_an_open_record_however_old() {
-    let f = setup().await;
-    accept(&f, 1, APP, 10).await;
-    assert_eq!(
-        f.repo.purge_finished(T0 + secs(1_000_000), 100).await,
-        Ok(0)
-    );
-    assert_eq!(read(&f, 1, T0).await.status, OperationStatus::Accepted);
-}
-
-#[tokio::test]
-async fn purge_respects_the_limit_and_goes_oldest_first() {
-    let f = setup().await;
-    for (n, app) in [(1, "a.app"), (2, "b.app"), (3, "c.app")] {
-        accept(&f, n, app, 3600).await;
-    }
-    for (n, at) in [(1, 10), (2, 20), (3, 30)] {
-        f.repo
-            .finish(
-                id(n),
-                &report(n, "x"),
-                RequestCategory::Succeeded,
-                finished_event(n),
-                T0 + secs(at),
-            )
-            .await
-            .unwrap();
-    }
-    let cutoff = T0 + secs(100);
-    assert_eq!(f.repo.purge_finished(cutoff, 2).await, Ok(2));
-    let now = T0 + secs(101);
-    assert_eq!(f.repo.read_operation(id(1), now).await, Ok(None));
-    assert_eq!(f.repo.read_operation(id(2), now).await, Ok(None));
-    assert!(f.repo.read_operation(id(3), now).await.unwrap().is_some());
-    assert_eq!(f.repo.purge_finished(cutoff, 2).await, Ok(1));
-    assert_eq!(f.repo.purge_finished(cutoff, 2).await, Ok(0));
-}
-
-// ---- read ----
-
-#[tokio::test]
-async fn read_operation_is_none_for_an_unknown_id() {
-    let f = setup().await;
-    assert_eq!(f.repo.read_operation(id(404), T0).await, Ok(None));
-}
-
-#[tokio::test]
-async fn read_operation_interrupts_an_expired_record_first() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let now = T0 + secs(61);
-    let op = read(&f, 1, now).await;
-    assert_eq!(op.status, OperationStatus::Interrupted);
-    assert_eq!(op.finished_at, Some(now));
-    assert!(op.report.interrupted);
-    let recorded = events(&f, 1).await;
-    assert_eq!(recorded.len(), 2);
-    assert_eq!(recorded[1].kind, AuditKind::Finished);
-    // A second read changes nothing.
-    assert_eq!(read(&f, 1, now + secs(10)).await, op);
-    assert_eq!(events(&f, 1).await.len(), 2);
-}
-
-#[tokio::test]
-async fn read_operation_leaves_an_unexpired_record_alone() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    assert_eq!(
-        read(&f, 1, T0 + secs(59)).await.status,
-        OperationStatus::Accepted
-    );
-    assert_eq!(events(&f, 1).await.len(), 1);
-}
-
-// ---- audit_events ----
-
-#[tokio::test]
-async fn audit_events_come_back_ordered_by_event_id_and_by_correlation() {
-    let f = setup().await;
-    for event in [3, 1, 2] {
-        f.repo
-            .record_refused(refused_event(0xA000 + event, 0xA))
-            .await
-            .unwrap();
-    }
+    running(&f, 1, APP, &[]).await;
     f.repo
-        .record_refused(refused_event(0xB001, 0xB))
+        .finish(
+            id(1),
+            &final_report(1, APP, OperationAction::Seed),
+            RequestCategory::Succeeded,
+        )
         .await
         .unwrap();
+    accept(&f, 2, "open.app", OPEN).await;
 
-    let ids: Vec<Uuid> = events(&f, 0xA).await.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids, [id(0xA001), id(0xA002), id(0xA003)]);
-    assert_eq!(events(&f, 0xB).await.len(), 1);
-    assert_eq!(events(&f, 0xC).await, []);
+    assert_eq!(
+        f.repo.purge(OPEN, 10).await,
+        Ok(0),
+        "not yet past retention"
+    );
+    assert_eq!(
+        f.repo.purge(Duration::ZERO, 10).await,
+        Ok(1),
+        "at the retention boundary"
+    );
+    assert_eq!(f.repo.read_operation(id(1)).await, Ok(None));
+    assert_eq!(
+        read(&f, 2).await.status,
+        OperationStatus::Accepted,
+        "open is kept"
+    );
+    assert_eq!(events(&f, 1).await.len(), 2, "the history is kept");
+    assert_eq!(
+        applications(&f).await.len(),
+        1,
+        "the application record is kept"
+    );
+    assert_eq!(
+        f.repo.purge(Duration::MAX, 10).await,
+        Ok(0),
+        "a cutoff before time"
+    );
+}
+
+// ---- history and application pages ----
+
+#[tokio::test]
+async fn the_history_page_is_in_event_id_order_with_a_cursor_and_a_filter() {
+    let f = setup().await;
+    for (e, correlation) in [(0x30, 0xA), (0x10, 0xB), (0x20, 0xA)] {
+        f.repo
+            .record_refused(event(e, HistoryKind::Refused, correlation))
+            .await
+            .unwrap();
+    }
+    let ids = |page: Vec<HistoryEvent>| page.into_iter().map(|e| e.event_id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(f.repo.history_page(None, None, 10).await.unwrap()),
+        [id(0x10), id(0x20), id(0x30)]
+    );
+    assert_eq!(
+        ids(f.repo.history_page(None, Some(id(0x10)), 1).await.unwrap()),
+        [id(0x20)]
+    );
+    assert_eq!(
+        ids(f
+            .repo
+            .history_page(Some(vec![id(0xA)]), None, 10)
+            .await
+            .unwrap()),
+        [id(0x20), id(0x30)]
+    );
+    assert_eq!(
+        ids(f
+            .repo
+            .history_page(Some(vec![id(0xA), id(0xB)]), None, 10)
+            .await
+            .unwrap()),
+        [id(0x10), id(0x20), id(0x30)]
+    );
+    assert_eq!(
+        f.repo.history_page(Some(vec![id(0xF)]), None, 10).await,
+        Ok(vec![])
+    );
 }
 
 #[tokio::test]
-async fn audit_events_round_trip_every_field() {
+async fn the_application_page_is_in_id_order_with_a_cursor_and_a_filter() {
     let f = setup().await;
-    let mut event = refused_event(0xA001, 0xA);
-    event.action = OperationAction::Uninstall;
-    event.written_at = datetime!(2026-10-22 10:00:00.123456 UTC);
-    event.content = json!({ "application": { "id": "x" }, "result": { "problem_count": 0 } });
-    f.repo.record_refused(event.clone()).await.unwrap();
-    // `SQLite` stores whole milliseconds.
-    event.written_at = datetime!(2026-10-22 10:00:00.123 UTC);
-    assert_eq!(events(&f, 0xA).await, [event]);
+    for (n, app) in [(1, "c.app"), (2, "a.app"), (3, "b.app")] {
+        running(&f, n, app, &[]).await;
+        f.repo
+            .finish(
+                id(n),
+                &final_report(n, app, OperationAction::Seed),
+                RequestCategory::Succeeded,
+            )
+            .await
+            .unwrap();
+    }
+    let names = |page: Vec<ApplicationRecord>| {
+        page.into_iter()
+            .map(|r| r.application_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(f.repo.applications_page(None, None, 10).await.unwrap()),
+        ["a.app", "b.app", "c.app"]
+    );
+    assert_eq!(
+        names(
+            f.repo
+                .applications_page(None, Some("a.app".to_owned()), 1)
+                .await
+                .unwrap()
+        ),
+        ["b.app"]
+    );
+    assert_eq!(
+        names(
+            f.repo
+                .applications_page(Some(vec!["c.app".to_owned(), "a.app".to_owned()]), None, 10)
+                .await
+                .unwrap()
+        ),
+        ["a.app", "c.app"]
+    );
+}
+
+#[tokio::test]
+async fn pages_are_capped_at_their_maximum() {
+    let f = setup().await;
+    for e in 1..=u128::from(HISTORY_PAGE_MAX_LIMIT) + 1 {
+        f.repo
+            .record_refused(event(e, HistoryKind::Refused, 0xA))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        f.repo
+            .history_page(None, None, u64::MAX)
+            .await
+            .unwrap()
+            .len(),
+        usize::try_from(HISTORY_PAGE_MAX_LIMIT).unwrap()
+    );
 }
 
 // ---- storage timeout ----
@@ -1194,25 +1122,30 @@ async fn a_slow_store_gives_unavailable_within_the_timeout() {
 
     let started = std::time::Instant::now();
     assert_eq!(
-        f.repo.open_operation(APP, T0).await,
+        f.repo.open_operation(APP).await,
         Err(StorageError::Unavailable)
     );
     assert_eq!(
         f.repo
-            .accept(new_op(1, APP, 60), accepted_event(1), T0)
+            .accept(
+                new_op(1, APP, OperationAction::Seed, OPEN),
+                accepted_event(1)
+            )
             .await,
         Err(StorageError::Unavailable)
     );
     assert_eq!(
-        f.repo.record_refused(refused_event(0x9001, 0x9000)).await,
+        f.repo
+            .record_refused(event(0x9001, HistoryKind::Refused, 0x9000))
+            .await,
         Err(StorageError::Unavailable)
     );
     assert_eq!(
-        f.repo.mark_running(id(1), T0).await,
+        f.repo.mark_running(id(1), &[]).await,
         Err(StorageError::Unavailable)
     );
     assert_eq!(
-        f.repo.audit_events(id(1)).await,
+        f.repo.history_page(None, None, 10).await,
         Err(StorageError::Unavailable)
     );
     assert!(
@@ -1222,10 +1155,9 @@ async fn a_slow_store_gives_unavailable_within_the_timeout() {
 
     release.send(()).unwrap();
     holder.await.unwrap().unwrap();
-    // Not sticky: the next call answers, and nothing from the timed-out accept
-    // was committed.
-    assert_eq!(f.repo.open_operation(APP, T0).await, Ok(None));
-    assert_eq!(f.repo.read_operation(id(1), T0).await, Ok(None));
+    // Not sticky, and nothing from the timed-out accept was committed.
+    assert_eq!(f.repo.open_operation(APP).await, Ok(None));
+    assert_eq!(f.repo.read_operation(id(1)).await, Ok(None));
 }
 
 // ---- concurrency ----
@@ -1237,37 +1169,32 @@ async fn concurrent_accepts_for_one_application_have_exactly_one_winner() {
     for n in 1..=8_u128 {
         let repo = Arc::clone(&f.repo);
         tasks.push(tokio::spawn(async move {
-            repo.accept(new_op(n, APP, 60), accepted_event(n), T0).await
+            repo.accept(
+                new_op(n, APP, OperationAction::Seed, OPEN),
+                accepted_event(n),
+            )
+            .await
         }));
     }
     let mut won = Vec::new();
     let mut violated = 0;
     for (n, task) in (1..=8_u128).zip(tasks) {
         match task.await.unwrap() {
-            Ok(()) => won.push(n),
+            Ok(_) => won.push(n),
             Err(StorageError::IndexViolated) => violated += 1,
             Err(other) => panic!("unexpected {other:?}"),
         }
     }
     assert_eq!(won.len(), 1, "exactly one winner: {won:?}");
     assert_eq!(violated, 7);
-    let winner = won[0];
-    assert_eq!(
-        f.repo
-            .open_operation(APP, T0)
-            .await
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        id(winner)
-    );
     for n in 1..=8_u128 {
-        let expected = usize::from(n == winner);
-        assert_eq!(events(&f, n).await.len(), expected, "events of {n}");
+        assert_eq!(
+            events(&f, n).await.len(),
+            usize::from(n == won[0]),
+            "events of {n}"
+        );
     }
 }
-
-// ---- contention (F-001) ----
 
 /// Run `n` accepts at once, released together by a barrier; `app` names the
 /// application of accept `i`.
@@ -1275,7 +1202,7 @@ async fn burst_accepts(
     f: &Fixture,
     n: u128,
     app: impl Fn(u128) -> String,
-) -> Vec<Result<(), StorageError>> {
+) -> Vec<Result<Accepted, StorageError>> {
     let barrier = Arc::new(tokio::sync::Barrier::new(usize::try_from(n).unwrap()));
     let mut tasks = Vec::new();
     for i in 1..=n {
@@ -1284,8 +1211,11 @@ async fn burst_accepts(
         let app = app(i);
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            repo.accept(new_op(i, &app, 60), accepted_event(i), T0)
-                .await
+            repo.accept(
+                new_op(i, &app, OperationAction::Seed, OPEN),
+                accepted_event(i),
+            )
+            .await
         }));
     }
     let mut results = Vec::new();
@@ -1303,9 +1233,6 @@ async fn concurrent_accepts_for_different_applications_all_succeed_on_a_file_dat
         results.iter().all(Result::is_ok),
         "contention is retried, never Unavailable: {results:?}"
     );
-    for i in 1..=16_u128 {
-        assert_eq!(events(&f, i).await.len(), 1, "accepted event of {i}");
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1321,377 +1248,8 @@ async fn concurrent_accepts_for_one_application_on_a_file_database_have_one_winn
     assert_eq!(violated, 15, "no Unavailable among the losers: {results:?}");
 }
 
-// ---- batch interruption survives a failing record (F-005) ----
+// ---- stored timestamps ----
 
-/// Store a category token the migration's `CHECK` would refuse, on a separate
-/// single-connection pool with `CHECK` enforcement off, so a row that does not
-/// map back exists.
-async fn corrupt_category(f: &Fixture, operation: u128) {
-    let mut options = sea_orm::ConnectOptions::new(f.dsn.clone());
-    options.max_connections(1);
-    let conn = Database::connect(options).await.expect("second connection");
-    for sql in [
-        "PRAGMA ignore_check_constraints = ON".to_owned(),
-        format!(
-            "UPDATE operations SET category = 'bogus' WHERE operation_id = x'{operation:032x}'"
-        ),
-    ] {
-        conn.execute_unprepared(&sql).await.expect("corrupt row");
-    }
-}
-
-#[tokio::test]
-async fn batch_interruption_goes_past_a_record_that_does_not_map() {
-    let f = setup().await;
-    accept(&f, 1, "bad.app", 10).await;
-    accept(&f, 2, "good.app", 20).await;
-    corrupt_category(&f, 1).await;
-
-    let now = T0 + secs(100);
-    assert_eq!(f.repo.interrupt_expired_batch(now, 10).await, Ok(1));
-    assert_eq!(read(&f, 2, now).await.status, OperationStatus::Interrupted);
-    assert_eq!(events(&f, 2).await.len(), 2);
-    // The bad record is untouched: still open, no finished event.
-    assert_eq!(events(&f, 1).await, [accepted_event(1)]);
-    assert_eq!(
-        f.repo
-            .open_operation("bad.app", T0)
-            .await
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        id(1)
-    );
-}
-
-#[tokio::test]
-async fn batch_interruption_fails_when_every_attempted_record_fails() {
-    let f = setup().await;
-    accept(&f, 1, "bad.app", 10).await;
-    corrupt_category(&f, 1).await;
-    assert_eq!(
-        f.repo.interrupt_expired_batch(T0 + secs(100), 10).await,
-        Err(StorageError::Unavailable)
-    );
-}
-
-#[tokio::test]
-async fn batch_interruption_with_nothing_due_is_zero() {
-    let f = setup().await;
-    assert_eq!(f.repo.interrupt_expired_batch(T0, 10).await, Ok(0));
-}
-
-// ---- the finished event belongs to the record (F-006) ----
-
-#[tokio::test]
-async fn finish_derives_the_stored_category_and_clears_interrupted() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let mut given = report(1, APP);
-    given.category = Some(RequestCategory::Conflict);
-    given.interrupted = true;
-    f.repo
-        .finish(
-            id(1),
-            &given,
-            RequestCategory::Succeeded,
-            finished_event(1),
-            T0 + secs(10),
-        )
-        .await
-        .unwrap();
-    let op = read(&f, 1, T0 + secs(11)).await;
-    assert_eq!(op.category, Some(RequestCategory::Succeeded));
-    assert_eq!(op.report.category, Some(RequestCategory::Succeeded));
-    assert!(!op.report.interrupted);
-}
-
-#[tokio::test]
-async fn supervisor_completion_stores_internal_failure_in_the_report() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    let mut given = report(1, APP);
-    given.interrupted = true;
-    f.repo
-        .complete_by_supervisor(id(1), &given, finished_event(1), T0 + secs(10))
-        .await
-        .unwrap();
-    let op = read(&f, 1, T0 + secs(11)).await;
-    assert_eq!(op.report.category, Some(RequestCategory::InternalFailure));
-    assert!(!op.report.interrupted);
-}
-
-/// A finished event that does not belong to operation 1, each in one way.
-fn mismatched_events() -> Vec<(&'static str, AuditEvent)> {
-    let mut other_id = finished_event(1);
-    other_id.event_id = id(0x7777);
-    let mut other_correlation = finished_event(1);
-    other_correlation.correlation_id = id(2);
-    let mut other_action = finished_event(1);
-    other_action.action = OperationAction::Uninstall;
-    let mut other_kind = finished_event(1);
-    other_kind.kind = AuditKind::Refused;
-    vec![
-        ("event id", other_id),
-        ("correlation id", other_correlation),
-        ("action", other_action),
-        ("kind", other_kind),
-    ]
-}
-
-async fn assert_nothing_written(f: &Fixture) {
-    let op = read(f, 1, T0 + secs(11)).await;
-    assert_eq!(op.status, OperationStatus::Accepted);
-    assert_eq!(op.category, None);
-    assert_eq!(op.finished_at, None);
-    assert_eq!(op.report, report(1, APP));
-    assert_eq!(events(f, 1).await, [accepted_event(1)]);
-    assert_eq!(events(f, 2).await, []);
-    assert_eq!(events(f, 0x7777).await, []);
-}
-
-#[tokio::test]
-async fn finish_refuses_a_finished_event_of_another_record_and_writes_nothing() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    for (what, event) in mismatched_events() {
-        let result = f
-            .repo
-            .finish(
-                id(1),
-                &report(1, APP),
-                RequestCategory::Succeeded,
-                event,
-                T0 + secs(10),
-            )
-            .await;
-        assert_eq!(result, Err(StorageError::Inconsistent), "{what}");
-        assert_nothing_written(&f).await;
-    }
-}
-
-#[tokio::test]
-async fn supervisor_completion_refuses_a_finished_event_of_another_record() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    for (what, event) in mismatched_events() {
-        let result = f
-            .repo
-            .complete_by_supervisor(id(1), &failed_report(1), event, T0 + secs(10))
-            .await;
-        assert_eq!(result, Err(StorageError::Inconsistent), "{what}");
-        assert_nothing_written(&f).await;
-    }
-}
-
-#[tokio::test]
-async fn a_final_record_is_operation_final_even_with_a_mismatched_event() {
-    let f = setup().await;
-    accept(&f, 1, APP, 60).await;
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(61)).await,
-        Ok(true)
-    );
-    let (_, event) = mismatched_events().remove(0);
-    let result = f
-        .repo
-        .finish(
-            id(1),
-            &report(1, APP),
-            RequestCategory::Succeeded,
-            event,
-            T0 + secs(62),
-        )
-        .await;
-    assert_eq!(result, Err(StorageError::OperationFinal));
-}
-
-// ---- audit order, offsets and sub-second guards (F-008) ----
-
-fn written(event: u128, correlation: u128, at: OffsetDateTime) -> AuditEvent {
-    let mut event = refused_event(event, correlation);
-    event.written_at = at;
-    event
-}
-
-fn micros(n: i64) -> time::Duration {
-    time::Duration::microseconds(n)
-}
-
-#[tokio::test]
-async fn audit_events_read_in_write_time_order_when_event_ids_run_the_other_way() {
-    let f = setup().await;
-    // Event ids ascend while write times descend, in whole seconds.
-    for (event, at) in [(0xA001, 30), (0xA002, 20), (0xA003, 10)] {
-        f.repo
-            .record_refused(written(event, 0xA, T0 + secs(at)))
-            .await
-            .unwrap();
-    }
-    let ids: Vec<Uuid> = events(&f, 0xA).await.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids, [id(0xA003), id(0xA002), id(0xA001)]);
-}
-
-#[tokio::test]
-async fn audit_events_with_equal_write_times_read_in_event_id_order() {
-    let f = setup().await;
-    for event in [0xA003, 0xA001, 0xA002] {
-        f.repo
-            .record_refused(written(event, 0xA, T0 + secs(5)))
-            .await
-            .unwrap();
-    }
-    let ids: Vec<Uuid> = events(&f, 0xA).await.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids, [id(0xA001), id(0xA002), id(0xA003)]);
-}
-
-#[tokio::test]
-async fn audit_events_read_in_write_time_order_across_mixed_fraction_lengths() {
-    let f = setup().await;
-    for (event, at) in [
-        (0xA001, secs(10) + micros(500_000)),
-        (0xA002, secs(10)),
-        (0xA003, secs(10) + micros(123_456)),
-        (0xA004, secs(9) + micros(999_999)),
-    ] {
-        f.repo
-            .record_refused(written(event, 0xA, T0 + at))
-            .await
-            .unwrap();
-    }
-    let ids: Vec<Uuid> = events(&f, 0xA).await.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids, [id(0xA004), id(0xA002), id(0xA003), id(0xA001)]);
-}
-
-#[tokio::test]
-async fn audit_events_read_in_write_time_order_across_fractions_of_one_length() {
-    let f = setup().await;
-    for (event, at) in [
-        (0xA001, micros(500_000)),
-        (0xA002, micros(250_000)),
-        (0xA003, micros(750_000)),
-    ] {
-        f.repo
-            .record_refused(written(event, 0xA, T0 + secs(10) + at))
-            .await
-            .unwrap();
-    }
-    let ids: Vec<Uuid> = events(&f, 0xA).await.iter().map(|e| e.event_id).collect();
-    assert_eq!(ids, [id(0xA002), id(0xA001), id(0xA003)]);
-}
-
-#[tokio::test]
-async fn guards_compare_instants_given_with_an_offset() {
-    let f = setup().await;
-    let plus_two = time::UtcOffset::from_hms(2, 0, 0).unwrap();
-    let local = |at: OffsetDateTime| at.to_offset(plus_two);
-    let mut new = new_op(1, APP, 60);
-    new.accepted_at = local(T0);
-    new.run_deadline = local(T0 + secs(60));
-    f.repo
-        .accept(new, accepted_event(1), local(T0))
-        .await
-        .unwrap();
-    let op = read(&f, 1, local(T0 + secs(1))).await;
-    assert_eq!(op.run_deadline, T0 + secs(60));
-    assert_eq!(op.accepted_at, T0);
-
-    let open = f
-        .repo
-        .open_operation(APP, local(T0 + secs(59)))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!open.expired);
-    assert!(
-        f.repo
-            .open_operation(APP, local(T0 + secs(60)))
-            .await
-            .unwrap()
-            .unwrap()
-            .expired,
-        "expired at the deadline"
-    );
-    f.repo
-        .mark_running(id(1), local(T0 + secs(59)))
-        .await
-        .unwrap();
-    assert_eq!(
-        f.repo
-            .record_report(id(1), &report(1, APP), local(T0 + secs(60)))
-            .await,
-        Err(StorageError::OperationFinal),
-        "the deadline is exclusive for a write"
-    );
-    assert_eq!(
-        f.repo
-            .interrupt_if_expired(id(1), local(T0 + secs(59)))
-            .await,
-        Ok(false)
-    );
-    assert_eq!(
-        f.repo
-            .interrupt_if_expired(id(1), local(T0 + secs(60)))
-            .await,
-        Ok(true)
-    );
-}
-
-#[tokio::test]
-async fn guards_compare_sub_second_inputs_of_one_fraction_length() {
-    let f = setup().await;
-    let mut new = new_op(1, APP, 60);
-    new.run_deadline = T0 + secs(60) + micros(500_000);
-    f.repo.accept(new, accepted_event(1), T0).await.unwrap();
-
-    f.repo
-        .mark_running(id(1), T0 + secs(60) + micros(499_999))
-        .await
-        .expect("a microsecond before the deadline");
-    assert_eq!(
-        f.repo
-            .record_report(id(1), &report(1, APP), T0 + secs(60) + micros(500_000))
-            .await,
-        Err(StorageError::OperationFinal),
-        "at the deadline"
-    );
-    assert_eq!(
-        f.repo
-            .interrupt_if_expired(id(1), T0 + secs(60) + micros(499_999))
-            .await,
-        Ok(false)
-    );
-    assert_eq!(
-        f.repo
-            .interrupt_if_expired(id(1), T0 + secs(60) + micros(500_000))
-            .await,
-        Ok(true)
-    );
-}
-
-#[tokio::test]
-async fn guards_compare_sub_second_inputs_across_fraction_lengths() {
-    let f = setup().await;
-    let mut new = new_op(1, APP, 60);
-    new.run_deadline = T0 + secs(60) + micros(500_000);
-    f.repo.accept(new, accepted_event(1), T0).await.unwrap();
-    f.repo
-        .mark_running(id(1), T0 + secs(60))
-        .await
-        .expect("a whole second before a half-second deadline");
-    assert_eq!(
-        f.repo
-            .interrupt_if_expired(id(1), T0 + secs(60) + micros(1))
-            .await,
-        Ok(false)
-    );
-    assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(61)).await,
-        Ok(true)
-    );
-}
-
-/// The stored text of `column` in `table`, read on a second connection.
 async fn stored_text(f: &Fixture, table: &str, column: &str) -> Vec<String> {
     let mut options = sea_orm::ConnectOptions::new(f.dsn.clone());
     options.max_connections(1);
@@ -1711,37 +1269,23 @@ async fn stored_text(f: &Fixture, table: &str, column: &str) -> Vec<String> {
 #[tokio::test]
 async fn sqlite_stores_timestamps_as_fixed_width_utc_text() {
     let f = setup().await;
-    let plus_two = time::UtcOffset::from_hms(2, 0, 0).unwrap();
-    let mut new = new_op(1, APP, 60);
-    new.accepted_at = T0.to_offset(plus_two);
-    new.run_deadline = T0 + secs(60) + micros(500_999);
-    f.repo.accept(new, accepted_event(1), T0).await.unwrap();
-    f.repo
-        .record_refused(written(0xA001, 0xA, T0 + secs(10)))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        stored_text(&f, "operations", "accepted_at").await,
-        ["2026-10-22 10:00:00.000"]
-    );
-    assert_eq!(
-        stored_text(&f, "operations", "run_deadline").await,
-        ["2026-10-22 10:01:00.500"]
-    );
-    let written_at = stored_text(&f, "audit_ledger", "written_at").await;
-    assert!(
-        written_at.contains(&"2026-10-22 10:00:10.000".to_owned()),
-        "{written_at:?}"
-    );
-    assert_eq!(
-        read(&f, 1, T0).await.run_deadline,
-        T0 + secs(60) + micros(500_000),
-        "read back at millisecond precision"
-    );
+    accept(&f, 1, APP, Duration::from_millis(1500)).await;
+    let shape =
+        |text: &str| text.len() == 23 && text.as_bytes()[10] == b' ' && text.as_bytes()[19] == b'.';
+    for (table, column) in [
+        ("operations", "accepted_at"),
+        ("operations", "run_deadline"),
+        ("operation_history", "written_at"),
+    ] {
+        let stored = stored_text(&f, table, column).await;
+        assert!(
+            stored.iter().all(|t| shape(t)),
+            "{table}.{column}: {stored:?}"
+        );
+    }
 }
 
-// ---- a timeout in the middle of a transaction (F-008) ----
+// ---- a timeout in the middle of a transaction ----
 
 #[tokio::test]
 async fn a_timeout_after_the_first_statement_commits_nothing() {
@@ -1754,7 +1298,8 @@ async fn a_timeout_after_the_first_statement_commits_nothing() {
             // The second connection takes the write lock and keeps it.
             db.transaction(move |tx| {
                 Box::pin(async move {
-                    insert_event(tx, DbBackend::Sqlite, &refused_event(0x9001, 0x9000)).await?;
+                    let held = event(0x9001, HistoryKind::Refused, 0x9000);
+                    insert_event(tx, DbBackend::Sqlite, &held, OffsetDateTime::now_utc()).await?;
                     started.send(()).ok();
                     wait.await.ok();
                     Ok::<(), DbError>(())
@@ -1766,12 +1311,13 @@ async fn a_timeout_after_the_first_statement_commits_nothing() {
         (release, holder)
     };
 
-    // The accept's first statement (a read) runs; its insert then waits on the
-    // write lock until `storage_call_timeout` drops the call.
     let started = std::time::Instant::now();
     assert_eq!(
         f.repo
-            .accept(new_op(1, APP, 60), accepted_event(1), T0)
+            .accept(
+                new_op(1, APP, OperationAction::Seed, OPEN),
+                accepted_event(1)
+            )
             .await,
         Err(StorageError::Unavailable)
     );
@@ -1779,13 +1325,12 @@ async fn a_timeout_after_the_first_statement_commits_nothing() {
 
     release.send(()).unwrap();
     holder.await.unwrap().unwrap();
-    assert_eq!(f.repo.open_operation(APP, T0).await, Ok(None));
-    assert_eq!(f.repo.read_operation(id(1), T0).await, Ok(None));
+    assert_eq!(f.repo.open_operation(APP).await, Ok(None));
     assert_eq!(events(&f, 1).await, []);
     assert_eq!(events(&f, 0x9000).await.len(), 1, "the holder's own write");
 }
 
-// ---- logs carry a class and the call, never the application id (F-009) ----
+// ---- logs carry a class and the call, never the application id ----
 
 const SECRET_APP: &str = "very-secret-application-id.example";
 
@@ -1793,12 +1338,13 @@ const SECRET_APP: &str = "very-secret-application-id.example";
 #[traced_test]
 async fn a_failed_step_logs_its_class_and_call_but_no_application_id() {
     let f = setup().await;
-    accept(&f, 1, "other.app", 60).await;
-    // The event id is taken, so the insert fails on a unique constraint.
+    accept(&f, 1, "other.app", OPEN).await;
     let mut clash = accepted_event(2);
-    clash.event_id = id(0x2001);
+    clash.event_id = id(0x1001);
     assert_eq!(
-        f.repo.accept(new_op(2, SECRET_APP, 60), clash, T0).await,
+        f.repo
+            .accept(new_op(2, SECRET_APP, OperationAction::Seed, OPEN), clash)
+            .await,
         Err(StorageError::Unavailable)
     );
     assert!(logs_contain("class=\"constraint\""));
@@ -1813,7 +1359,7 @@ async fn a_timeout_logs_its_class_and_call_but_no_application_id() {
     let f = setup_with(Duration::from_millis(100)).await;
     let (release, holder) = hold_connection(&f.db).await;
     assert_eq!(
-        f.repo.open_operation(SECRET_APP, T0).await,
+        f.repo.open_operation(SECRET_APP).await,
         Err(StorageError::Unavailable)
     );
     release.send(()).unwrap();
@@ -1827,14 +1373,14 @@ async fn a_timeout_logs_its_class_and_call_but_no_application_id() {
 #[traced_test]
 async fn a_row_that_does_not_map_logs_the_row_mapping_class() {
     let f = setup().await;
-    accept(&f, 1, SECRET_APP, 10).await;
+    accept(&f, 1, SECRET_APP, EXPIRED).await;
     corrupt_category(&f, 1).await;
     assert_eq!(
-        f.repo.interrupt_if_expired(id(1), T0 + secs(20)).await,
+        f.repo.expire_if_expired(id(1)).await,
         Err(StorageError::Unavailable)
     );
     assert!(logs_contain("class=\"row_mapping\""));
-    assert!(logs_contain("call=\"interrupt_if_expired\""));
+    assert!(logs_contain("call=\"expire_if_expired\""));
     assert!(!logs_contain(SECRET_APP));
 }
 
@@ -1868,50 +1414,4 @@ fn error_classes_come_from_the_error_kind() {
     assert_eq!(class(&DbError::from(RowError)), "row_mapping");
     assert_eq!(class(&sea(DbErr::Custom("anything".to_owned()))), "other");
     assert_eq!(class(&DbError::InvalidParameter("x".to_owned())), "other");
-}
-
-// ---- batch limits (F-010) ----
-
-#[tokio::test]
-async fn a_huge_limit_is_clamped_and_still_works() {
-    let f = setup().await;
-    for n in 1..=3_u128 {
-        accept(&f, n, &format!("app.{n}"), 10).await;
-    }
-    assert_eq!(
-        f.repo
-            .interrupt_expired_batch(T0 + secs(20), u64::MAX)
-            .await,
-        Ok(3)
-    );
-    assert_eq!(
-        f.repo.purge_finished(T0 + secs(3600), u64::MAX).await,
-        Ok(3)
-    );
-}
-
-#[tokio::test]
-async fn a_batch_never_handles_more_than_the_maximum() {
-    let f = setup().await;
-    let total = MAX_BATCH_LIMIT + 5;
-    for n in 1..=u128::from(total) {
-        f.repo
-            .accept(new_op(n, &format!("app.{n}"), 10), accepted_event(n), T0)
-            .await
-            .unwrap();
-    }
-    let now = T0 + secs(20);
-    assert_eq!(
-        f.repo.interrupt_expired_batch(now, u64::MAX).await,
-        Ok(MAX_BATCH_LIMIT)
-    );
-    assert_eq!(f.repo.interrupt_expired_batch(now, u64::MAX).await, Ok(5));
-    assert_eq!(
-        f.repo.purge_finished(T0 + secs(3600), u64::MAX).await,
-        Ok(MAX_BATCH_LIMIT)
-    );
-    assert_eq!(
-        f.repo.purge_finished(T0 + secs(3600), u64::MAX).await,
-        Ok(5)
-    );
 }

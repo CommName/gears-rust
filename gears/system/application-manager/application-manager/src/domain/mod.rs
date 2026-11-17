@@ -6,8 +6,8 @@
 
 pub mod actions;
 pub mod allowed_callers;
-pub mod audit;
 pub mod error;
+pub mod history;
 pub mod operation;
 pub mod plugin_set;
 pub mod ports;

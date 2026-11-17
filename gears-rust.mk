@@ -538,9 +538,9 @@ lane_args_types-registry-db = -p cf-gears-types-registry --features integration 
 lane_args_eb-gear-db = -p cf-gears-event-broker --features integration -E 'binary(/_backends_test$$/)'
 lane_env_eb-gear-db = EB_TEST_REQUIRE_DOCKER=1
 
-## Application Manager's database tier: the operations table and the audit
-## ledger on PostgreSQL and MySQL (Docker required; each test starts its own
-## container). APPLICATION_MANAGER_DB_REQUIRE_DOCKER=1 turns an unreachable
+## Application Manager's database tier: the operations, operation history and
+## applications tables on PostgreSQL and MySQL (Docker required; each test
+## starts its own container). APPLICATION_MANAGER_DB_REQUIRE_DOCKER=1 turns an unreachable
 ## Docker into a failure; without it the tests skip and pass vacuously.
 lane_args_application-manager-db = -p cf-gears-application-manager --features integration -E 'binary(/_backends_test$$/)'
 lane_env_application-manager-db = APPLICATION_MANAGER_DB_REQUIRE_DOCKER=1

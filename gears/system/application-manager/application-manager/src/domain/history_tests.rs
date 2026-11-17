@@ -7,18 +7,17 @@ use serde_json::{Value, json};
 use time::macros::datetime;
 
 use super::*;
-use crate::test_support::ctx;
+use crate::domain::operation::CompletionReason;
+use crate::test_support::platform_ctx;
 
 const RECEIVED: OffsetDateTime = datetime!(2026-10-22 10:00:00 UTC);
 const RECEIVED_TEXT: &str = "2026-10-22T10:00:00Z";
 
 /// SHA-256 of `abc` (FIPS 180-4 test vector).
 const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-/// SHA-256 of the empty input.
-const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn caller() -> CallerIdentity {
-    CallerIdentity::from_security_context(&ctx())
+    CallerIdentity::from_platform_context(&platform_ctx("app-seeder"))
 }
 
 fn caller_json() -> Value {
@@ -37,9 +36,16 @@ fn keys(content: &Value) -> Vec<&str> {
 }
 
 fn within(id: &str, version: Option<&str>) -> ApplicationRef {
-    ApplicationRef::Within {
-        id: id.to_owned(),
-        version: version.map(str::to_owned),
+    ApplicationRef {
+        id: BoundedText::Within(id.to_owned()),
+        version: version.map(|v| BoundedText::Within(v.to_owned())),
+    }
+}
+
+fn digest(bytes: usize, sha256: &str) -> BoundedText {
+    BoundedText::Digest {
+        bytes,
+        sha256: sha256.to_owned(),
     }
 }
 
@@ -63,7 +69,6 @@ fn report(action: OperationAction) -> OutcomeReport {
         operation_id: Uuid::from_u128(1),
         action,
         category: Some(RequestCategory::Succeeded),
-        interrupted: false,
         application: ReportApplication {
             id: "acme.app".to_owned(),
             version: (action == OperationAction::Seed).then(|| "1.0.0".to_owned()),
@@ -74,11 +79,11 @@ fn report(action: OperationAction) -> OutcomeReport {
     }
 }
 
-fn entry(key: &str, outcome: SectionOutcome, version: Option<&str>) -> SectionOutcomeEntry {
+fn entry(key: &str, outcome: SectionOutcome, section_type: Option<&str>) -> SectionOutcomeEntry {
     SectionOutcomeEntry {
         key: key.to_owned(),
-        outcome,
-        schema_version: version.map(str::to_owned),
+        section_type: section_type.map(str::to_owned),
+        outcome: Some(outcome),
         detail: None,
         location: None,
     }
@@ -102,49 +107,60 @@ fn bounded_counts_bytes_not_characters() {
         ApplicationRef::bounded("\u{e9}\u{e9}", None, 4),
         within("\u{e9}\u{e9}", None)
     );
-    let ApplicationRef::Digest { id_bytes, .. } = ApplicationRef::bounded("\u{e9}\u{e9}", None, 3)
-    else {
+    assert_eq!(
+        ApplicationRef::bounded("\u{e9}\u{e9}", None, 3).id,
+        BoundedText::of("\u{e9}\u{e9}", 3)
+    );
+    let BoundedText::Digest { bytes, .. } = BoundedText::of("\u{e9}\u{e9}", 3) else {
         panic!("4 bytes exceed a limit of 3");
     };
-    assert_eq!(id_bytes, 4);
+    assert_eq!(bytes, 4);
 }
 
 #[test]
 fn bounded_long_id_becomes_byte_length_and_sha256() {
     assert_eq!(
         ApplicationRef::bounded("abc", None, 2),
-        ApplicationRef::Digest {
-            id_bytes: 3,
-            id_sha256: ABC_SHA256.to_owned(),
-            version_bytes: None,
-            version_sha256: None,
+        ApplicationRef {
+            id: digest(3, ABC_SHA256),
+            version: None,
         }
     );
 }
 
 #[test]
-fn bounded_long_version_becomes_a_digest_of_both() {
+fn bounded_digests_each_field_on_its_own() {
     assert_eq!(
         ApplicationRef::bounded("", Some("abc"), 2),
-        ApplicationRef::Digest {
-            id_bytes: 0,
-            id_sha256: EMPTY_SHA256.to_owned(),
-            version_bytes: Some(3),
-            version_sha256: Some(ABC_SHA256.to_owned()),
+        ApplicationRef {
+            id: BoundedText::Within(String::new()),
+            version: Some(digest(3, ABC_SHA256)),
         }
     );
+    assert_eq!(
+        ApplicationRef::bounded("abc", Some(""), 2),
+        ApplicationRef {
+            id: digest(3, ABC_SHA256),
+            version: Some(BoundedText::Within(String::new())),
+        }
+    );
+    assert_eq!(BoundedText::of("", 0), BoundedText::Within(String::new()));
+    assert_eq!(BoundedText::of("x", 0), digest(1, &sha_of("x")));
+}
+
+fn sha_of(text: &str) -> String {
+    let BoundedText::Digest { sha256, .. } = BoundedText::of(text, 0) else {
+        panic!("a non-empty text exceeds a limit of 0");
+    };
+    sha256
 }
 
 #[test]
 fn bounded_digest_is_lower_case_hex_of_64_digits() {
-    let ApplicationRef::Digest { id_sha256, .. } =
-        ApplicationRef::bounded(&"x".repeat(300), None, 255)
-    else {
-        panic!("300 bytes exceed 255");
-    };
-    assert_eq!(id_sha256.len(), 64);
+    let sha256 = sha_of(&"x".repeat(300));
+    assert_eq!(sha256.len(), 64);
     assert!(
-        id_sha256
+        sha256
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     );
@@ -195,24 +211,12 @@ fn accepted_has_no_result() {
 }
 
 #[test]
-fn caller_content_has_no_token() {
-    let with_token = SecurityContextWithToken::build();
-    let identity = CallerIdentity::from_security_context(&with_token);
-    let content = accepted(&within("a", Some("1")), None, &identity, RECEIVED);
-    assert!(!content.to_string().contains("secret-token"));
-}
-
-struct SecurityContextWithToken;
-
-impl SecurityContextWithToken {
-    fn build() -> toolkit_security::SecurityContext {
-        toolkit_security::SecurityContext::builder()
-            .subject_id(Uuid::from_u128(1))
-            .subject_tenant_id(Uuid::from_u128(2))
-            .bearer_token("secret-token".to_owned())
-            .build()
-            .unwrap()
-    }
+fn caller_content_is_the_platform_identity() {
+    let content = accepted(&within("a", Some("1")), None, &caller(), RECEIVED);
+    assert_eq!(
+        content["caller"],
+        serde_json::to_value(platform_ctx("app-seeder").identity()).unwrap()
+    );
 }
 
 // ---- finished ----
@@ -221,10 +225,14 @@ impl SecurityContextWithToken {
 fn finished_succeeded_emits_exactly_the_design_fields() {
     let mut done = report(OperationAction::Seed);
     done.sections = vec![
-        entry("billing", SectionOutcome::Succeeded, Some("3")),
-        entry("crm", SectionOutcome::Succeeded, Some("7")),
+        entry(
+            "billing",
+            SectionOutcome::Succeeded,
+            Some("gts.t.billing.v1~"),
+        ),
+        entry("crm", SectionOutcome::Succeeded, Some("gts.t.crm.v1~")),
     ];
-    let content = finished(&done);
+    let content = finished(&done, None);
     assert_eq!(keys(&content), ["application", "result"]);
     assert_eq!(
         content["application"],
@@ -234,7 +242,6 @@ fn finished_succeeded_emits_exactly_the_design_fields() {
         keys(&content["result"]),
         [
             "category",
-            "interrupted",
             "problem_count",
             "rules",
             "sections",
@@ -242,14 +249,13 @@ fn finished_succeeded_emits_exactly_the_design_fields() {
         ]
     );
     assert_eq!(content["result"]["category"], json!("succeeded"));
-    assert_eq!(content["result"]["interrupted"], json!(false));
     assert_eq!(content["result"]["problem_count"], json!(0));
     assert_eq!(content["result"]["rules"], json!([]));
     assert_eq!(
         content["result"]["sections"],
         json!([
-            { "key": "billing", "outcome": "succeeded", "schema_version": "3" },
-            { "key": "crm", "outcome": "succeeded", "schema_version": "7" },
+            { "key": "billing", "section_type": "gts.t.billing.v1~", "outcome": "succeeded" },
+            { "key": "crm", "section_type": "gts.t.crm.v1~", "outcome": "succeeded" },
         ])
     );
     assert_eq!(content["result"]["unavailable"], json!([]));
@@ -257,20 +263,30 @@ fn finished_succeeded_emits_exactly_the_design_fields() {
 
 #[test]
 fn finished_uninstall_application_has_only_the_id() {
-    let content = finished(&report(OperationAction::Uninstall));
+    let content = finished(&report(OperationAction::Uninstall), None);
     assert_eq!(content["application"], json!({ "id": "acme.app" }));
 }
 
 #[test]
-fn finished_interrupted_carries_the_marker_and_no_category() {
-    let mut cut = report(OperationAction::Seed);
-    cut.category = None;
-    cut.interrupted = true;
-    cut.sections = vec![entry("billing", SectionOutcome::Succeeded, Some("3"))];
-    let content = finished(&cut);
-    assert_eq!(content["result"]["interrupted"], json!(true));
-    assert!(content["result"].get("category").is_none(), "{content}");
-    assert_eq!(content["result"]["sections"].as_array().unwrap().len(), 1);
+fn finished_expiry_completion_carries_the_reason_expired() {
+    let mut expired = report(OperationAction::Seed);
+    expired.category = Some(RequestCategory::InternalFailure);
+    expired.sections = vec![
+        entry(
+            "billing",
+            SectionOutcome::Succeeded,
+            Some("gts.t.billing.v1~"),
+        ),
+        entry("crm", SectionOutcome::Lost, Some("gts.t.crm.v1~")),
+    ];
+    let content = finished(&expired, Some(CompletionReason::Expired));
+    assert_eq!(content["result"]["reason"], json!("expired"));
+    assert_eq!(content["result"]["category"], json!("internal_failure"));
+    assert_eq!(content["result"]["sections"][1]["outcome"], json!("lost"));
+    assert!(
+        finished(&expired, None)["result"].get("reason").is_none(),
+        "only an expiry completion has a reason"
+    );
 }
 
 #[test]
@@ -283,7 +299,7 @@ fn finished_records_problem_count_and_distinct_sorted_rule_tokens() {
         problem("type", "/sections/b/z", "z must be a string"),
         problem("missing_section", "/sections/c", "section c is missing"),
     ];
-    let content = finished(&invalid);
+    let content = finished(&invalid, None);
     assert_eq!(content["result"]["problem_count"], json!(4));
     assert_eq!(
         content["result"]["rules"],
@@ -294,34 +310,33 @@ fn finished_records_problem_count_and_distinct_sorted_rule_tokens() {
 #[test]
 fn finished_records_unavailable_items() {
     let mut unavailable = report(OperationAction::Seed);
-    unavailable.category = Some(RequestCategory::TemporarilyUnavailable);
+    unavailable.category = Some(RequestCategory::InternalFailure);
     unavailable.unavailable = vec![UnavailableItem {
-        dependency: Dependency::SectionSchema,
-        key: Some("billing".to_owned()),
+        dependency: Dependency::OperationStorage,
         reason: UnavailableReasonCode::TimedOut,
     }];
-    let content = finished(&unavailable);
+    let content = finished(&unavailable, None);
     assert_eq!(
         content["result"]["unavailable"],
-        json!([{ "dependency": "section_schema", "key": "billing", "reason": "timed_out" }])
+        json!([{ "dependency": "operation_storage", "reason": "timed_out" }])
     );
 }
 
 #[test]
-fn finished_section_entry_has_only_key_outcome_and_schema_version() {
+fn finished_section_entry_has_only_key_section_type_and_outcome() {
     let mut rejected = report(OperationAction::Seed);
     rejected.category = Some(RequestCategory::PluginRejected);
     rejected.sections = vec![SectionOutcomeEntry {
         key: "billing".to_owned(),
-        outcome: SectionOutcome::Rejected,
-        schema_version: Some("3".to_owned()),
+        section_type: Some("gts.t.billing.v1~".to_owned()),
+        outcome: Some(SectionOutcome::Rejected),
         detail: Some("plan too small".to_owned()),
         location: Some("/plan".to_owned()),
     }];
-    let content = finished(&rejected);
+    let content = finished(&rejected, None);
     assert_eq!(
         content["result"]["sections"],
-        json!([{ "key": "billing", "outcome": "rejected", "schema_version": "3" }])
+        json!([{ "key": "billing", "section_type": "gts.t.billing.v1~", "outcome": "rejected" }])
     );
 }
 
@@ -396,7 +411,6 @@ fn refused_unavailable_lists_its_items() {
     let mut unavailable = refusal(RequestCategory::TemporarilyUnavailable);
     unavailable.unavailable = vec![UnavailableItem {
         dependency: Dependency::OperationStorage,
-        key: None,
         reason: UnavailableReasonCode::TimedOut,
     }];
     let content = refused(&within("a", None), None, &caller(), RECEIVED, &unavailable);
@@ -436,7 +450,23 @@ fn refused_out_of_limit_application_is_length_and_digest() {
 }
 
 #[test]
-fn refused_out_of_limit_version_adds_version_length_and_digest() {
+fn refused_out_of_limit_version_is_digested_on_its_own() {
+    let application = ApplicationRef::bounded("ab", Some("abc"), 2);
+    let content = refused(
+        &application,
+        None,
+        &caller(),
+        RECEIVED,
+        &refusal(RequestCategory::InvalidManifest),
+    );
+    assert_eq!(
+        content["application"],
+        json!({ "id": "ab", "version_bytes": 3, "version_sha256": ABC_SHA256 })
+    );
+}
+
+#[test]
+fn refused_out_of_limit_id_and_version_are_both_digested() {
     let application = ApplicationRef::bounded("abc", Some("abc"), 2);
     let content = refused(
         &application,
@@ -466,8 +496,8 @@ fn finished_content_has_no_problem_location_message_or_plugin_detail() {
     leaky.category = Some(RequestCategory::PluginRejected);
     leaky.sections = vec![SectionOutcomeEntry {
         key: "billing".to_owned(),
-        outcome: SectionOutcome::Rejected,
-        schema_version: Some("3".to_owned()),
+        section_type: Some("gts.t.billing.v1~".to_owned()),
+        outcome: Some(SectionOutcome::Rejected),
         detail: Some(format!("detail {SENTINEL}")),
         location: Some(format!("/loc/{SENTINEL}")),
     }];
@@ -476,7 +506,7 @@ fn finished_content_has_no_problem_location_message_or_plugin_detail() {
         &format!("/sections/{SENTINEL}"),
         &format!("message {SENTINEL}"),
     )];
-    let text = finished(&leaky).to_string();
+    let text = finished(&leaky, None).to_string();
     assert!(!text.contains(SENTINEL), "{text}");
 }
 
