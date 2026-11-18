@@ -5,22 +5,44 @@ use std::sync::{Arc, OnceLock};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
+use toolkit::api::OpenApiRegistry;
+use toolkit::client_hub::ClientHub;
 use toolkit::config::ConfigError;
-use toolkit::contracts::RunnableCapability;
-use toolkit::{Gear, GearCtx};
+use toolkit::contracts::{RestApiCapability, RunnableCapability};
+use toolkit::{Gear, GearCtx, Healthcheck};
 
+use crate::api::rest;
+use crate::api::rest::health::StartupHealthcheck;
 use crate::config::ApplicationManagerConfig;
+use crate::domain::plugin_set::StartupState;
+use crate::domain::read_service::ReadService;
+use crate::infra::startup;
 use crate::sdk::{ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1};
 
 /// The Application Manager gear.
 #[toolkit::gear(
     name = "application-manager",
     deps = [types_registry, authz_resolver],
-    capabilities = [stateful],
+    capabilities = [rest, stateful],
 )]
 #[derive(Default)]
 pub struct ApplicationManager {
-    config: OnceLock<Arc<ApplicationManagerConfig>>,
+    runtime: OnceLock<Runtime>,
+}
+
+/// What `init` builds; `start` and the routes use it.
+struct Runtime {
+    hub: Arc<ClientHub>,
+    read: Arc<ReadService>,
+    startup: Arc<StartupState>,
+}
+
+impl ApplicationManager {
+    fn runtime(&self, phase: &str) -> anyhow::Result<&Runtime> {
+        self.runtime
+            .get()
+            .ok_or_else(|| anyhow!("{}: init must run before {phase}", Self::MODULE_NAME))
+    }
 }
 
 /// The SDK's GTS types are registered through the link-time inventory; fail
@@ -91,19 +113,69 @@ impl Gear for ApplicationManager {
             "application-manager: configuration validated"
         );
 
-        self.config
-            .set(Arc::new(config))
+        let allowed = Arc::new(config.allowed_callers());
+        let startup = Arc::new(StartupState::default());
+        let runtime = Runtime {
+            hub: ctx.client_hub(),
+            read: Arc::new(ReadService::new(allowed, Arc::clone(&startup))),
+            startup,
+        };
+        self.runtime
+            .set(runtime)
             .map_err(|_| anyhow!("{}: already initialized", Self::MODULE_NAME))?;
         Ok(())
     }
 }
 
+impl RestApiCapability for ApplicationManager {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: axum::Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<axum::Router> {
+        let runtime = self.runtime("register_rest")?;
+        Ok(rest::register_routes(
+            router,
+            openapi,
+            Arc::clone(&runtime.read),
+        ))
+    }
+
+    /// Readiness follows startup: not ready until `start` publishes the
+    /// section plugin set (DESIGN 4.3). `None` before `init`.
+    fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
+        let runtime = self.runtime.get()?;
+        Some(Arc::new(StartupHealthcheck::new(Arc::clone(
+            &runtime.startup,
+        ))))
+    }
+}
+
 #[async_trait]
 impl RunnableCapability for ApplicationManager {
-    async fn start(&self, _cancel: CancellationToken) -> anyhow::Result<()> {
-        if self.config.get().is_none() {
-            return Err(anyhow!("{}: init must run before start", Self::MODULE_NAME));
-        }
+    /// Build the section plugin set once and publish it. Any failed check
+    /// fails the start phase, which stops the host; there is no retry.
+    /// Cancellation ends startup with nothing published.
+    async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
+        let runtime = self.runtime("start")?;
+        let discovered = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                tracing::warn!("application-manager: start cancelled before the plugin set was fixed");
+                return Err(anyhow!("{}: start cancelled", Self::MODULE_NAME));
+            }
+            discovered = startup::discover(&runtime.hub) => discovered,
+        };
+        let set = discovered.map_err(|e| {
+            tracing::error!(reason = e.reason.as_str(), detail = %e.detail, "application-manager: startup failed");
+            anyhow!("{}: {e}", Self::MODULE_NAME)
+        })?;
+        tracing::info!(keys = ?set.keys(), "application-manager: section plugin set fixed");
+        runtime
+            .startup
+            .publish(set)
+            .map_err(|_| anyhow!("{}: already started", Self::MODULE_NAME))?;
         Ok(())
     }
 

@@ -1,15 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use toolkit::config::ConfigProvider;
-use toolkit::{ClientHub, Gear, GearCtx};
+use toolkit::contracts::RestApiCapability;
+use toolkit::{ClientHub, Gear, GearCtx, HealthcheckStatus};
 use uuid::Uuid;
 
 use super::*;
-use crate::test_support::valid_config_json;
+use crate::domain::error::DomainError;
+use crate::test_support::{
+    PluginSpec, hub_with, hub_with_registry, platform_ctx, valid_config_json,
+};
+use types_registry_sdk::testing::{MockTypesRegistryClient, internal};
 
 struct StaticConfigProvider {
     root: Value,
@@ -26,11 +32,15 @@ fn valid_config() -> Value {
 }
 
 fn ctx_with(root: Value) -> GearCtx {
+    ctx_with_hub(root, Arc::new(ClientHub::new()))
+}
+
+fn ctx_with_hub(root: Value, hub: Arc<ClientHub>) -> GearCtx {
     GearCtx::new(
         ApplicationManager::MODULE_NAME,
         Uuid::from_u128(1),
         Arc::new(StaticConfigProvider { root }),
-        Arc::new(ClientHub::new()),
+        hub,
         CancellationToken::new(),
     )
 }
@@ -115,11 +125,90 @@ async fn start_before_init_fails() {
 }
 
 #[tokio::test]
-async fn start_and_stop_after_init_succeed() {
+async fn start_publishes_the_plugin_set_and_stop_succeeds() {
     let gear = ApplicationManager::default();
-    gear.init(&ctx_with_config(&valid_config())).await.unwrap();
+    let plugins = [PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    )];
+    let root = json!({ "application-manager": { "config": valid_config() } });
+    gear.init(&ctx_with_hub(root, hub_with(&plugins)))
+        .await
+        .unwrap();
+    let state = &gear.runtime.get().unwrap().startup;
+    assert!(state.plugin_set().is_none(), "not ready before start");
     gear.start(CancellationToken::new()).await.unwrap();
+    assert_eq!(state.plugin_set().unwrap().keys(), ["cf.test.a.section"]);
+    assert_eq!(
+        plugins[0].client.as_ref().unwrap().calls(),
+        0,
+        "no plugin call"
+    );
     gear.stop(CancellationToken::new()).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_startup_fails_start_with_its_reason_and_stays_not_ready() {
+    let gear = ApplicationManager::default();
+    let registry = MockTypesRegistryClient::new().with_list_error(internal("down"));
+    let root = json!({ "application-manager": { "config": valid_config() } });
+    gear.init(&ctx_with_hub(root, hub_with_registry(&[], registry)))
+        .await
+        .unwrap();
+    let err = gear.start(CancellationToken::new()).await.unwrap_err();
+    assert!(
+        format!("{err:#}")
+            .starts_with("application-manager: startup_failed: types_registry_unreachable: "),
+        "{err:#}"
+    );
+    assert!(gear.runtime.get().unwrap().startup.plugin_set().is_none());
+    let check = gear.healthcheck(&ctx_with(json!({}))).unwrap();
+    assert_eq!(check.check().await.status, HealthcheckStatus::Unhealthy);
+}
+
+/// An initialized gear over `hub`, with `overrides` applied to the valid config.
+async fn initialized(overrides: &Value, hub: Arc<ClientHub>) -> ApplicationManager {
+    let mut config = valid_config();
+    for (name, value) in overrides.as_object().unwrap() {
+        config[name] = value.clone();
+    }
+    let gear = ApplicationManager::default();
+    let root = json!({ "application-manager": { "config": config } });
+    gear.init(&ctx_with_hub(root, hub)).await.unwrap();
+    gear
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_start_publishes_nothing() {
+    let plugins = [PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    )];
+    let gear = initialized(&json!({}), hub_with(&plugins)).await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let started = tokio::time::Instant::now();
+    let err = gear.start(cancel).await.unwrap_err();
+    assert_eq!(format!("{err:#}"), "application-manager: start cancelled");
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert!(gear.runtime.get().unwrap().startup.plugin_set().is_none());
+}
+
+#[tokio::test]
+async fn allowed_callers_from_config_decide_read_schema() {
+    let gear = initialized(&json!({}), hub_with(&[])).await;
+    gear.start(CancellationToken::new()).await.unwrap();
+    let read = &gear.runtime.get().unwrap().read;
+    assert_eq!(
+        read.list_section_keys(&platform_ctx("app-seeder")),
+        Ok(vec![])
+    );
+    assert!(matches!(
+        read.list_section_keys(&platform_ctx("someone-else")),
+        Err(DomainError::NotPermitted { .. })
+    ));
 }
 
 #[test]
@@ -147,4 +236,24 @@ fn sdk_type_missing_from_inventory_fails() {
         );
     }
     ensure_sdk_types_registered(&[section, spec]).unwrap();
+}
+
+#[tokio::test]
+async fn healthcheck_follows_startup() {
+    let root = json!({ "application-manager": { "config": valid_config() } });
+    let plugins = [PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    )];
+    let ctx = ctx_with_hub(root, hub_with(&plugins));
+    let gear = ApplicationManager::default();
+    assert!(gear.healthcheck(&ctx).is_none(), "no check before init");
+
+    gear.init(&ctx).await.unwrap();
+    let check = gear.healthcheck(&ctx).expect("check after init");
+    assert_eq!(check.check().await.status, HealthcheckStatus::Unhealthy);
+
+    gear.start(CancellationToken::new()).await.unwrap();
+    assert_eq!(check.check().await.status, HealthcheckStatus::Healthy);
 }

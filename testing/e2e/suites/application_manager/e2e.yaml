@@ -1,0 +1,16 @@
+suite: application-manager
+# The gear lists its section plugins and resolves their section types in
+# types-registry at start, and decides its platform-plane reads from its
+# allowed callers; the core gears (types-registry, resolvers, static plugins)
+# come from the launcher defaults. The no-op section plugin is
+# the plugin set under test.
+features:
+  - application-manager
+  - noop-section-plugin
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - application-manager
+  - noop-section-plugin

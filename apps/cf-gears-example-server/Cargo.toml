@@ -86,6 +86,7 @@ bss-orders = [
 bss-pricing = ["dep:bss_pricing", "bss-products"]
 bss-approvals = ["dep:bss_approvals"]
 application-manager = ["dep:application_manager"]
+noop-section-plugin = ["dep:noop_section_plugin"]
 # The admission gate links its default engine plugin, policy-engine.
 admission-control = ["dep:admission-control", "policy-engine"]
 policy-engine = ["dep:policy-engine"]
@@ -176,6 +177,7 @@ bss_approvals = { package = "cf-gears-bss-approvals", path = "../../gears/bss/ap
 
 # Optional Application Manager gear
 application_manager = { package = "cf-gears-application-manager", path = "../../gears/system/application-manager/application-manager", optional = true }
+noop_section_plugin = { package = "cf-gears-noop-section-plugin", path = "../../gears/system/application-manager/plugins/noop-section-plugin", optional = true }
 
 # Optional Admission Control gear
 admission-control = { package = "cf-gears-admission-control", path = "../../gears/system/admission-control/admission-control", optional = true }
