@@ -42,6 +42,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 use application_manager_sdk::{
     OperationAction, OutcomeReport, RequestCategory, SectionOutcome, SectionOutcomeEntry,
@@ -191,7 +192,11 @@ impl SeaOrmOperationRepository {
         call: &'static str,
         work: impl Future<Output = Result<T, DbError>>,
     ) -> Result<T, StorageError> {
-        match tokio::time::timeout(self.timeout, work).await {
+        let span = tracing::debug_span!("application_manager.storage", call);
+        match tokio::time::timeout(self.timeout, work)
+            .instrument(span)
+            .await
+        {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(classify(self.backend, call, &error)),
             Err(_elapsed) => {

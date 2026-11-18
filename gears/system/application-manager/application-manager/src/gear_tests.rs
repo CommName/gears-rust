@@ -193,7 +193,53 @@ async fn start_publishes_the_plugin_set_and_stop_succeeds() {
         0,
         "no plugin call"
     );
+    let runtime = gear.runtime.get().unwrap();
+    assert!(
+        runtime.sweeper.lock().unwrap().is_some(),
+        "start runs the sweeper"
+    );
     gear.stop(CancellationToken::new()).await.unwrap();
+    assert!(
+        runtime.sweeper.lock().unwrap().is_none(),
+        "stop ends the sweeper"
+    );
+    assert_eq!(runtime.gate.admit().err(), Some(DomainError::NotReady));
+}
+
+#[tokio::test]
+async fn stop_drains_a_request_task_still_running() {
+    let plugins = [PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    )];
+    let gear = Arc::new(initialized(&json!({}), hub_with(&plugins)).await);
+    gear.start(CancellationToken::new()).await.unwrap();
+    let in_flight = gear.runtime.get().unwrap().gate.admit().unwrap();
+
+    let stopping = tokio::spawn({
+        let gear = Arc::clone(&gear);
+        async move { gear.stop(CancellationToken::new()).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!stopping.is_finished(), "stop waits for the request task");
+    drop(in_flight);
+    stopping.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn stop_gives_up_on_a_request_task_at_the_deadline() {
+    let plugins = [PluginSpec::new(
+        "cf.test.a.plugin.v1",
+        1,
+        "cf.test.a.section.v1",
+    )];
+    let gear = initialized(&json!({}), hub_with(&plugins)).await;
+    gear.start(CancellationToken::new()).await.unwrap();
+    let _in_flight = gear.runtime.get().unwrap().gate.admit().unwrap();
+    let deadline = CancellationToken::new();
+    deadline.cancel();
+    gear.stop(deadline).await.unwrap();
 }
 
 #[tokio::test]

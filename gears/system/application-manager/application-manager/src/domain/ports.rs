@@ -7,13 +7,46 @@ use application_manager_sdk::{
 };
 use async_trait::async_trait;
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
+
+use crate::domain::actions::TenantAction;
 
 use crate::domain::history::HistoryEvent;
 use crate::domain::operation::{
     Accepted, ApplicationRecord, NewOperation, OpenOperation, Operation,
 };
 use crate::domain::plugin_set::SectionPlugin;
+
+/// Why the PDP did not permit a tenant-plane read.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AccessError {
+    /// Denied, a permit with constraints, or constraints that do not
+    /// compile (403).
+    #[error("not permitted")]
+    NotPermitted,
+    /// The PDP failed, timed out at `pdp_call_timeout`, or is not
+    /// registered (503).
+    #[error("access control cannot answer")]
+    Unavailable,
+}
+
+/// The PDP decision of the tenant-plane reads (ADR 0004).
+#[async_trait]
+pub trait AccessControl: Send + Sync {
+    /// Decide whether the caller may perform `action`, as a platform-level
+    /// permission on the application resource: no context tenant and no
+    /// resource properties.
+    ///
+    /// # Errors
+    /// [`AccessError`] when the read is not permitted or cannot be decided.
+    async fn authorize(
+        &self,
+        ctx: &SecurityContext,
+        action: TenantAction,
+    ) -> Result<(), AccessError>;
+}
 
 /// Why a bounded plugin call produced no plugin answer
 /// (`cpt-cf-application-manager-component-plugin-call-guard`).

@@ -13,7 +13,8 @@ use crate::domain::operation::{NewOperation, Operation, OperationStatus};
 use crate::domain::plugin_set::PluginSet;
 use crate::infra::call_guard::CallGuard;
 use crate::test_support::{
-    Answer, FakePlugin, Hook, HookedRepo, allowed_callers, platform_ctx, section_plugin,
+    Answer, FakePlugin, Hook, HookedRepo, RecordedSignals, allowed_callers, platform_ctx,
+    section_plugin,
 };
 
 const APP: &str = "acme.app";
@@ -31,6 +32,7 @@ struct Harness {
     orchestrator: Arc<RequestOrchestrator>,
     repo: Arc<HookedRepo>,
     plugins: Vec<Arc<FakePlugin>>,
+    signals: Arc<RecordedSignals>,
 }
 
 /// A started orchestrator whose plugin set is one plugin per answer, keyed
@@ -50,21 +52,26 @@ async fn harness_with(answers: &[Answer], settings: OrchestratorSettings) -> Har
         ))
         .unwrap();
     let guard = Arc::new(CallGuard::new(settings.plugin_call_timeout, 4));
-    let orchestrator = Arc::new(RequestOrchestrator::new(
-        Arc::new(allowed_callers(
-            "app-seeder",
-            vec![CallerAction::Seed, CallerAction::Uninstall],
-        )),
-        Arc::clone(&repo) as Arc<dyn OperationRepository>,
-        Arc::new(SectionPluginRouter::new(guard)),
-        Arc::new(SchemaValidator::new(settings.max_envelope_text_length).unwrap()),
-        startup,
-        settings,
-    ));
+    let signals = RecordedSignals::new();
+    let orchestrator = Arc::new(
+        RequestOrchestrator::new(
+            Arc::new(allowed_callers(
+                "app-seeder",
+                vec![CallerAction::Seed, CallerAction::Uninstall],
+            )),
+            Arc::clone(&repo) as Arc<dyn OperationRepository>,
+            Arc::new(SectionPluginRouter::new(guard)),
+            Arc::new(SchemaValidator::new(settings.max_envelope_text_length).unwrap()),
+            startup,
+            settings,
+        )
+        .with_signals(Arc::clone(&signals) as Arc<dyn Signals>),
+    );
     Harness {
         orchestrator,
         repo,
         plugins,
+        signals,
     }
 }
 
@@ -659,4 +666,81 @@ fn plugin_answers_map_to_outcomes_with_the_detail_cut() {
         assert_eq!(outcome, expected);
         assert_eq!((detail, location), (None, None), "{expected:?}");
     }
+}
+
+// ---- operational signals (DESIGN 4.1) ----
+
+/// Wait until `line` was recorded `times` times.
+async fn signalled(signals: &RecordedSignals, line: &str, times: usize) {
+    for _ in 0..500 {
+        if signals.count(line) >= times {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{line} not recorded {times} times: {:?}", signals.lines());
+}
+
+#[tokio::test]
+async fn an_accepted_seed_raises_its_signals() {
+    let h = harness(&[Answer::Ok, Answer::Rejected]).await;
+    h.run(seed_all(&h)).await;
+    signalled(&h.signals, "tasks:-1", 1).await;
+    let lines = h.signals.lines();
+    for line in [
+        "tasks:1",
+        "request:seed,accepted",
+        "section:a,succeeded",
+        "section:b,rejected",
+        "completed:seed,plugin_rejected,run",
+        "duration:seed",
+        "tasks:-1",
+    ] {
+        assert_eq!(h.signals.count(line), 1, "{line}: {lines:?}");
+    }
+    assert_eq!(h.signals.count("history:true"), 2, "accepted and finished");
+    assert_eq!(h.signals.count("history:false"), 0);
+}
+
+#[tokio::test]
+async fn a_refusal_raises_its_category_and_the_caller_refusal() {
+    let h = harness(&[Answer::Ok]).await;
+    let (_, answer) = h.submit_as("someone-else", seed_all(&h)).await;
+    assert!(answer.is_err());
+    signalled(&h.signals, "tasks:-1", 1).await;
+    assert_eq!(h.signals.count("request:seed,not_permitted"), 1);
+    assert_eq!(h.signals.count("refused:seed"), 1);
+    assert_eq!(h.signals.count("history:true"), 1);
+}
+
+#[tokio::test]
+async fn an_unwritten_refused_event_and_storage_failure_are_signalled() {
+    let h = harness(&[Answer::Ok]).await;
+    h.repo.hook("open_operation", Hook::Fail);
+    h.repo.hook("record_refused", Hook::Fail);
+    let (_, answer) = h.submit(seed_all(&h)).await;
+    assert_eq!(answer, Err(DomainError::StorageUnavailable));
+    assert_eq!(h.signals.count("request:seed,temporarily_unavailable"), 1);
+    assert_eq!(h.signals.count("unavailable:storage"), 1);
+    assert_eq!(h.signals.count("history:false"), 1);
+}
+
+#[tokio::test]
+async fn a_timed_out_section_is_counted_by_its_key() {
+    let h = harness_with(
+        &[Answer::Hang],
+        OrchestratorSettings {
+            plugin_call_timeout: Duration::from_millis(50),
+            ..settings()
+        },
+    )
+    .await;
+    h.run(seed_all(&h)).await;
+    assert_eq!(
+        h.signals.count("section:a,timed_out"),
+        1,
+        "{:?}",
+        h.signals.lines()
+    );
+    assert_eq!(h.signals.count("completed:seed,internal_failure,run"), 1);
 }

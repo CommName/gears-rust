@@ -127,3 +127,40 @@ pub struct OperationDto {
     #[schema(value_type = Option<Object>)]
     pub report: Option<serde_json::Value>,
 }
+
+/// One history event.
+#[derive(Debug, Clone, PartialEq)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = ApplicationManagerHistoryEventDto)]
+pub struct HistoryEventDto {
+    /// Time-ordered event id; the page order.
+    pub event_id: uuid::Uuid,
+    /// `accepted`, `finished` or `refused`.
+    pub kind: String,
+    /// The operation id of an accepted request, else the request id.
+    pub correlation_id: uuid::Uuid,
+    /// `seed` or `uninstall`.
+    pub action: String,
+    /// Database time of the write, RFC 3339.
+    pub written_at: String,
+    /// The event content (DESIGN 3.1 "History event content").
+    #[schema(value_type = Object)]
+    pub content: serde_json::Value,
+}
+
+/// The last finished seed of one application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = ApplicationManagerApplicationDto)]
+pub struct ApplicationDto {
+    /// The exact application id; the page order.
+    pub application_id: String,
+    /// The version of the last finished seed, as sent.
+    pub version: String,
+    /// That seed's operation.
+    pub operation_id: uuid::Uuid,
+    /// That seed's outcome category.
+    pub category: String,
+    /// When that seed finished, RFC 3339.
+    pub finished_at: String,
+}

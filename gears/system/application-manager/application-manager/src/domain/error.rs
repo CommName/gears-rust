@@ -3,7 +3,7 @@
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
-use crate::domain::actions::CallerAction;
+use crate::domain::actions::{CallerAction, TenantAction};
 use crate::domain::schema_validator::Problem;
 
 /// A refused request, by outcome rank (DESIGN 3.3), or a refused read.
@@ -45,6 +45,25 @@ pub enum DomainError {
     /// The operation id is unknown, malformed, or purged (read: 404).
     #[error("operation not found")]
     OperationNotFound,
+    /// The PDP does not permit a tenant-plane read (403).
+    #[error("not permitted: {action}")]
+    AccessDenied {
+        /// The refused read.
+        action: TenantAction,
+    },
+    /// The PDP cannot answer a tenant-plane read (503).
+    #[error("access control cannot answer")]
+    AccessUnavailable,
+    /// A list query option the read does not serve (400).
+    #[error("invalid query: {parameter}: {message}")]
+    InvalidQuery {
+        /// The query parameter.
+        parameter: &'static str,
+        /// The platform `OData` reason code.
+        reason: &'static str,
+        /// What is wrong.
+        message: String,
+    },
     /// The request task failed before it answered: a gear defect (500).
     #[error("internal failure")]
     Defect,

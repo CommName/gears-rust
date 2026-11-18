@@ -15,6 +15,7 @@ use application_manager_sdk::{CallerIdentity, Envelope};
 use async_trait::async_trait;
 use serde_json::Value;
 use toolkit_macros::domain_model;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::domain::plugin_set::{PluginSet, SectionPlugin};
@@ -77,6 +78,7 @@ impl SectionPluginRouter {
             let answer = self
                 .calls
                 .apply(plugin, caller, operation_id, envelope, section)
+                .instrument(call_span("apply", plugin))
                 .await;
             let go_on = observer.after(plugin, &answer).await;
             routed.push((plugin.key.clone(), answer));
@@ -105,6 +107,7 @@ impl SectionPluginRouter {
             let answer = self
                 .calls
                 .remove(plugin, caller, operation_id, application_id)
+                .instrument(call_span("remove", plugin))
                 .await;
             let go_on = observer.after(plugin, &answer).await;
             routed.push((plugin.key.clone(), answer));
@@ -114,6 +117,15 @@ impl SectionPluginRouter {
         }
         routed
     }
+}
+
+/// The span of one plugin call, a child of the operation span.
+fn call_span(call: &'static str, plugin: &SectionPlugin) -> tracing::Span {
+    tracing::info_span!(
+        "application_manager.section_call",
+        call,
+        section_key = %plugin.key
+    )
 }
 
 #[cfg(test)]
