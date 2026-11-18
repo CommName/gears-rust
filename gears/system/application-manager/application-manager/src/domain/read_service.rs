@@ -10,7 +10,9 @@ use toolkit_security::PlatformSecurityContext;
 use crate::domain::actions::CallerAction;
 use crate::domain::allowed_callers::{AllowedCallers, identity_fields};
 use crate::domain::error::DomainError;
+use crate::domain::operation::Operation;
 use crate::domain::plugin_set::StartupState;
+use crate::domain::ports::OperationRepository;
 use crate::domain::schema_validator::{CompiledSection, SchemaValidator};
 
 /// The combined schema of a whole manifest with every section type.
@@ -29,6 +31,7 @@ pub struct ReadService {
     allowed: Arc<AllowedCallers>,
     startup: Arc<StartupState>,
     validator: Arc<SchemaValidator>,
+    operations: Arc<dyn OperationRepository>,
 }
 
 impl fmt::Debug for ReadService {
@@ -46,11 +49,38 @@ impl ReadService {
         allowed: Arc<AllowedCallers>,
         startup: Arc<StartupState>,
         validator: Arc<SchemaValidator>,
+        operations: Arc<dyn OperationRepository>,
     ) -> Self {
         Self {
             allowed,
             startup,
             validator,
+            operations,
+        }
+    }
+
+    /// One operation record, after the expiry completion of an expired open
+    /// one, when the allowed callers grant `read_operation` (DESIGN 3.6
+    /// "Operation read"). Calls no section plugin and records no history
+    /// event.
+    ///
+    /// # Errors
+    /// [`DomainError::NotPermitted`] before any storage read;
+    /// [`DomainError::OperationNotFound`] for a malformed, unknown, or purged
+    /// id; [`DomainError::StorageUnavailable`] when storage cannot answer.
+    pub async fn read_operation(
+        &self,
+        ctx: &PlatformSecurityContext,
+        operation_id: &str,
+    ) -> Result<Operation, DomainError> {
+        self.check(ctx, CallerAction::ReadOperation)?;
+        let Ok(operation_id) = uuid::Uuid::parse_str(operation_id) else {
+            return Err(DomainError::OperationNotFound);
+        };
+        match self.operations.read_operation(operation_id).await {
+            Ok(Some(operation)) => Ok(operation),
+            Ok(None) => Err(DomainError::OperationNotFound),
+            Err(_) => Err(DomainError::StorageUnavailable),
         }
     }
 

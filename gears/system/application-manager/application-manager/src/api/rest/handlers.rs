@@ -3,13 +3,24 @@
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tokio::sync::OwnedSemaphorePermit;
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
 
-use super::dto::{ManifestSchemaDto, SectionKeysDto, SectionSchemaDto, SectionTypeDto};
+use super::dto::{
+    AcceptedDto, ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto, SectionTypeDto,
+    UninstallRequestDto,
+};
 use super::error::to_canonical;
+use super::gate::RequestGate;
 use crate::domain::error::DomainError;
+use crate::domain::operation::{Operation, OperationStatus};
+use crate::domain::orchestrator::{Receipt, RequestOrchestrator, Submitted};
 use crate::domain::read_service::ReadService;
 
 /// `GET /application-manager/v1/section-keys`.
@@ -71,6 +82,142 @@ pub async fn get_manifest_schema(
             .map(|(key, section_type)| SectionTypeDto { key, section_type })
             .collect(),
     }))
+}
+
+/// `POST /application-manager/v1/applications`.
+///
+/// # Errors
+/// The synchronous refusals of DESIGN 3.3: 503, 403, 409, 400, or 500.
+pub async fn seed(
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(gate): Extension<Arc<RequestGate>>,
+    Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
+    extract::Json(manifest): extract::Json<serde_json::Value>,
+) -> ApiResult<Response> {
+    let receipt = Receipt::new(OffsetDateTime::now_utc());
+    let admission = admit(&gate, receipt.request_id);
+    let submitted = orchestrator
+        .seed(ctx, manifest, receipt, admission)
+        .await
+        .map_err(|e| to_canonical(&e, receipt.request_id))?;
+    Ok(accepted(submitted))
+}
+
+/// `DELETE /application-manager/v1/applications/{application_id}`.
+///
+/// # Errors
+/// As [`seed`].
+pub async fn uninstall_by_id(
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(gate): Extension<Arc<RequestGate>>,
+    Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
+    Path(application_id): Path<String>,
+) -> ApiResult<Response> {
+    let receipt = Receipt::new(OffsetDateTime::now_utc());
+    let admission = admit(&gate, receipt.request_id);
+    let submitted = orchestrator
+        .uninstall(ctx, application_id, receipt, admission)
+        .await
+        .map_err(|e| to_canonical(&e, receipt.request_id))?;
+    Ok(accepted(submitted))
+}
+
+/// `POST /application-manager/v1/applications:uninstall`.
+///
+/// # Errors
+/// As [`seed`].
+pub async fn uninstall(
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(gate): Extension<Arc<RequestGate>>,
+    Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
+    extract::Json(body): extract::Json<UninstallRequestDto>,
+) -> ApiResult<Response> {
+    let receipt = Receipt::new(OffsetDateTime::now_utc());
+    let admission = admit(&gate, receipt.request_id);
+    let submitted = orchestrator
+        .uninstall(ctx, body.application_id, receipt, admission)
+        .await
+        .map_err(|e| to_canonical(&e, receipt.request_id))?;
+    Ok(accepted(submitted))
+}
+
+/// The gate's answer; the orchestrator records the refused event of a
+/// refusal.
+fn admit(gate: &RequestGate, request_id: Uuid) -> Result<OwnedSemaphorePermit, DomainError> {
+    gate.admit().inspect_err(|refusal| {
+        tracing::info!(%request_id, refusal = %refusal, "application-manager: refused at the gate");
+    })
+}
+
+/// 202 with the operation id and its `Location`.
+fn accepted(submitted: Submitted) -> Response {
+    let location = format!(
+        "/application-manager/v1/operations/{}",
+        submitted.operation_id
+    );
+    (
+        StatusCode::ACCEPTED,
+        [(header::LOCATION, location)],
+        Json(AcceptedDto {
+            operation_id: submitted.operation_id,
+            status: "accepted".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+/// `GET /application-manager/v1/operations/{operation_id}`.
+///
+/// # Errors
+/// 403 when the allowed callers do not grant `read_operation`; 404 for a
+/// malformed, unknown, or purged id; 503 when storage cannot answer.
+pub async fn get_operation(
+    Extension(ctx): Extension<PlatformSecurityContext>,
+    Extension(svc): Extension<Arc<ReadService>>,
+    Path(operation_id): Path<String>,
+) -> ApiResult<Json<OperationDto>> {
+    let request_id = Uuid::now_v7();
+    let span = tracing::info_span!("get_operation", %request_id);
+    let operation = svc
+        .read_operation(&ctx, &operation_id)
+        .await
+        .map_err(|e| refusal(&span, &e, request_id))?;
+    Ok(Json(operation_dto(operation)))
+}
+
+fn timestamp(at: OffsetDateTime) -> String {
+    at.format(&Rfc3339).unwrap_or_default()
+}
+
+fn token<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(token)) => token,
+        _ => String::new(),
+    }
+}
+
+/// The record, and the report only once the operation is completed.
+fn operation_dto(operation: Operation) -> OperationDto {
+    let status = match operation.status {
+        OperationStatus::Accepted => "accepted",
+        OperationStatus::Running => "running",
+        OperationStatus::Completed => "completed",
+    };
+    let report = (operation.status == OperationStatus::Completed)
+        .then(|| serde_json::to_value(&operation.report).ok())
+        .flatten();
+    OperationDto {
+        operation_id: operation.operation_id,
+        application_id: operation.application_id,
+        action: token(&operation.action),
+        status: status.to_owned(),
+        category: operation.category.as_ref().map(token),
+        accepted_at: timestamp(operation.accepted_at),
+        started_at: operation.started_at.map(timestamp),
+        finished_at: operation.finished_at.map(timestamp),
+        run_deadline: timestamp(operation.run_deadline),
+        report,
+    }
 }
 
 /// The canonical error of a refused read. The read service logs a caller

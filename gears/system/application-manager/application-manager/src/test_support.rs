@@ -297,3 +297,247 @@ pub fn hub_with_registry(
     }
     hub
 }
+
+// ── Operation storage for the orchestrator, read-service and route tests ─────
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use application_manager_sdk::{OutcomeReport, RequestCategory, SectionOutcome};
+use sea_orm_migration::MigratorTrait;
+use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+
+use crate::domain::history::HistoryEvent;
+use crate::domain::operation::{
+    Accepted, ApplicationRecord, NewOperation, OpenOperation, Operation,
+};
+use crate::domain::ports::{BuildRefused, OperationRepository, StorageError};
+use crate::infra::storage::{Migrator, SeaOrmOperationRepository};
+
+/// A repository over a fresh in-memory `SQLite` database built from the
+/// gear's migration.
+pub async fn sqlite_repo() -> Arc<SeaOrmOperationRepository> {
+    let dsn = format!(
+        "sqlite:file:application_manager_test_{}?mode=memory&cache=shared",
+        Uuid::new_v4()
+    );
+    let db = connect_db(
+        &dsn,
+        ConnectOpts {
+            max_conns: Some(1),
+            min_conns: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("connect sqlite");
+    run_migrations_for_testing(&db, Migrator::migrations())
+        .await
+        .expect("run migrations");
+    Arc::new(SeaOrmOperationRepository::new(
+        Arc::new(DBProvider::<DbError>::new(db)),
+        Duration::from_secs(10),
+    ))
+}
+
+/// What a [`HookedRepo`] does instead of, or before, a call.
+#[derive(Clone, Copy, Debug)]
+pub enum Hook {
+    /// Fail with [`StorageError::Unavailable`].
+    Fail,
+    /// Panic.
+    Panic,
+    /// Wait, then run the call.
+    Sleep(Duration),
+    /// `open_operation` only: answer that no operation is open.
+    NoneOpen,
+}
+
+/// A repository that runs every call on a real store, counts the calls, and
+/// applies the hook set for a method.
+pub struct HookedRepo {
+    inner: Arc<dyn OperationRepository>,
+    hooks: Mutex<HashMap<&'static str, Hook>>,
+    calls: Mutex<HashMap<&'static str, usize>>,
+}
+
+impl HookedRepo {
+    pub async fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: sqlite_repo().await,
+            hooks: Mutex::new(HashMap::new()),
+            calls: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn hook(&self, method: &'static str, hook: Hook) {
+        self.hooks.lock().expect("lock").insert(method, hook);
+    }
+
+    pub fn calls(&self, method: &'static str) -> usize {
+        self.calls
+            .lock()
+            .expect("lock")
+            .get(method)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count the call and apply its hook: `Err` to fail it, `Ok(true)` when
+    /// `open_operation` must answer that none is open.
+    async fn enter(&self, method: &'static str) -> Result<bool, StorageError> {
+        *self.calls.lock().expect("lock").entry(method).or_default() += 1;
+        let hook = self.hooks.lock().expect("lock").get(method).copied();
+        match hook {
+            Some(Hook::Fail) => Err(StorageError::Unavailable),
+            Some(Hook::Panic) => panic!("injected panic in {method}"),
+            Some(Hook::Sleep(wait)) => {
+                tokio::time::sleep(wait).await;
+                Ok(false)
+            }
+            Some(Hook::NoneOpen) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    /// All history events of `correlation_id`.
+    pub async fn events(&self, correlation_id: Uuid) -> Vec<HistoryEvent> {
+        self.inner
+            .history_page(Some(vec![correlation_id]), None, 100)
+            .await
+            .expect("history")
+    }
+
+    /// The operation once it is completed, waiting for the request task.
+    pub async fn completed(&self, operation_id: Uuid) -> Operation {
+        for _ in 0..500 {
+            if let Ok(Some(op)) = self.inner.read_operation(operation_id).await
+                && op.status == crate::domain::operation::OperationStatus::Completed
+            {
+                return op;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("operation {operation_id} did not complete");
+    }
+}
+
+#[async_trait]
+impl OperationRepository for HookedRepo {
+    async fn open_operation(
+        &self,
+        application_id: &str,
+    ) -> Result<Option<OpenOperation>, StorageError> {
+        if self.enter("open_operation").await? {
+            return Ok(None);
+        }
+        self.inner.open_operation(application_id).await
+    }
+
+    async fn accept(
+        &self,
+        new: NewOperation,
+        accepted: HistoryEvent,
+    ) -> Result<Accepted, StorageError> {
+        self.enter("accept").await?;
+        self.inner.accept(new, accepted).await
+    }
+
+    async fn refuse_after_lost_race(
+        &self,
+        application_id: &str,
+        build_refused: BuildRefused,
+    ) -> Result<Uuid, StorageError> {
+        self.enter("refuse_after_lost_race").await?;
+        self.inner
+            .refuse_after_lost_race(application_id, build_refused)
+            .await
+    }
+
+    async fn record_refused(&self, event: HistoryEvent) -> Result<(), StorageError> {
+        self.enter("record_refused").await?;
+        self.inner.record_refused(event).await
+    }
+
+    async fn mark_running(
+        &self,
+        operation_id: Uuid,
+        sections: &[(String, Option<String>)],
+    ) -> Result<Duration, StorageError> {
+        self.enter("mark_running").await?;
+        self.inner.mark_running(operation_id, sections).await
+    }
+
+    async fn record_section_outcome(
+        &self,
+        operation_id: Uuid,
+        key: &str,
+        outcome: SectionOutcome,
+        detail: Option<String>,
+        location: Option<String>,
+    ) -> Result<(), StorageError> {
+        self.enter("record_section_outcome").await?;
+        self.inner
+            .record_section_outcome(operation_id, key, outcome, detail, location)
+            .await
+    }
+
+    async fn finish(
+        &self,
+        operation_id: Uuid,
+        report: &OutcomeReport,
+        category: RequestCategory,
+    ) -> Result<(), StorageError> {
+        self.enter("finish").await?;
+        self.inner.finish(operation_id, report, category).await
+    }
+
+    async fn complete_by_supervisor(&self, operation_id: Uuid) -> Result<(), StorageError> {
+        self.enter("complete_by_supervisor").await?;
+        self.inner.complete_by_supervisor(operation_id).await
+    }
+
+    async fn expire_if_expired(&self, operation_id: Uuid) -> Result<bool, StorageError> {
+        self.enter("expire_if_expired").await?;
+        self.inner.expire_if_expired(operation_id).await
+    }
+
+    async fn expire_batch(&self, limit: u64) -> Result<u64, StorageError> {
+        self.enter("expire_batch").await?;
+        self.inner.expire_batch(limit).await
+    }
+
+    async fn purge(&self, retention: Duration, limit: u64) -> Result<u64, StorageError> {
+        self.enter("purge").await?;
+        self.inner.purge(retention, limit).await
+    }
+
+    async fn read_operation(&self, operation_id: Uuid) -> Result<Option<Operation>, StorageError> {
+        self.enter("read_operation").await?;
+        self.inner.read_operation(operation_id).await
+    }
+
+    async fn history_page(
+        &self,
+        correlation_ids: Option<Vec<Uuid>>,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> Result<Vec<HistoryEvent>, StorageError> {
+        self.enter("history_page").await?;
+        self.inner.history_page(correlation_ids, after, limit).await
+    }
+
+    async fn applications_page(
+        &self,
+        application_ids: Option<Vec<String>>,
+        after: Option<String>,
+        limit: u64,
+    ) -> Result<Vec<ApplicationRecord>, StorageError> {
+        self.enter("applications_page").await?;
+        self.inner
+            .applications_page(application_ids, after, limit)
+            .await
+    }
+}

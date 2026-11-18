@@ -4,13 +4,15 @@
 //! plugin. Calls `apply` or `remove` one at a time in priority order through
 //! the plugin call guard, continuing after failures, with the caller identity
 //! and operation id. It never retries, never consults the types registry, and
-//! neither records outcomes nor checks the run deadline: before each call it
-//! asks its caller whether the call may still be made.
+//! neither records outcomes nor checks the run deadline: its caller's
+//! [`DispatchObserver`] is asked before each call whether it may still be
+//! made, and told each answer, and either can stop the dispatch.
 
 use std::fmt;
 use std::sync::Arc;
 
 use application_manager_sdk::{CallerIdentity, Envelope};
+use async_trait::async_trait;
 use serde_json::Value;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -20,6 +22,17 @@ use crate::domain::ports::{CallResult, PluginCalls};
 
 /// The answer of one plugin the router called, by section key.
 pub type Routed = (String, CallResult);
+
+/// The caller's side of one dispatch: the run-deadline check before each call
+/// and the outcome write after it.
+#[async_trait]
+pub trait DispatchObserver: Send {
+    /// May `plugin` be called now? `false` stops the dispatch before it.
+    async fn before(&mut self, plugin: &SectionPlugin) -> bool;
+
+    /// `plugin` answered `answer`; `false` stops the dispatch after it.
+    async fn after(&mut self, plugin: &SectionPlugin, answer: &CallResult) -> bool;
+}
 
 /// Dispatches seed and uninstall calls over the plugin set.
 #[domain_model]
@@ -42,9 +55,10 @@ impl SectionPluginRouter {
     }
 
     /// Call `apply` on every plugin in priority order, each with its own
-    /// section from `sections` (a validated seed has one per key). Before each
-    /// call `may_call` is asked; the first `false` stops the dispatch. The
-    /// answers of the plugins called come back in order.
+    /// section from `sections` (a validated seed has one per key). `observer`
+    /// is asked before each call and told each answer; a `false` from either
+    /// stops the dispatch. The answers of the plugins called come back in
+    /// order.
     pub async fn apply_all(
         &self,
         set: &PluginSet,
@@ -52,11 +66,11 @@ impl SectionPluginRouter {
         operation_id: Uuid,
         envelope: &Envelope,
         sections: &serde_json::Map<String, Value>,
-        mut may_call: impl FnMut(&SectionPlugin) -> bool,
+        observer: &mut dyn DispatchObserver,
     ) -> Vec<Routed> {
         let mut routed = Vec::with_capacity(set.plugins().len());
         for plugin in set.plugins() {
-            if !may_call(plugin) {
+            if !observer.before(plugin).await {
                 break;
             }
             let section = sections.get(&plugin.key).unwrap_or(&Value::Null);
@@ -64,31 +78,39 @@ impl SectionPluginRouter {
                 .calls
                 .apply(plugin, caller, operation_id, envelope, section)
                 .await;
+            let go_on = observer.after(plugin, &answer).await;
             routed.push((plugin.key.clone(), answer));
+            if !go_on {
+                break;
+            }
         }
         routed
     }
 
     /// Call `remove` for `application_id` on every plugin in priority order,
-    /// asking `may_call` before each call as [`Self::apply_all`] does.
+    /// with `observer` as in [`Self::apply_all`].
     pub async fn remove_all(
         &self,
         set: &PluginSet,
         caller: &CallerIdentity,
         operation_id: Uuid,
         application_id: &str,
-        mut may_call: impl FnMut(&SectionPlugin) -> bool,
+        observer: &mut dyn DispatchObserver,
     ) -> Vec<Routed> {
         let mut routed = Vec::with_capacity(set.plugins().len());
         for plugin in set.plugins() {
-            if !may_call(plugin) {
+            if !observer.before(plugin).await {
                 break;
             }
             let answer = self
                 .calls
                 .remove(plugin, caller, operation_id, application_id)
                 .await;
+            let go_on = observer.after(plugin, &answer).await;
             routed.push((plugin.key.clone(), answer));
+            if !go_on {
+                break;
+            }
         }
         routed
     }

@@ -12,12 +12,16 @@ use toolkit::contracts::{DatabaseCapability, RestApiCapability, RunnableCapabili
 use toolkit::{Gear, GearCtx, Healthcheck};
 
 use crate::api::rest;
+use crate::api::rest::gate::RequestGate;
 use crate::api::rest::health::StartupHealthcheck;
 use crate::config::ApplicationManagerConfig;
+use crate::domain::orchestrator::{OrchestratorSettings, RequestOrchestrator};
 use crate::domain::plugin_set::StartupState;
-use crate::domain::ports::OperationRepository;
+use crate::domain::ports::{OperationRepository, PluginCalls};
 use crate::domain::read_service::ReadService;
+use crate::domain::router::SectionPluginRouter;
 use crate::domain::schema_validator::SchemaValidator;
+use crate::infra::call_guard::CallGuard;
 use crate::infra::startup;
 use crate::infra::storage::SeaOrmOperationRepository;
 use crate::sdk::{ApplicationManagerSectionPluginSpecV1, OUTCOME_REPORT_TYPE, SECTION_BASE_TYPE};
@@ -38,8 +42,8 @@ struct Runtime {
     hub: Arc<ClientHub>,
     read: Arc<ReadService>,
     startup: Arc<StartupState>,
-    #[expect(dead_code, reason = "the request orchestrator uses it in PR 5")]
-    operations: Arc<dyn OperationRepository>,
+    gate: Arc<RequestGate>,
+    orchestrator: Arc<RequestOrchestrator>,
 }
 
 impl ApplicationManager {
@@ -130,20 +134,44 @@ impl Gear for ApplicationManager {
                 Self::MODULE_NAME
             )
         })?;
+        let validator = Arc::new(validator);
         let startup = Arc::new(StartupState::default());
-        let operations = Arc::new(SeaOrmOperationRepository::new(
+        let operations: Arc<dyn OperationRepository> = Arc::new(SeaOrmOperationRepository::new(
             Arc::new(db),
             config.storage_call_timeout,
+        ));
+        let guard: Arc<dyn PluginCalls> = Arc::new(CallGuard::new(
+            config.plugin_call_timeout,
+            config.plugin_max_in_flight,
+        ));
+        let orchestrator = Arc::new(RequestOrchestrator::new(
+            Arc::clone(&allowed),
+            Arc::clone(&operations),
+            Arc::new(SectionPluginRouter::new(guard)),
+            Arc::clone(&validator),
+            Arc::clone(&startup),
+            OrchestratorSettings {
+                plugin_call_timeout: config.plugin_call_timeout,
+                storage_call_timeout: config.storage_call_timeout,
+                run_window_margin: config.run_window_margin,
+                max_envelope_text_length: config.max_envelope_text_length,
+            },
+        ));
+        let gate = Arc::new(RequestGate::new(
+            Arc::clone(&startup),
+            config.max_request_tasks,
         ));
         let runtime = Runtime {
             hub: ctx.client_hub(),
             read: Arc::new(ReadService::new(
                 allowed,
                 Arc::clone(&startup),
-                Arc::new(validator),
+                validator,
+                operations,
             )),
             startup,
-            operations,
+            gate,
+            orchestrator,
         };
         self.runtime
             .set(runtime)
@@ -172,6 +200,8 @@ impl RestApiCapability for ApplicationManager {
             router,
             openapi,
             Arc::clone(&runtime.read),
+            Arc::clone(&runtime.orchestrator),
+            Arc::clone(&runtime.gate),
         ))
     }
 
@@ -212,7 +242,12 @@ impl RunnableCapability for ApplicationManager {
         Ok(())
     }
 
+    /// Refuse every later seed and uninstall. Request tasks already running
+    /// finish on their own; the drain is PR 6.
     async fn stop(&self, _deadline_token: CancellationToken) -> anyhow::Result<()> {
+        if let Some(runtime) = self.runtime.get() {
+            runtime.gate.stop();
+        }
         Ok(())
     }
 }

@@ -36,6 +36,8 @@ types-registry = { workspace = true }
 types-registry-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 
+# Raw request bodies of the request orchestrator
+
 # Async runtime
 async-trait = { workspace = true }
 futures = { workspace = true }

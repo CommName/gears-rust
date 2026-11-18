@@ -2,9 +2,12 @@
 //!
 //! Every refusal is a canonical Problem with no extension member, carrying
 //! the request id. Temporarily unavailable carries
-//! [`REFUSAL_RETRY_AFTER_SECONDS`]; not permitted names the action; an unknown
-//! section key is not found. The permission-denied builder fixes the Problem
-//! `detail`, so the request id and action go in its `reason`.
+//! [`REFUSAL_RETRY_AFTER_SECONDS`]; not permitted names the action; a
+//! conflict has reason `application_busy` and names the open operation; an
+//! invalid manifest lists its field violations. The permission-denied builder
+//! fixes the Problem `detail`, so the request id and action go in its
+//! `reason`; the invalid-argument builder fixes it too, so the request id is
+//! its first field violation.
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use uuid::Uuid;
@@ -23,15 +26,51 @@ pub struct ApplicationError;
 pub fn to_canonical(err: &DomainError, request_id: Uuid) -> CanonicalError {
     match err {
         DomainError::NotReady => unavailable(request_id, "the application manager is not ready"),
+        DomainError::AtCapacity => {
+            unavailable(request_id, "the application manager is at capacity")
+        }
+        DomainError::StorageUnavailable => {
+            unavailable(request_id, "operation storage cannot answer")
+        }
         DomainError::NotPermitted { action } => ApplicationError::permission_denied()
             .with_reason(format!(
                 "request {request_id}: action {action} is not permitted"
             ))
             .create(),
+        DomainError::Conflict { operation_id } => ApplicationError::aborted(format!(
+            "request {request_id}: operation {operation_id} of the application is open"
+        ))
+        .with_reason("application_busy")
+        .create(),
+        DomainError::InvalidManifest { problems } => {
+            // The invalid-argument builder fixes `detail`, so the request id
+            // is the first field violation.
+            let mut error = ApplicationError::invalid_argument().with_field_violation(
+                "request_id",
+                request_id.to_string(),
+                "request_id",
+            );
+            for problem in problems {
+                error = error.with_field_violation(
+                    problem.location.clone(),
+                    problem.message.clone(),
+                    problem.rule.clone(),
+                );
+            }
+            error.create()
+        }
         DomainError::UnknownSectionKey => {
             ApplicationError::not_found(format!("request {request_id}: unknown section key"))
                 .with_resource("section_key")
                 .create()
+        }
+        DomainError::OperationNotFound => {
+            ApplicationError::not_found(format!("request {request_id}: operation not found"))
+                .with_resource("operation")
+                .create()
+        }
+        DomainError::Defect => {
+            CanonicalError::internal(format!("request {request_id}: internal failure")).create()
         }
     }
 }
