@@ -11,7 +11,7 @@ use crate::models::{CallerIdentity, Envelope};
 /// - Plugins use their own service credentials and never receive a caller
 ///   credential.
 /// - In their own `init` they register a type derived from
-///   [`crate::ApplicationManagerSectionV1`], whose schema is the section's
+///   [`crate::SECTION_BASE_TYPE`], whose schema is the section's
 ///   content rules as JSON Schema Draft-07, a GTS instance of
 ///   [`crate::ApplicationManagerSectionPluginSpecV1`] naming that type in
 ///   `section_type`, and a scoped `ClientHub` client for this trait.

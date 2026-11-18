@@ -1,14 +1,16 @@
 //! Startup and registration (`cpt-cf-application-manager-component-startup-registration`).
 //!
 //! Runs once from `start`: lists the section plugin instances, reads their
-//! priorities and section types, resolves each section type and derives its
-//! key, resolves the clients, and checks the set
+//! priorities and section types, resolves each section type, derives its key,
+//! has the schema validator compile its schema, resolves the clients, and
+//! checks the set
 //! (`cpt-cf-application-manager-fr-startup-checks`). It calls no section
 //! plugin. Any failure stops the gear with a DESIGN 4.1 reason; there is no
 //! retry.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use application_manager_sdk::{ApplicationManagerSectionPluginSpecV1, SectionPluginClientV1};
 use gts::GtsSchema;
@@ -17,6 +19,7 @@ use toolkit::gts::PluginV1;
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
 
 use crate::domain::plugin_set::{PluginSet, SectionPlugin, section_key_of};
+use crate::domain::schema_validator::{CompiledSection, UnusableCause, compile_section};
 
 /// A DESIGN 4.1 startup failure reason this component reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +33,9 @@ pub enum StartupReason {
     /// A section type is not derived directly from the section base type as
     /// one segment.
     InvalidSectionType,
+    /// A section type's schema refers outside its document, is too complex,
+    /// or does not compile.
+    SectionSchemaUnusable,
     /// No `ClientHub` client is registered for an instance.
     PluginClientUnresolved,
     /// Two plugins have section types with the same key.
@@ -47,6 +53,7 @@ impl StartupReason {
             Self::PluginPropertiesUnreadable => "plugin_properties_unreadable",
             Self::SectionTypeUnresolved => "section_type_unresolved",
             Self::InvalidSectionType => "invalid_section_type",
+            Self::SectionSchemaUnusable => "section_schema_unusable",
             Self::PluginClientUnresolved => "plugin_client_unresolved",
             Self::DuplicateSectionKey => "duplicate_section_key",
             Self::EqualPriority => "equal_priority",
@@ -98,6 +105,51 @@ struct Resolved {
     instance: Instance,
     key: String,
     schema: serde_json::Value,
+}
+
+/// An instance whose section schema is compiled.
+struct Compiled {
+    instance: Instance,
+    key: String,
+    section: Arc<CompiledSection>,
+}
+
+/// Compile every resolved schema off the async executor, in instance order.
+/// A panic in compilation counts as a schema that does not compile.
+async fn compile_all(resolved: Vec<Resolved>) -> Result<Vec<Compiled>, StartupFailure> {
+    let compiled = tokio::task::spawn_blocking(move || {
+        resolved
+            .into_iter()
+            .map(|r| {
+                let result = compile_section(&r.key, &r.instance.section_type, &r.schema);
+                (r.instance, r.key, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| {
+        StartupFailure::new(
+            StartupReason::SectionSchemaUnusable,
+            format!(
+                "schema compilation aborted: {}",
+                UnusableCause::CompileFailed
+            ),
+        )
+    })?;
+    compiled
+        .into_iter()
+        .map(|(instance, key, result)| match result {
+            Ok(section) => Ok(Compiled {
+                instance,
+                key,
+                section: Arc::new(section),
+            }),
+            Err(cause) => Err(StartupFailure::new(
+                StartupReason::SectionSchemaUnusable,
+                format!("{}: {:?}: {cause}", instance.id, instance.section_type),
+            )),
+        })
+        .collect()
 }
 
 /// Build the plugin set, or report the first failing check in DESIGN 4.1
@@ -169,12 +221,14 @@ pub async fn discover(hub: &ClientHub) -> Result<PluginSet, StartupFailure> {
         });
     }
 
-    let mut plugins = Vec::with_capacity(resolved.len());
-    for Resolved {
+    let compiled = compile_all(resolved).await?;
+
+    let mut plugins = Vec::with_capacity(compiled.len());
+    for Compiled {
         instance,
         key,
-        schema,
-    } in resolved
+        section,
+    } in compiled
     {
         let client = hub
             .try_get_scoped::<dyn SectionPluginClientV1>(&ClientScope::gts_id(&instance.id))
@@ -187,7 +241,7 @@ pub async fn discover(hub: &ClientHub) -> Result<PluginSet, StartupFailure> {
             priority: instance.priority,
             instance_id: instance.id,
             client,
-            schema,
+            section,
         });
     }
 

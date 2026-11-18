@@ -16,7 +16,7 @@ pub mod infra;
 // types-registry through the link-time inventory.
 pub use application_manager_sdk as sdk;
 pub use application_manager_sdk::{
-    ApplicationManagerSectionPluginSpecV1, ApplicationManagerSectionV1, SectionPluginClientV1,
+    ApplicationManagerSectionPluginSpecV1, SECTION_BASE_TYPE, SectionPluginClientV1,
     SectionPluginError,
 };
 

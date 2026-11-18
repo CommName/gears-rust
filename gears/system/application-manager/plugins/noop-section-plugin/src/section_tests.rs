@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn the_section_type_derives_from_the_section_base_type() {
-    let base = <ApplicationManagerSectionV1 as GtsSchema>::TYPE_ID;
+    let base = SECTION_BASE_TYPE;
     assert_eq!(
         SECTION_TYPE.strip_prefix(base),
         Some("cf.core.noop.section.v1~")

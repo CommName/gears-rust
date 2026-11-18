@@ -211,6 +211,33 @@ async fn allowed_callers_from_config_decide_read_schema() {
     ));
 }
 
+#[tokio::test]
+async fn the_noop_section_type_compiles_and_serves_its_schema() {
+    use noop_section_plugin::section::{SECTION_TYPE, section_type_schema};
+
+    use crate::domain::schema_validator::section_problems;
+    use crate::test_support::type_schema;
+
+    let mut spec = PluginSpec::new("cf.test.noop.plugin.v1", 100, "cf.core.noop.section.v1");
+    spec.section_type = Some(type_schema(SECTION_TYPE, section_type_schema()));
+    let gear = initialized(&json!({}), hub_with(&[spec])).await;
+    gear.start(CancellationToken::new()).await.unwrap();
+    let read = &gear.runtime.get().unwrap().read;
+    let section = read
+        .section_schema(&platform_ctx("app-seeder"), "cf.core.noop.section")
+        .unwrap();
+    assert_eq!(section.section_type(), SECTION_TYPE);
+    let sections = [section];
+    assert_eq!(
+        section_problems(&sections, &json!({ "cf.core.noop.section": { "any": 1 } })),
+        []
+    );
+    assert_eq!(
+        section_problems(&sections, &json!({ "cf.core.noop.section": [] }))[0].rule,
+        "type"
+    );
+}
+
 #[test]
 fn sdk_types_are_in_inventory_of_the_gear_test_binary() {
     ensure_sdk_types_linked().unwrap();

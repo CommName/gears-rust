@@ -38,8 +38,13 @@ authz-resolver = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["macros", "sync", "time"] }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true }
+
+# Section schema validation (DESIGN 3.2)
+jsonschema = { workspace = true }
+percent-encoding = { workspace = true }
 
 # REST
 axum = { workspace = true }
@@ -59,6 +64,9 @@ inventory = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+noop-section-plugin = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
+proptest = { workspace = true }
+tracing-test = { workspace = true, features = ["no-env-filter"] }

@@ -2,9 +2,9 @@
 //!
 //! Every refusal is a canonical Problem with no extension member, carrying
 //! the request id. Temporarily unavailable carries
-//! [`REFUSAL_RETRY_AFTER_SECONDS`]; not permitted names the action. The
-//! permission-denied builder fixes the Problem `detail`, so the request id and
-//! action go in its `reason`.
+//! [`REFUSAL_RETRY_AFTER_SECONDS`]; not permitted names the action; an unknown
+//! section key is not found. The permission-denied builder fixes the Problem
+//! `detail`, so the request id and action go in its `reason`.
 
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use uuid::Uuid;
@@ -28,6 +28,11 @@ pub fn to_canonical(err: &DomainError, request_id: Uuid) -> CanonicalError {
                 "request {request_id}: action {action} is not permitted"
             ))
             .create(),
+        DomainError::UnknownSectionKey => {
+            ApplicationError::not_found(format!("request {request_id}: unknown section key"))
+                .with_resource("section_key")
+                .create()
+        }
     }
 }
 

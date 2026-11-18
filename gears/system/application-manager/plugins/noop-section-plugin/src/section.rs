@@ -1,7 +1,6 @@
 //! The no-op section type.
 
-use application_manager_sdk::ApplicationManagerSectionV1;
-use gts::GtsSchema;
+use application_manager_sdk::SECTION_BASE_TYPE;
 use serde_json::{Value, json};
 
 /// The section type of the no-op plugin, derived directly from the section
@@ -17,7 +16,7 @@ pub fn section_type_schema() -> Value {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "No-op section: any JSON object.",
         "allOf": [{
-            "$ref": format!("gts://{}", <ApplicationManagerSectionV1 as GtsSchema>::TYPE_ID)
+            "$ref": format!("gts://{SECTION_BASE_TYPE}")
         }],
         "type": "object"
     })
