@@ -490,7 +490,7 @@ test-eb-kafka: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
+	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg application-manager-db
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -537,6 +537,13 @@ lane_args_types-registry-db = -p cf-gears-types-registry --features integration 
 ## it the PostgreSQL and MySQL tests skip.
 lane_args_eb-gear-db = -p cf-gears-event-broker --features integration -E 'binary(/_backends_test$$/)'
 lane_env_eb-gear-db = EB_TEST_REQUIRE_DOCKER=1
+
+## Application Manager's database tier: the operations, operation history and
+## applications tables on PostgreSQL and MySQL (Docker required; each test
+## starts its own container). APPLICATION_MANAGER_DB_REQUIRE_DOCKER=1 turns an unreachable
+## Docker into a failure; without it the tests skip and pass vacuously.
+lane_args_application-manager-db = -p cf-gears-application-manager --features integration -E 'binary(/_backends_test$$/)'
+lane_env_application-manager-db = APPLICATION_MANAGER_DB_REQUIRE_DOCKER=1
 
 ## OAGW's database tier: the repository conformance suite, the
 ## migration tests and the proxy cache tests on PostgreSQL and MySQL, and the
@@ -1472,7 +1479,7 @@ all: check test-integration e2e-local openapi
 
 # Integration lanes that `make all` and `make ci` run (target-specific LANE, see tests.mk).
 all: LANE = toolkit-db-sqlite
-ci: LANE = users-info-pg usage-collector-pg usage-collector-ch types-registry-db oagw-db \
+ci: LANE = users-info-pg usage-collector-pg usage-collector-ch types-registry-db application-manager-db oagw-db \
 	oagw-cluster
 
 # Re-run setup when a make file changes.

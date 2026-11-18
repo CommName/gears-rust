@@ -3,6 +3,8 @@
 use toolkit::gts::PluginV1;
 use toolkit_gts::{gts_id, gts_type_schema};
 
+use crate::models::OutcomeReport;
+
 /// Abstract base of every section type.
 ///
 /// Each section plugin registers, in its own `init`, a type derived directly
@@ -88,6 +90,44 @@ pub struct ApplicationManagerSectionPluginSpecV1 {
 
 /// GTS resource type of an application, the PDP resource of ADR 0004.
 pub const APPLICATION_RESOURCE_TYPE: &str = gts_id!("cf.core.application_manager.application.v1~");
+
+/// GTS type id of the operation outcome report ([`crate::models::OutcomeReport`]).
+pub const OUTCOME_REPORT_TYPE: &str = gts_id!("cf.core.application_manager.outcome_report.v1~");
+
+/// The JSON Schema of [`OutcomeReport`], derived from the struct itself.
+///
+/// The `#[gts_type_schema]` macro cannot declare this type: it needs a
+/// `V1`-suffixed struct that carries an `id: GtsInstanceId` or `gts_type`
+/// field, and the report is a plain serde value with neither. The struct
+/// already derives `schemars::JsonSchema`, so the schema is generated from it
+/// (one source of truth, no checked-in JSON) and registered in the same
+/// link-time inventory the macro feeds. Sub-schemas are inlined so the
+/// document has no `$defs` and carries its `$id` as the only identifier.
+fn outcome_report_schema_json() -> String {
+    let generator = schemars::generate::SchemaSettings::draft07()
+        .with(|settings| settings.inline_subschemas = true)
+        .into_generator();
+    let mut schema =
+        serde_json::to_value(generator.into_root_schema_for::<OutcomeReport>()).unwrap_or_default();
+    if let Some(object) = schema.as_object_mut() {
+        object.insert(
+            "$id".to_owned(),
+            serde_json::Value::String(format!("gts://{OUTCOME_REPORT_TYPE}")),
+        );
+        object.insert(
+            "description".to_owned(),
+            serde_json::Value::String("Application Manager operation outcome report".to_owned()),
+        );
+    }
+    schema.to_string()
+}
+
+toolkit_gts::inventory::submit! {
+    toolkit_gts::InventoryTypeSchema {
+        type_id: OUTCOME_REPORT_TYPE,
+        schema_fn: outcome_report_schema_json,
+    }
+}
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

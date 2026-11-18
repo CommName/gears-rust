@@ -195,6 +195,8 @@ calculator = { path = "../../examples/oop-gears/calculator/calculator", optional
 application_manager = { package = "cf-gears-application-manager", path = "../../gears/system/application-manager/application-manager" }
 uuid = { workspace = true }
 tokio-util = { workspace = true }
+# `tests/application_manager_config.rs` hands the gear an in-memory database.
+toolkit-db = { workspace = true, features = ["sqlite"] }
 tempfile = { workspace = true }
 serde-saphyr = { workspace = true }
 # `tests/schema_guard_boot.rs` seeds a legacy table into an isolated data root.

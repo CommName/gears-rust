@@ -568,6 +568,9 @@ gears:
       sources: ["pricing", "products"]
 
   application-manager:
+    database:
+      server: "sqlite_users"
+      file: "application_manager.db"
     config:
       plugin_call_timeout: "10s"
       run_window_margin: "30s"
