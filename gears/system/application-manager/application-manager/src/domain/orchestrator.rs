@@ -12,7 +12,6 @@ use application_manager_sdk::{
     UnavailableItem, UnavailableReasonCode,
 };
 use async_trait::async_trait;
-use bytes::Bytes;
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
@@ -68,18 +67,16 @@ impl Receipt {
     }
 }
 
-/// A request as the REST layer received it. Bodies are raw: parsing is part
-/// of the request task, so a body that is not JSON is recorded like any
-/// other envelope problem.
+/// A request as the REST layer extracted it. A body that is not of its type
+/// never reaches the gear; every request that does is recorded.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestInput {
     /// `POST /applications`: the manifest.
-    Seed(Bytes),
-    /// `DELETE /applications/{application_id}`: the decoded path segment.
-    UninstallById(String),
-    /// `POST /applications:uninstall`: a body with `application_id`.
-    UninstallBody(Bytes),
+    Seed(Value),
+    /// `DELETE /applications/{application_id}` or `POST
+    /// /applications:uninstall`: the application id.
+    Uninstall(String),
 }
 
 /// An accepted request.
@@ -518,23 +515,17 @@ impl RequestOrchestrator {
     fn parse(&self, input: &RequestInput) -> Parsed {
         let max = usize::try_from(self.settings.max_envelope_text_length).unwrap_or(usize::MAX);
         match input {
-            RequestInput::Seed(body) => {
-                let (manifest, problems) = match serde_json::from_slice::<Value>(body) {
-                    Ok(manifest) => {
-                        let problems = self.validator.check_envelope(&manifest);
-                        (Some(manifest), problems)
-                    }
-                    Err(_) => (None, vec![Problem::new(String::new(), "type")]),
-                };
+            RequestInput::Seed(manifest) => {
+                let problems = self.validator.check_envelope(manifest);
                 let text = |field: &str| {
-                    manifest
-                        .as_ref()
-                        .and_then(|m| m["application"][field].as_str())
+                    manifest["application"][field]
+                        .as_str()
                         .map(str::to_owned)
+                        .unwrap_or_default()
                 };
-                let application_id = text("id").unwrap_or_default();
-                let version = text("version").unwrap_or_default();
-                let sections = manifest.as_ref().map(|m| m["sections"].clone());
+                let application_id = text("id");
+                let version = text("version");
+                let sections = Some(manifest["sections"].clone());
                 let section_keys = sections
                     .as_ref()
                     .and_then(Value::as_object)
@@ -551,18 +542,12 @@ impl RequestOrchestrator {
                     application,
                 }
             }
-            RequestInput::UninstallById(id) => self.uninstall(id.clone(), Vec::new(), max),
-            RequestInput::UninstallBody(body) => {
-                let (id, problems) = uninstall_body(body);
-                self.uninstall(id, problems, max)
-            }
+            RequestInput::Uninstall(id) => self.uninstall(id.clone(), max),
         }
     }
 
-    fn uninstall(&self, id: String, mut problems: Vec<Problem>, max: usize) -> Parsed {
-        if problems.is_empty() {
-            problems = self.validator.check_application_id(&id);
-        }
+    fn uninstall(&self, id: String, max: usize) -> Parsed {
+        let problems = self.validator.check_application_id(&id);
         let application = ApplicationRef::bounded(&id, None, max);
         Parsed {
             caller_action: CallerAction::Uninstall,
@@ -629,28 +614,6 @@ impl RequestOrchestrator {
             )
         })
     }
-}
-
-/// The application id of an uninstall body, or the problems of the body: a
-/// JSON object with exactly a text `application_id`.
-fn uninstall_body(body: &[u8]) -> (String, Vec<Problem>) {
-    let problem = |location: &str, rule: &str| vec![Problem::new(location.to_owned(), rule)];
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return (String::new(), problem("", "type"));
-    };
-    let Some(members) = value.as_object() else {
-        return (String::new(), problem("", "type"));
-    };
-    let Some(id) = members.get("application_id") else {
-        return (String::new(), problem("", "required"));
-    };
-    let Some(id) = id.as_str() else {
-        return (String::new(), problem("/application_id", "type"));
-    };
-    if members.len() > 1 {
-        return (id.to_owned(), problem("", "additionalProperties"));
-    }
-    (id.to_owned(), Vec::new())
 }
 
 fn report_problem(problem: &Problem) -> ReportProblem {

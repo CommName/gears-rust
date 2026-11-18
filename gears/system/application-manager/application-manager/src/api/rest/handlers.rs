@@ -5,7 +5,6 @@ use std::sync::Arc;
 use axum::extract::{Extension, Path};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use toolkit::api::canonical_prelude::*;
@@ -14,6 +13,7 @@ use uuid::Uuid;
 
 use super::dto::{
     AcceptedDto, ManifestSchemaDto, OperationDto, SectionKeysDto, SectionSchemaDto, SectionTypeDto,
+    UninstallRequestDto,
 };
 use super::error::to_canonical;
 use super::gate::RequestGate;
@@ -91,9 +91,9 @@ pub async fn seed(
     Extension(ctx): Extension<PlatformSecurityContext>,
     Extension(gate): Extension<Arc<RequestGate>>,
     Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
-    body: Bytes,
+    extract::Json(manifest): extract::Json<serde_json::Value>,
 ) -> ApiResult<Response> {
-    submit(ctx, &gate, orchestrator, RequestInput::Seed(body)).await
+    submit(ctx, &gate, orchestrator, RequestInput::Seed(manifest)).await
 }
 
 /// `DELETE /application-manager/v1/applications/{application_id}`.
@@ -110,7 +110,7 @@ pub async fn uninstall_by_id(
         ctx,
         &gate,
         orchestrator,
-        RequestInput::UninstallById(application_id),
+        RequestInput::Uninstall(application_id),
     )
     .await
 }
@@ -123,9 +123,15 @@ pub async fn uninstall(
     Extension(ctx): Extension<PlatformSecurityContext>,
     Extension(gate): Extension<Arc<RequestGate>>,
     Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
-    body: Bytes,
+    extract::Json(body): extract::Json<UninstallRequestDto>,
 ) -> ApiResult<Response> {
-    submit(ctx, &gate, orchestrator, RequestInput::UninstallBody(body)).await
+    submit(
+        ctx,
+        &gate,
+        orchestrator,
+        RequestInput::Uninstall(body.application_id),
+    )
+    .await
 }
 
 /// The gate, then the request task; 202 with the operation id and its

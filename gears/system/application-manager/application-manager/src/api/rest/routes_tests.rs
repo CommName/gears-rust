@@ -516,13 +516,37 @@ async fn an_invalid_envelope_is_400_with_the_request_id_first() {
 }
 
 #[tokio::test]
-async fn a_body_that_is_not_json_is_400() {
+async fn a_body_that_is_not_json_is_400_and_not_recorded() {
     let h = harness(true, writer()).await;
     let (status, _, body) = send(&h, "POST", SEED_PATH, b"{nope", platform_ctx("app-seeder")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    let violations = body["context"]["field_violations"].as_array().unwrap();
-    assert_eq!(violations[1]["field"], json!(""));
-    assert_eq!(violations[1]["reason"], json!("type"));
+    assert_eq!(h.repo.history_page(None, None, 10).await.unwrap(), []);
+    assert_eq!(h.plugin.calls(), 0);
+}
+
+#[tokio::test]
+async fn an_uninstall_body_of_another_shape_is_refused_and_not_recorded() {
+    let h = harness(true, writer()).await;
+    let unprocessable = StatusCode::UNPROCESSABLE_ENTITY;
+    for (request, expected) in [
+        (&b"not json"[..], StatusCode::BAD_REQUEST),
+        (b"[]", unprocessable),
+        (b"{}", unprocessable),
+        (br#"{"application_id":7}"#, unprocessable),
+        (br#"{"application_id":"a","x":1}"#, unprocessable),
+    ] {
+        let (status, _, body) = send(
+            &h,
+            "POST",
+            "/application-manager/v1/applications:uninstall",
+            request,
+            platform_ctx("app-seeder"),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+    assert_eq!(h.repo.history_page(None, None, 10).await.unwrap(), []);
+    assert_eq!(h.plugin.calls(), 0);
 }
 
 #[tokio::test]

@@ -78,11 +78,7 @@ fn permit() -> tokio::sync::OwnedSemaphorePermit {
 
 fn manifest(id: &str, sections: &Value) -> RequestInput {
     RequestInput::Seed(
-        serde_json::to_vec(
-            &json!({ "application": { "id": id, "version": "1.0.0" }, "sections": sections }),
-        )
-        .unwrap()
-        .into(),
+        json!({ "application": { "id": id, "version": "1.0.0" }, "sections": sections }),
     )
 }
 
@@ -244,7 +240,7 @@ async fn a_seed_with_an_empty_plugin_set_succeeds() {
 async fn an_uninstall_removes_in_priority_order_and_deletes_the_record() {
     let h = harness(&[Answer::Ok, Answer::Ok]).await;
     h.run(seed_all(&h)).await;
-    let op = h.run(RequestInput::UninstallById(APP.to_owned())).await;
+    let op = h.run(RequestInput::Uninstall(APP.to_owned())).await;
     assert_eq!(op.category, Some(RequestCategory::Succeeded));
     assert_eq!(op.report.sections[0].section_type, None);
     for plugin in &h.plugins {
@@ -255,51 +251,19 @@ async fn an_uninstall_removes_in_priority_order_and_deletes_the_record() {
 }
 
 #[tokio::test]
-async fn an_uninstall_by_body_runs_the_same_way() {
-    let h = harness(&[]).await;
-    let op = h
-        .run(RequestInput::UninstallBody(
-            br#"{"application_id":"acme.app"}"#.to_vec().into(),
-        ))
-        .await;
-    assert_eq!(op.category, Some(RequestCategory::Succeeded));
-    assert_eq!(op.application_id, APP);
-}
-
-#[tokio::test]
-async fn bad_uninstall_bodies_and_ids_are_rank_4() {
+async fn bad_uninstall_ids_are_rank_4() {
     let h = harness(&[Answer::Ok]).await;
     let cases: Vec<(RequestInput, (&str, &str))> = vec![
         (
-            RequestInput::UninstallBody(b"not json".to_vec().into()),
-            ("", "type"),
-        ),
-        (
-            RequestInput::UninstallBody(b"[]".to_vec().into()),
-            ("", "type"),
-        ),
-        (
-            RequestInput::UninstallBody(b"{}".to_vec().into()),
-            ("", "required"),
-        ),
-        (
-            RequestInput::UninstallBody(br#"{"application_id":7}"#.to_vec().into()),
-            ("/application_id", "type"),
-        ),
-        (
-            RequestInput::UninstallBody(br#"{"application_id":"a","x":1}"#.to_vec().into()),
-            ("", "additionalProperties"),
-        ),
-        (
-            RequestInput::UninstallById(String::new()),
+            RequestInput::Uninstall(String::new()),
             ("/application_id", "minLength"),
         ),
         (
-            RequestInput::UninstallById("a".repeat(65)),
+            RequestInput::Uninstall("a".repeat(65)),
             ("/application_id", "maxLength"),
         ),
         (
-            RequestInput::UninstallById("a\u{7}b".to_owned()),
+            RequestInput::Uninstall("a\u{7}b".to_owned()),
             ("/application_id", "pattern"),
         ),
     ];
@@ -345,22 +309,6 @@ async fn an_envelope_problem_is_rank_4_with_a_refused_event_and_no_operation() {
 }
 
 #[tokio::test]
-async fn a_body_that_is_not_json_is_rank_4() {
-    let h = harness(&[Answer::Ok]).await;
-    let (receipt, answer) = h
-        .submit(RequestInput::Seed(b"{not json".to_vec().into()))
-        .await;
-    let Err(DomainError::InvalidManifest { problems }) = answer else {
-        panic!("{answer:?}");
-    };
-    assert_eq!(
-        (problems[0].location.as_str(), problems[0].rule.as_str()),
-        ("", "type")
-    );
-    h.refused(&receipt).await;
-}
-
-#[tokio::test]
 async fn a_caller_not_allowed_is_rank_2_with_no_storage_read() {
     let h = harness(&[Answer::Ok]).await;
     let (receipt, answer) = h.submit_as("someone-else", seed_all(&h)).await;
@@ -383,7 +331,7 @@ async fn a_caller_not_allowed_is_rank_2_with_no_storage_read() {
 async fn rank_2_beats_rank_4() {
     let h = harness(&[Answer::Ok]).await;
     let (_, answer) = h
-        .submit_as("someone-else", RequestInput::UninstallById(String::new()))
+        .submit_as("someone-else", RequestInput::Uninstall(String::new()))
         .await;
     assert_eq!(
         answer,
@@ -436,7 +384,7 @@ async fn open_operation(h: &Harness, window: Duration) -> Uuid {
                 report: initial_report(
                     id,
                     &h.orchestrator
-                        .parse(&RequestInput::UninstallById(APP.to_owned())),
+                        .parse(&RequestInput::Uninstall(APP.to_owned())),
                 ),
             },
             HistoryEvent {

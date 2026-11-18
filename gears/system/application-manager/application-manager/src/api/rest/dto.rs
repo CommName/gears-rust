@@ -65,8 +65,8 @@ pub struct EnvelopeDto {
     pub version: String,
 }
 
-/// A manifest: exactly the envelope and one section per section key. The
-/// body is read raw, so a body that is not JSON is an envelope problem.
+/// A manifest: exactly the envelope and one section per section key. A body
+/// that is not JSON is refused before it reaches the gear.
 #[derive(Debug, Clone, PartialEq)]
 #[toolkit_macros::api_dto(request)]
 #[schema(as = ApplicationManagerSeedRequestDto)]
@@ -78,9 +78,11 @@ pub struct SeedRequestDto {
     pub sections: serde_json::Value,
 }
 
-/// An uninstall with the application id in the body.
+/// An uninstall with the application id in the body. A body of any other
+/// shape is refused before it reaches the gear.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
 #[schema(as = ApplicationManagerUninstallRequestDto)]
 pub struct UninstallRequestDto {
     /// The application id, under the envelope text rule.
