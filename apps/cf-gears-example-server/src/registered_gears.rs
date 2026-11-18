@@ -136,6 +136,8 @@ use bss_orders as _;
 use bss_orders_test_authz_plugin as _;
 // Orders' required Event Broker gear (and, through it, the cluster gear) plus the plugins its
 // standalone deployment selects.
+#[cfg(feature = "application-manager")]
+use application_manager as _;
 #[cfg(feature = "bss-orders")]
 use event_broker as _;
 #[cfg(feature = "bss-orders")]

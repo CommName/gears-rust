@@ -85,6 +85,7 @@ bss-orders = [
 ]
 bss-pricing = ["dep:bss_pricing", "bss-products"]
 bss-approvals = ["dep:bss_approvals"]
+application-manager = ["dep:application_manager"]
 # The admission gate links its default engine plugin, policy-engine.
 admission-control = ["dep:admission-control", "policy-engine"]
 policy-engine = ["dep:policy-engine"]
@@ -173,6 +174,9 @@ standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", pa
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", path = "../../gears/system/event-broker/plugins/sqlite-event-broker-plugin", optional = true }
 bss_approvals = { package = "cf-gears-bss-approvals", path = "../../gears/bss/approvals/approvals", optional = true }
 
+# Optional Application Manager gear
+application_manager = { package = "cf-gears-application-manager", path = "../../gears/system/application-manager/application-manager", optional = true }
+
 # Optional Admission Control gear
 admission-control = { package = "cf-gears-admission-control", path = "../../gears/system/admission-control/admission-control", optional = true }
 
@@ -185,6 +189,8 @@ calculator-gateway = { path = "../../examples/oop-gears/calculator-gateway/calcu
 calculator = { path = "../../examples/oop-gears/calculator/calculator", optional = true }
 
 [dev-dependencies]
+# `tests/application_manager_config.rs` parses the gear config at default features.
+application_manager = { package = "cf-gears-application-manager", path = "../../gears/system/application-manager/application-manager" }
 uuid = { workspace = true }
 tokio-util = { workspace = true }
 tempfile = { workspace = true }

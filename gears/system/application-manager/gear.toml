@@ -1,0 +1,7 @@
+[gear]
+name = "Application Manager"
+description = "The Application Manager is a platform gear that learns which applications are installed in an environment."
+category = "core-platform-integration"
+is_plugin = false
+has_plugins = true
+has_extension_point = true

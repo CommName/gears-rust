@@ -1,0 +1,53 @@
+[package]
+name = "cf-gears-application-manager"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Application Manager gear - learns which applications are installed and dispatches manifest sections to section plugins"
+repository.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "application_manager"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+application-manager-sdk = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
+
+# GTS (section plugin type registration check)
+gts = { workspace = true }
+
+# Gears named in the `deps` of the gear declaration
+types-registry = { workspace = true }
+authz-resolver = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+tokio-util = { workspace = true }
+
+# Error handling and serialization
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }
