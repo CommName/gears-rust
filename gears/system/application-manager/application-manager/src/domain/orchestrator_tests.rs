@@ -76,13 +76,34 @@ fn permit() -> tokio::sync::OwnedSemaphorePermit {
     Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()
 }
 
-fn manifest(id: &str, sections: &Value) -> RequestInput {
-    RequestInput::Seed(
-        json!({ "application": { "id": id, "version": "1.0.0" }, "sections": sections }),
-    )
+/// A seed or an uninstall, so one harness drives both entry points.
+#[derive(Debug, Clone)]
+enum Call {
+    Seed(Value),
+    Uninstall(String),
 }
 
-fn seed_all(h: &Harness) -> RequestInput {
+impl Call {
+    async fn send(
+        self,
+        orchestrator: &Arc<RequestOrchestrator>,
+        ctx: PlatformSecurityContext,
+        receipt: Receipt,
+        admission: Result<tokio::sync::OwnedSemaphorePermit, DomainError>,
+    ) -> Result<Submitted, DomainError> {
+        let orchestrator = Arc::clone(orchestrator);
+        match self {
+            Self::Seed(manifest) => orchestrator.seed(ctx, manifest, receipt, admission).await,
+            Self::Uninstall(id) => orchestrator.uninstall(ctx, id, receipt, admission).await,
+        }
+    }
+}
+
+fn manifest(id: &str, sections: &Value) -> Call {
+    Call::Seed(json!({ "application": { "id": id, "version": "1.0.0" }, "sections": sections }))
+}
+
+fn seed_all(h: &Harness) -> Call {
     let keys = ["a", "b", "c", "d"];
     let sections: serde_json::Map<String, Value> = (0..h.plugins.len())
         .map(|i| (keys[i].to_owned(), json!({ "n": i })))
@@ -94,21 +115,26 @@ impl Harness {
     async fn submit_as(
         &self,
         caller: &str,
-        input: RequestInput,
+        input: Call,
     ) -> (Receipt, Result<Submitted, DomainError>) {
         let receipt = Receipt::new(OffsetDateTime::now_utc());
-        let answer = Arc::clone(&self.orchestrator)
-            .submit(platform_ctx(caller), input, receipt, permit())
+        let answer = input
+            .send(
+                &self.orchestrator,
+                platform_ctx(caller),
+                receipt,
+                Ok(permit()),
+            )
             .await;
         (receipt, answer)
     }
 
-    async fn submit(&self, input: RequestInput) -> (Receipt, Result<Submitted, DomainError>) {
+    async fn submit(&self, input: Call) -> (Receipt, Result<Submitted, DomainError>) {
         self.submit_as("app-seeder", input).await
     }
 
     /// Submit, expect acceptance, and return the completed operation.
-    async fn run(&self, input: RequestInput) -> Operation {
+    async fn run(&self, input: Call) -> Operation {
         let (receipt, answer) = self.submit(input).await;
         assert_eq!(
             answer,
@@ -240,7 +266,7 @@ async fn a_seed_with_an_empty_plugin_set_succeeds() {
 async fn an_uninstall_removes_in_priority_order_and_deletes_the_record() {
     let h = harness(&[Answer::Ok, Answer::Ok]).await;
     h.run(seed_all(&h)).await;
-    let op = h.run(RequestInput::Uninstall(APP.to_owned())).await;
+    let op = h.run(Call::Uninstall(APP.to_owned())).await;
     assert_eq!(op.category, Some(RequestCategory::Succeeded));
     assert_eq!(op.report.sections[0].section_type, None);
     for plugin in &h.plugins {
@@ -253,17 +279,17 @@ async fn an_uninstall_removes_in_priority_order_and_deletes_the_record() {
 #[tokio::test]
 async fn bad_uninstall_ids_are_rank_4() {
     let h = harness(&[Answer::Ok]).await;
-    let cases: Vec<(RequestInput, (&str, &str))> = vec![
+    let cases: Vec<(Call, (&str, &str))> = vec![
         (
-            RequestInput::Uninstall(String::new()),
+            Call::Uninstall(String::new()),
             ("/application_id", "minLength"),
         ),
         (
-            RequestInput::Uninstall("a".repeat(65)),
+            Call::Uninstall("a".repeat(65)),
             ("/application_id", "maxLength"),
         ),
         (
-            RequestInput::Uninstall("a\u{7}b".to_owned()),
+            Call::Uninstall("a\u{7}b".to_owned()),
             ("/application_id", "pattern"),
         ),
     ];
@@ -331,7 +357,7 @@ async fn a_caller_not_allowed_is_rank_2_with_no_storage_read() {
 async fn rank_2_beats_rank_4() {
     let h = harness(&[Answer::Ok]).await;
     let (_, answer) = h
-        .submit_as("someone-else", RequestInput::Uninstall(String::new()))
+        .submit_as("someone-else", Call::Uninstall(String::new()))
         .await;
     assert_eq!(
         answer,
@@ -381,11 +407,7 @@ async fn open_operation(h: &Harness, window: Duration) -> Uuid {
                 action: OperationAction::Seed,
                 run_window: window,
                 finished_event_id: Uuid::now_v7(),
-                report: initial_report(
-                    id,
-                    &h.orchestrator
-                        .parse(&RequestInput::Uninstall(APP.to_owned())),
-                ),
+                report: initial_report(id, &h.orchestrator.parse_uninstall(APP.to_owned())),
             },
             HistoryEvent {
                 event_id: Uuid::now_v7(),
@@ -493,14 +515,16 @@ async fn a_gear_defect_before_the_answer_is_a_defect_with_a_refused_event() {
 async fn the_gate_refusal_event_names_the_gear_as_unavailable() {
     let h = harness(&[Answer::Ok]).await;
     let receipt = Receipt::new(OffsetDateTime::now_utc());
-    h.orchestrator
-        .refuse_at_gate(
-            &platform_ctx("app-seeder"),
-            &seed_all(&h),
-            &receipt,
-            &DomainError::AtCapacity,
+    let answer = seed_all(&h)
+        .send(
+            &h.orchestrator,
+            platform_ctx("app-seeder"),
+            receipt,
+            Err(DomainError::AtCapacity),
         )
         .await;
+    assert_eq!(answer, Err(DomainError::AtCapacity));
+    assert_eq!(h.calls(), [0]);
     let refused = h.refused(&receipt).await;
     assert_eq!(
         refused.content["result"]["unavailable"],
@@ -514,11 +538,11 @@ async fn the_gate_refusal_event_names_the_gear_as_unavailable() {
 async fn the_request_task_completes_when_the_caller_drops_the_future() {
     let h = harness(&[Answer::Ok]).await;
     let receipt = Receipt::new(OffsetDateTime::now_utc());
-    let submit = Arc::clone(&h.orchestrator).submit(
+    let submit = seed_all(&h).send(
+        &h.orchestrator,
         platform_ctx("app-seeder"),
-        seed_all(&h),
         receipt,
-        permit(),
+        Ok(permit()),
     );
     // Dropped before it can answer.
     assert!(tokio::time::timeout(Duration::ZERO, submit).await.is_err());

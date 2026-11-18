@@ -67,18 +67,6 @@ impl Receipt {
     }
 }
 
-/// A request as the REST layer extracted it. A body that is not of its type
-/// never reaches the gear; every request that does is recorded.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RequestInput {
-    /// `POST /applications`: the manifest.
-    Seed(Value),
-    /// `DELETE /applications/{application_id}` or `POST
-    /// /applications:uninstall`: the application id.
-    Uninstall(String),
-}
-
 /// An accepted request.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,30 +155,64 @@ impl RequestOrchestrator {
         }
     }
 
-    /// Run a request that passed the gate. A supervisor task owns `permit`
-    /// until the operation is final and runs the request task; this future
-    /// waits only for the synchronous answer, and the tasks keep running when
-    /// it is dropped. A request task that ends before it answers is a
-    /// [`DomainError::Defect`] with a refused event of category internal
-    /// failure; one that ends after acceptance gets the supervisor
+    /// Seed `manifest`. `admission` is the gate's answer: a refusal records
+    /// its refused event and is returned. Otherwise a supervisor task owns
+    /// the permit until the operation is final and runs the request task;
+    /// this future waits only for the synchronous answer, and the tasks keep
+    /// running when it is dropped. A request task that ends before it
+    /// answers is a [`DomainError::Defect`] with a refused event of category
+    /// internal failure; one that ends after acceptance gets the supervisor
     /// completion.
     ///
     /// # Errors
     /// The refusal of ranks 1 to 4, [`DomainError::StorageUnavailable`] at
     /// acceptance, a conflict naming the winner of a lost race, or
     /// [`DomainError::Defect`].
-    pub async fn submit(
+    pub async fn seed(
         self: Arc<Self>,
         ctx: PlatformSecurityContext,
-        input: RequestInput,
+        manifest: Value,
         receipt: Receipt,
-        permit: OwnedSemaphorePermit,
+        admission: Result<OwnedSemaphorePermit, DomainError>,
     ) -> Result<Submitted, DomainError> {
+        let parsed = self.parse_seed(&manifest);
+        self.submit(ctx, parsed, receipt, admission).await
+    }
+
+    /// Uninstall `application_id`, as [`Self::seed`].
+    ///
+    /// # Errors
+    /// As [`Self::seed`].
+    pub async fn uninstall(
+        self: Arc<Self>,
+        ctx: PlatformSecurityContext,
+        application_id: String,
+        receipt: Receipt,
+        admission: Result<OwnedSemaphorePermit, DomainError>,
+    ) -> Result<Submitted, DomainError> {
+        let parsed = self.parse_uninstall(application_id);
+        self.submit(ctx, parsed, receipt, admission).await
+    }
+
+    async fn submit(
+        self: Arc<Self>,
+        ctx: PlatformSecurityContext,
+        parsed: Parsed,
+        receipt: Receipt,
+        admission: Result<OwnedSemaphorePermit, DomainError>,
+    ) -> Result<Submitted, DomainError> {
+        let permit = match admission {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                self.record_refusal(&ctx, &parsed, &receipt, &refusal).await;
+                return Err(refusal);
+            }
+        };
         let (answer, answered) = oneshot::channel();
         let progress = Arc::new(Mutex::new(Progress::Synchronous));
         let task = tokio::spawn(Arc::clone(&self).run(
             ctx.clone(),
-            input.clone(),
+            parsed.clone(),
             receipt,
             answer,
             Arc::clone(&progress),
@@ -208,7 +230,6 @@ impl RequestOrchestrator {
             );
             match stage {
                 Progress::Synchronous => {
-                    let parsed = self.parse(&input);
                     self.record_refusal(&ctx, &parsed, &receipt, &DomainError::Defect)
                         .await;
                 }
@@ -226,30 +247,16 @@ impl RequestOrchestrator {
         answered.await.unwrap_or(Err(DomainError::Defect))
     }
 
-    /// Record the refused event of a gate refusal (`NotReady` or
-    /// `AtCapacity`, rank 1). Never fails: a missing event is logged.
-    pub async fn refuse_at_gate(
-        &self,
-        ctx: &PlatformSecurityContext,
-        input: &RequestInput,
-        receipt: &Receipt,
-        refusal: &DomainError,
-    ) {
-        let parsed = self.parse(input);
-        self.record_refusal(ctx, &parsed, receipt, refusal).await;
-    }
-
     /// The request task: the synchronous phase, then, once accepted and
     /// answered, the operation.
     async fn run(
         self: Arc<Self>,
         ctx: PlatformSecurityContext,
-        input: RequestInput,
+        parsed: Parsed,
         receipt: Receipt,
         answer: oneshot::Sender<Result<Submitted, DomainError>>,
         progress: Arc<Mutex<Progress>>,
     ) {
-        let parsed = self.parse(&input);
         let settle = |stage| *progress.lock().unwrap_or_else(PoisonError::into_inner) = stage;
         match self.synchronous(&ctx, &parsed, &receipt).await {
             Err(refusal) => {
@@ -511,44 +518,39 @@ impl RequestOrchestrator {
         }
     }
 
-    /// Parse `input` into what every step needs.
-    fn parse(&self, input: &RequestInput) -> Parsed {
-        let max = usize::try_from(self.settings.max_envelope_text_length).unwrap_or(usize::MAX);
-        match input {
-            RequestInput::Seed(manifest) => {
-                let problems = self.validator.check_envelope(manifest);
-                let text = |field: &str| {
-                    manifest["application"][field]
-                        .as_str()
-                        .map(str::to_owned)
-                        .unwrap_or_default()
-                };
-                let application_id = text("id");
-                let version = text("version");
-                let sections = Some(manifest["sections"].clone());
-                let section_keys = sections
-                    .as_ref()
-                    .and_then(Value::as_object)
-                    .map(|members| self.section_keys(members));
-                let application = ApplicationRef::bounded(&application_id, Some(&version), max);
-                Parsed {
-                    caller_action: CallerAction::Seed,
-                    action: OperationAction::Seed,
-                    application_id,
-                    version: Some(version),
-                    sections,
-                    problems,
-                    section_keys,
-                    application,
-                }
-            }
-            RequestInput::Uninstall(id) => self.uninstall(id.clone(), max),
+    /// A seed's manifest, parsed into what every step needs.
+    fn parse_seed(&self, manifest: &Value) -> Parsed {
+        let problems = self.validator.check_envelope(manifest);
+        let text = |field: &str| {
+            manifest["application"][field]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_default()
+        };
+        let application_id = text("id");
+        let version = text("version");
+        let sections = Some(manifest["sections"].clone());
+        let section_keys = sections
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|members| self.section_keys(members));
+        let application = ApplicationRef::bounded(&application_id, Some(&version), self.max_text());
+        Parsed {
+            caller_action: CallerAction::Seed,
+            action: OperationAction::Seed,
+            application_id,
+            version: Some(version),
+            sections,
+            problems,
+            section_keys,
+            application,
         }
     }
 
-    fn uninstall(&self, id: String, max: usize) -> Parsed {
+    /// An uninstall's application id, parsed into what every step needs.
+    fn parse_uninstall(&self, id: String) -> Parsed {
         let problems = self.validator.check_application_id(&id);
-        let application = ApplicationRef::bounded(&id, None, max);
+        let application = ApplicationRef::bounded(&id, None, self.max_text());
         Parsed {
             caller_action: CallerAction::Uninstall,
             action: OperationAction::Uninstall,
@@ -559,6 +561,10 @@ impl RequestOrchestrator {
             section_keys: None,
             application,
         }
+    }
+
+    fn max_text(&self) -> usize {
+        usize::try_from(self.settings.max_envelope_text_length).unwrap_or(usize::MAX)
     }
 
     /// The keys of the key set a manifest carries, and a count of the others.

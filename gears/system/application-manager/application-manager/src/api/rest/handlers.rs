@@ -7,6 +7,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::OwnedSemaphorePermit;
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
@@ -19,7 +20,7 @@ use super::error::to_canonical;
 use super::gate::RequestGate;
 use crate::domain::error::DomainError;
 use crate::domain::operation::{Operation, OperationStatus};
-use crate::domain::orchestrator::{Receipt, RequestInput, RequestOrchestrator};
+use crate::domain::orchestrator::{Receipt, RequestOrchestrator, Submitted};
 use crate::domain::read_service::ReadService;
 
 /// `GET /application-manager/v1/section-keys`.
@@ -93,7 +94,13 @@ pub async fn seed(
     Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
     extract::Json(manifest): extract::Json<serde_json::Value>,
 ) -> ApiResult<Response> {
-    submit(ctx, &gate, orchestrator, RequestInput::Seed(manifest)).await
+    let receipt = Receipt::new(OffsetDateTime::now_utc());
+    let admission = admit(&gate, receipt.request_id);
+    let submitted = orchestrator
+        .seed(ctx, manifest, receipt, admission)
+        .await
+        .map_err(|e| to_canonical(&e, receipt.request_id))?;
+    Ok(accepted(submitted))
 }
 
 /// `DELETE /application-manager/v1/applications/{application_id}`.
@@ -106,13 +113,13 @@ pub async fn uninstall_by_id(
     Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
     Path(application_id): Path<String>,
 ) -> ApiResult<Response> {
-    submit(
-        ctx,
-        &gate,
-        orchestrator,
-        RequestInput::Uninstall(application_id),
-    )
-    .await
+    let receipt = Receipt::new(OffsetDateTime::now_utc());
+    let admission = admit(&gate, receipt.request_id);
+    let submitted = orchestrator
+        .uninstall(ctx, application_id, receipt, admission)
+        .await
+        .map_err(|e| to_canonical(&e, receipt.request_id))?;
+    Ok(accepted(submitted))
 }
 
 /// `POST /application-manager/v1/applications:uninstall`.
@@ -125,44 +132,30 @@ pub async fn uninstall(
     Extension(orchestrator): Extension<Arc<RequestOrchestrator>>,
     extract::Json(body): extract::Json<UninstallRequestDto>,
 ) -> ApiResult<Response> {
-    submit(
-        ctx,
-        &gate,
-        orchestrator,
-        RequestInput::Uninstall(body.application_id),
-    )
-    .await
+    let receipt = Receipt::new(OffsetDateTime::now_utc());
+    let admission = admit(&gate, receipt.request_id);
+    let submitted = orchestrator
+        .uninstall(ctx, body.application_id, receipt, admission)
+        .await
+        .map_err(|e| to_canonical(&e, receipt.request_id))?;
+    Ok(accepted(submitted))
 }
 
-/// The gate, then the request task; 202 with the operation id and its
-/// `Location` once accepted.
-async fn submit(
-    ctx: PlatformSecurityContext,
-    gate: &RequestGate,
-    orchestrator: Arc<RequestOrchestrator>,
-    input: RequestInput,
-) -> ApiResult<Response> {
-    let receipt = Receipt::new(OffsetDateTime::now_utc());
-    let request_id = receipt.request_id;
-    let permit = match gate.admit() {
-        Ok(permit) => permit,
-        Err(refusal) => {
-            tracing::info!(%request_id, refusal = %refusal, "application-manager: refused at the gate");
-            orchestrator
-                .refuse_at_gate(&ctx, &input, &receipt, &refusal)
-                .await;
-            return Err(to_canonical(&refusal, request_id));
-        }
-    };
-    let submitted = orchestrator
-        .submit(ctx, input, receipt, permit)
-        .await
-        .map_err(|e| to_canonical(&e, request_id))?;
+/// The gate's answer; the orchestrator records the refused event of a
+/// refusal.
+fn admit(gate: &RequestGate, request_id: Uuid) -> Result<OwnedSemaphorePermit, DomainError> {
+    gate.admit().inspect_err(|refusal| {
+        tracing::info!(%request_id, refusal = %refusal, "application-manager: refused at the gate");
+    })
+}
+
+/// 202 with the operation id and its `Location`.
+fn accepted(submitted: Submitted) -> Response {
     let location = format!(
         "/application-manager/v1/operations/{}",
         submitted.operation_id
     );
-    Ok((
+    (
         StatusCode::ACCEPTED,
         [(header::LOCATION, location)],
         Json(AcceptedDto {
@@ -170,7 +163,7 @@ async fn submit(
             status: "accepted".to_owned(),
         }),
     )
-        .into_response())
+        .into_response()
 }
 
 /// `GET /application-manager/v1/operations/{operation_id}`.
